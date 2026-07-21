@@ -1,0 +1,10 @@
+/target
+.env
+/.aacode
+design.md
+init.md
+LLM_CLIENT.md
+DEPS.md
+/.backup
+USAGE.md
+/.idea/
