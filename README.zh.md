@@ -147,7 +147,29 @@ multimodal:
 
 ### Skills（技能）
 
-Skills 放在配置的用户目录或项目目录下，**无需修改配置文件**，重启即自动发现。
+Skills 为文档型：`run_skills` 返回 SKILL.md 的指令内容，Agent 借助 `run_shell` 及其他工具执行。有两种发现模式：
+
+| 模式 | 触发条件 | 来源 |
+|---|---|---|
+| **项目模式**（传统，桌面 CLI） | 未设置 `AACODE_SKILLS_DIR` | 扫描 `<project>/skills/` 和 `<project>/.aacode/skills/` |
+| **用户目录模式**（移动端宿主） | 设置了 `AACODE_SKILLS_DIR` | 内置技能（编译进二进制） + `<skills_dir>/*/SKILL.md` |
+
+在项目模式下，**不会注入任何内置技能** —— 你需要手动在项目的 `skills/` 目录下放置 SKILL.md。
+
+在用户目录模式下，内置技能始终可用（编译进二进制，零文件依赖）：
+
+| 内置技能 | 始终注入 | 受 `extra_builtins` 门控 | 说明 |
+|---|---|---|---|
+| `skill_creator` | 是 | 否 | 创建和更新 Skill 的元技能 |
+| `book_writer` | 是 | 否 | 多阶段写书（大纲 → 故事线 → 逐章写作 → 审查） |
+| `agent_cron` | 否 | 是 | 定时任务调度的元技能（仅 Android） |
+
+如需在移动端启用 `agent_cron`，在配置中声明：
+```json
+{ "skills": { "extra_builtins": ["agent_cron"] } }
+```
+
+同名用户技能会覆盖内置技能。
 
 #### 目录结构
 
@@ -169,8 +191,6 @@ Skills 放在配置的用户目录或项目目录下，**无需修改配置文�
 ## Example
 run_skills("skill_name", {"param1": "value1", "param2": "value2"})
 ```
-
-Skills 为文档型：`run_skills` 返回 SKILL.md 的指令内容，Agent 借助 `run_shell` 及其他工具执行。内置 Skills 包括 `skill_creator`（用于创建和更新 Skill 的元技能）。
 
 ## 架构设计
 

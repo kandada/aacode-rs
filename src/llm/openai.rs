@@ -21,23 +21,24 @@ use std::time::Duration;
 /// Connect timeout: fail fast on dead links so the retry loop can kick in
 /// (mobile networks flap; an unbounded connect looks like a frozen UI).
 const CONNECT_TIMEOUT_SECS: u64 = 10;
-/// Per-read socket timeout for the SSE stream. Covers the TLS handshake,
-/// waiting for response headers (time-to-first-token upper bound), and the
-/// gap between stream chunks. NOT a total timeout — long streamed responses
-/// are unaffected as long as bytes keep arriving.
-const READ_TIMEOUT_SECS: u64 = 120;
+/// Per-read socket timeout for the SSE stream. Overridable via AACODE_LLM_READ_TIMEOUT.
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
+const WRITE_TIMEOUT_SECS: u64 = 30;
 
-/// Builds the shared HTTP agent: bounded connect/read timeouts + keep-alive
-/// connection pooling (the ReAct loop makes many sequential calls to the
-/// same host; reusing the TLS session saves seconds per iteration on mobile).
-pub(crate) fn llm_agent() -> ureq::Agent {
+/// Builds the shared HTTP agent with bounded connect/read/write/total timeouts.
+pub(crate) fn llm_agent(request_timeout_secs: Option<u64>) -> ureq::Agent {
     let read_secs = std::env::var("AACODE_LLM_READ_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(READ_TIMEOUT_SECS);
+        .unwrap_or(DEFAULT_READ_TIMEOUT_SECS);
+    let total_secs = request_timeout_secs
+        .or_else(|| std::env::var("AACODE_LLM_REQUEST_TIMEOUT").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(300);
     ureq::builder()
         .timeout_connect(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout_read(Duration::from_secs(read_secs))
+        .timeout_write(Duration::from_secs(WRITE_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(total_secs))
         .build()
 }
 
@@ -49,8 +50,8 @@ pub struct OpenAiClient {
 impl OpenAiClient {
     pub fn new(model: ModelConfig) -> Self {
         OpenAiClient {
+            agent: llm_agent(model.request_timeout_secs),
             model,
-            agent: llm_agent(),
         }
     }
 

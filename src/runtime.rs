@@ -41,8 +41,12 @@ impl AgentRuntime {
     /// Initialize the runtime for `project_path`, building the appropriate
     /// shell backend. The native backend needs no setup; the fastshell backend
     /// initializes a VFS sandbox + embedded CPython.
-    pub fn init(config: AgentConfig, project_path: PathBuf) -> Result<Self> {
+    pub fn init(mut config: AgentConfig, project_path: PathBuf) -> Result<Self> {
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+        // Wire config.timeouts.model_request into model's per-request deadline
+        if config.model.request_timeout_secs.is_none() {
+            config.model.request_timeout_secs = Some(config.timeouts.model_request);
+        }
         // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
         std::fs::create_dir_all(&project_path)
             .map_err(|e| AacodeError::Io(format!("create project dir: {e}")))?;
@@ -73,10 +77,13 @@ impl AgentRuntime {
     /// where the host already called fastshell_init on the same sandbox).
     /// Forces the fastshell backend regardless of config.
     pub fn with_fastshell(
-        config: AgentConfig,
+        mut config: AgentConfig,
         project_path: PathBuf,
         fs: Arc<Mutex<Fastshell>>,
     ) -> Self {
+        if config.model.request_timeout_secs.is_none() {
+            config.model.request_timeout_secs = Some(config.timeouts.model_request);
+        }
         AgentRuntime {
             config,
             project_path,

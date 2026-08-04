@@ -26,8 +26,8 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     pub fn new(model: ModelConfig) -> Self {
         AnthropicClient {
+            agent: super::openai::llm_agent(model.request_timeout_secs),
             model,
-            agent: super::openai::llm_agent(),
         }
     }
 

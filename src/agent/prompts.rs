@@ -25,14 +25,13 @@ pub const SYSTEM_PROMPT_FOR_MAIN_AGENT: &str = r#"You are a principal AI coding 
 Available tools:
 1. Core tools
     - run_shell: Execute shell commands (universal Swiss Army knife) — ALL file, code, and system operations go through it.
-      * **max_output**: Pass a number (e.g. 200, 500, 2000) to limit returned output and save context. Omit for full output when you need all of it.
+      * **max_output**: Pass a number (e.g. 200, 500, 2000) to limit returned output and save context. Omit for full output when you need all of it
       * Read files: cat "file", tail -n 50 "file", sed -n '100,200p' "file"  (always quote filenames containing spaces/special chars)
-      * Write/edit: echo/cat/sed/awk, supports pipes (|), redirection (>), etc.
-      * Pipe data into Python: write to a temp file first (e.g. `echo "1\n2" > in.txt; python3 calc.py < in.txt`). Direct `echo | python3` works on desktop but may fail on mobile.
-      * Search/info: grep, ls, find, wc, pytest, git, python, etc.
-      * Multi-line files: heredoc (`cat > file << 'EOF' ... EOF`).
-      * max_output param: default None for full output; pass a number e.g. 200 to limit (saves tokens).
-    ⚠️  There is no write_file, read_file, or edit_file tool — use run_shell + shell commands for ALL file operations.
+      * Write/edit: echo/cat/sed/awk, supports pipes (|), redirection (>), etc
+      * Pipe data into Python: write to a temp file first (e.g. `echo "1\n2" > in.txt; python3 calc.py < in.txt`)
+      * Search/info: grep, ls, find, wc, pytest, git, python, etc
+      * Multi-line files: heredoc (`cat > file << 'EOF' ... EOF`)
+      * max_output param: default None for full output; pass a number e.g. 200 to limit (saves tokens)
 2. Web tools
     - search_web: Search the internet (SearXNG > Brave > Google CSE > Bing scraping fallback)
     - fetch_url: Fetch web page content (also available via run_shell + curl)
@@ -127,7 +126,7 @@ During each thought, naturally plan:
 pub fn sub_agent_prompt(agent_type: &str) -> String {
     let base = match agent_type {
         "code" => {
-            "You are a specialized code-writing agent. Write high-quality, maintainable code; follow best practices; add tests; keep changes minimal; prefer incremental updates. ⚠️ There is no write_file, read_file, or edit_file tool — use run_shell + shell commands (cat/echo/sed/awk) for all file operations."
+            "You are a specialized code-writing agent. Write high-quality, maintainable code; follow best practices; add tests; keep changes minimal; prefer incremental updates. Use run_shell + shell commands (cat/echo/sed/awk) for all file operations."
         }
         "test" => {
             "You are a specialized testing agent. Write comprehensive test cases, cover edge cases and exceptions, and generate clear test reports."
@@ -136,7 +135,7 @@ pub fn sub_agent_prompt(agent_type: &str) -> String {
             "You are a research agent. Analyze requirements and scope, search for relevant docs and best practices, and provide comprehensive analysis and recommendations."
         }
         _ => {
-            "You are a general-purpose sub-agent. Complete the assigned task efficiently. ⚠️ Use run_shell for all file operations — no write_file tool exists."
+            "You are a general-purpose sub-agent. Complete the assigned task efficiently. Use run_shell for all file operations."
         }
     };
     format!("{base}\n\nUse the provided tools to complete your task. Always use native tool_calls — do not output JSON tool call info in your response.")
@@ -150,9 +149,8 @@ mod tests {
     fn main_prompt_has_placeholder() {
         assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("{skills_list}"));
         assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("run_shell"));
-        // Anti-hallucination guard words present.
-        assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("no write_file"));
-        assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("read_file"));
+        // Verify run_shell is emphasized as the exclusive file tool.
+        assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("ALL file, code, and system operations go through it"));
     }
 
     #[test]
@@ -164,8 +162,8 @@ mod tests {
     }
 
     #[test]
-    fn sub_agents_get_anti_hallucination_guard() {
-        assert!(sub_agent_prompt("code").contains("no write_file"));
+    fn sub_agents_emphasize_run_shell() {
+        assert!(sub_agent_prompt("code").contains("run_shell + shell commands"));
         assert!(sub_agent_prompt("other").contains("run_shell for all file operations"));
     }
 }

@@ -31,10 +31,14 @@ pub struct MainAgent {
 
 impl MainAgent {
     pub fn new(
-        config: AgentConfig,
+        mut config: AgentConfig,
         project_path: PathBuf,
         backend: Arc<dyn ShellBackend>,
     ) -> Self {
+        // Wire config.timeouts.model_request into the LLM agent's per-request deadline
+        if config.model.request_timeout_secs.is_none() {
+            config.model.request_timeout_secs = Some(config.timeouts.model_request);
+        }
         let llm = build_client(&config.model);
         // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
         let context = ContextManager::new(&project_path);
@@ -67,9 +71,12 @@ impl MainAgent {
         self.build_registry_with_holder().0
     }
 
-    /// Assemble the full system prompt (prompt + skills + working dir +
-    /// project analysis + init instructions).
-    fn build_system_prompt(&self, registry: &ToolRegistry) -> String {
+    /// Assemble the fully-static system prompt (messages[0]).
+    /// All content here is configuration that rarely changes — init.md
+    /// is project-level rules, skills_list comes from the host, and
+    /// Working Directory + PLANNING_IN_THOUGHT are anchored per session.
+    /// Byte-identical across execute() calls → provider KV cache stays hot.
+    fn build_system_prompt(&self, _registry: &ToolRegistry) -> String {
         let skills_user_dir = self
             .config
             .skills
@@ -80,19 +87,20 @@ impl MainAgent {
             &self.project_path,
             skills_user_dir.as_deref(),
             &self.config.skills.extra_builtins,
+            self.config.skills.vfs_skills_dir.as_deref(),
         );
         let mut prompt = SYSTEM_PROMPT_FOR_MAIN_AGENT.replace("{skills_list}", &skills_list);
         prompt.push_str(&format!(
-            "\n\n## Working Directory\nYour current working directory is: {}\nAll file operations should use paths relative to this directory.",
+            "\n\n## Working Directory\nYour current working directory is: {}\nFor project files, use paths relative to this directory.",
             self.project_path.display()
         ));
-        // Project analysis
-        let analysis = self.context.analyze_project_structure();
-        prompt.push_str(&format!("\n\n{analysis}"));
-        // Init instructions
+        if self.backend.kind() == "fastshell" {
+            prompt.push_str(" Paths starting with / (e.g. /skills) are relative to the sandbox root, not the real filesystem. Paths without / are relative to your working directory. avoid /tmp/.");
+        }
+        // Project init instructions (static config, rarely changes).
         let init = self.context.load_init_instructions();
-        prompt.push_str(&format!("\n\nProject init instructions:\n{init}"));
-        // Planning guidance
+        prompt.push_str(&format!("\n\n## Project Init Instructions\n\n{init}"));
+        // Planning guidance (static).
         prompt.push_str(PLANNING_IN_THOUGHT);
         // Plan-first mode: instruct the model to produce a plan before acting.
         if self.config.plan_first {
@@ -100,7 +108,6 @@ impl MainAgent {
                 "\n\nPlan-First Mode: Before taking any action, first produce a concise numbered plan of the steps you will take. Only then begin executing tools.\n",
             );
         }
-        let _ = registry; // registry currently not needed for prompt text
         prompt
     }
 
@@ -194,7 +201,7 @@ impl MainAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::backend::NativeShell;
+    use crate::tools::backend::{CmdOutput, NativeShell};
 
     fn make_agent() -> (MainAgent, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -219,13 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_has_working_dir_and_skills() {
+    fn system_prompt_has_static_content() {
         let (agent, _) = make_agent();
         let reg = agent.build_registry();
         let p = agent.build_system_prompt(&reg);
         assert!(p.contains("Working Directory"));
-        assert!(p.contains("Project init instructions"));
         assert!(!p.contains("{skills_list}"));
+        // Static config belongs in messages[0].
+        assert!(p.contains("Project Init Instructions"));
+        // Dynamic project analysis is removed — not in messages[0], not appended.
     }
 
     #[test]
@@ -243,5 +252,42 @@ mod tests {
         let reg = agent.build_registry();
         let p = agent.build_system_prompt(&reg);
         assert!(p.contains("Plan-First Mode"));
+    }
+
+    struct MockFastshellBackend;
+    impl ShellBackend for MockFastshellBackend {
+        fn run(
+            &self,
+            _command: &str,
+            _stdin_input: Option<&str>,
+            _timeout_secs: u64,
+            _cwd: &std::path::Path,
+        ) -> CmdOutput {
+            CmdOutput { stdout: String::new(), stderr: String::new(), exit_code: 0 }
+        }
+        fn kind(&self) -> &'static str { "fastshell" }
+    }
+
+    #[test]
+    fn fastshell_backend_adds_sandbox_hint() {
+        let dir = std::env::temp_dir().join(format!("aacode_shint_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend: Arc<dyn ShellBackend> = Arc::new(MockFastshellBackend);
+        let mut acfg = AgentConfig::default();
+        acfg.model.api_key = Some("sk-test".into());
+        let agent = MainAgent::new(acfg, dir, backend);
+        let reg = agent.build_registry();
+        let p = agent.build_system_prompt(&reg);
+        assert!(p.contains("sandbox root"), "fastshell prompt must contain sandbox hint");
+        assert!(p.contains("avoid /tmp/"));
+    }
+
+    #[test]
+    fn native_backend_does_not_add_sandbox_hint() {
+        let (agent, _) = make_agent();
+        let reg = agent.build_registry();
+        let p = agent.build_system_prompt(&reg);
+        assert!(!p.contains("sandbox root"), "native prompt must not contain sandbox hint");
+        assert!(!p.contains("avoid /tmp/"));
     }
 }

@@ -137,6 +137,7 @@ fn register_core_tools(
     reg.register(Box::new(skills::RunSkillsTool {
         project_path: project_path.clone(),
         user_dir: config.skills.user_dir.as_ref().map(PathBuf::from),
+        vfs_skills_dir: config.skills.vfs_skills_dir.clone(),
         extra_builtins: config.skills.extra_builtins.clone(),
     }));
 

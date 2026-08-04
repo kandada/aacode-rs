@@ -130,8 +130,11 @@ impl<'a> ReactLoop<'a> {
             }
 
             // Stale-loop detection warning (fetch_url stale domains).
+            // Persisted so cross-execute() prefix stays stable.
             if let Some(w) = stale.detect(&resp.tool_calls) {
-                messages.push(ChatMessage::system(format!("[SYSTEM WARNING]: {w}")));
+                let warn_msg = ChatMessage::system(format!("[SYSTEM WARNING]: {w}"));
+                let _ = session.add_message(SessionMessage::from_chat(&warn_msg));
+                messages.push(warn_msg);
             }
 
             // Append the assistant message carrying tool_calls.

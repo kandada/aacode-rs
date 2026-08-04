@@ -32,11 +32,15 @@ pub struct SessionMessage {
 
 impl SessionMessage {
     pub fn from_chat(m: &ChatMessage) -> Self {
+        let mut tokens = estimate_tokens(&m.content);
+        if let Some(rc) = &m.reasoning_content {
+            tokens += estimate_tokens(rc);
+        }
         SessionMessage {
             role: m.role.clone(),
             content: m.content.clone(),
             timestamp: now_iso(),
-            tokens: estimate_tokens(&m.content),
+            tokens,
             tool_calls: m.tool_calls.clone(),
             tool_call_id: m.tool_call_id.clone(),
             reasoning_content: m.reasoning_content.clone(),
@@ -264,8 +268,48 @@ impl SessionManager {
     }
 
     /// List all sessions, newest activity first.
+    /// Falls back to scanning disk files when the index is empty.
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
-        let index = self.load_index();
+        let mut index = self.load_index();
+        if index.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if stem == "sessions_index" {
+                        continue;
+                    }
+                    if let Ok(s) = std::fs::read_to_string(&path) {
+                        if let Ok(file) = serde_json::from_str::<SessionFile>(&s) {
+                            let title = file.messages.first()
+                                .map(|m| truncate_title(&m.content))
+                                .unwrap_or_default();
+                            let summary = SessionSummary {
+                                session_id: file.session_id.clone(),
+                                created_at: file.created_at.clone(),
+                                last_activity: file.messages.last()
+                                    .map(|m| m.timestamp.clone())
+                                    .unwrap_or_default(),
+                                total_messages: file.messages.len(),
+                                total_tokens: file.messages.iter().map(|m| m.tokens).sum(),
+                                title,
+                                status: "active".to_string(),
+                            };
+                            index.entry(file.session_id).or_insert(summary);
+                        }
+                    }
+                }
+            }
+            // Self-heal: write rebuilt index back to disk.
+            if !index.is_empty() {
+                if let Ok(contents) = serde_json::to_string_pretty(&index) {
+                    let _ = atomic_write(&self.index_path(), &contents);
+                }
+            }
+        }
         let mut v: Vec<SessionSummary> = index.into_values().collect();
         v.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
         v
@@ -299,12 +343,11 @@ impl SessionManager {
     }
 
     /// Get the current session's messages as ChatMessages (for LLM history).
+    /// System messages are included so that dynamically-appended context
+    /// (project analysis, init instructions, compaction summaries, etc.) are
+    /// preserved in the prefix for provider KV-cache stability across calls.
     pub fn history_chat(&self) -> Vec<ChatMessage> {
-        self.messages
-            .iter()
-            .filter(|m| m.role != "system")
-            .map(|m| m.to_chat())
-            .collect()
+        self.messages.iter().map(|m| m.to_chat()).collect()
     }
 
     /// Whether the last message is a tool result (interrupted mid-execution).
@@ -398,13 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn history_excludes_system() {
+    fn history_includes_system() {
         let proj = tmp_project();
         let mut sm = SessionManager::new(&proj);
         sm.create_session("t", None).unwrap();
         sm.add_message(SessionMessage::from_chat(&ChatMessage::system("sys")))
             .unwrap();
-        assert!(sm.history_chat().iter().all(|m| m.role != "system"));
+        // After cache-stability fix: system messages are included in history
+        // so persisted dynamic context is preserved for prefix matching.
+        assert!(sm.history_chat().iter().any(|m| m.role == "system"));
     }
 
     #[test]
@@ -460,5 +505,70 @@ mod tests {
 
         let msgs = sm2.read_session_messages(&id);
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn reasoning_content_counted_in_tokens() {
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: "hello world".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some("I need to think about this carefully".into()),
+        };
+        let sm = SessionMessage::from_chat(&msg);
+        // Should count both content and reasoning_content tokens.
+        let content_only = estimate_tokens("hello world");
+        let with_reasoning = estimate_tokens("hello world") + estimate_tokens("I need to think about this carefully");
+        assert!(sm.tokens > content_only);
+        assert_eq!(sm.tokens, with_reasoning);
+    }
+
+    #[test]
+    fn no_reasoning_content_tokens_unchanged() {
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: "hello world".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let sm = SessionMessage::from_chat(&msg);
+        assert_eq!(sm.tokens, estimate_tokens("hello world"));
+    }
+
+    #[test]
+    fn tool_message_tokens_ignore_reasoning() {
+        // Tool messages don't have reasoning_content normally, but even if set,
+        // we verify the field is preserved.
+        let msg = ChatMessage {
+            role: "tool".into(),
+            content: "result data".into(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            reasoning_content: None,
+        };
+        let sm = SessionMessage::from_chat(&msg);
+        assert_eq!(sm.tokens, estimate_tokens("result data"));
+    }
+
+    #[test]
+    fn persisted_dynamic_system_message_in_history() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("task", None).unwrap();
+
+        let analysis = SessionMessage::from_chat(&ChatMessage::system("## Project Analysis\n2 .rs files, 1 .py file"));
+        sm.add_message(analysis).unwrap();
+
+        let history = sm.history_chat();
+        assert!(history.iter().any(|m| m.role == "system" && m.content.contains("Project Analysis")));
+
+        // Reload from disk and verify system message is still in history.
+        let id = sm.current_session_id.unwrap();
+        let mut sm2 = SessionManager::new(&proj);
+        sm2.switch_session(&id).unwrap();
+        let history2 = sm2.history_chat();
+        assert!(history2.iter().any(|m| m.role == "system" && m.content.contains("Project Analysis")));
     }
 }

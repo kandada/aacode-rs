@@ -214,10 +214,15 @@ pub extern "C" fn aacode_run_task_with_cb(
 ///
 /// Default: the shell is confined to the project. When the host configured a
 /// user skills directory (`config.skills.user_dir`) the agent must be able to
-/// manage skills via run_shell — those live OUTSIDE the project — so the
-/// shell root is widened to the whole host sandbox and the session cwd is
-/// positioned at the project instead. Hosts that don't pass skills.user_dir
-/// keep the old strictly-project-confined behavior.
+/// manage skills via run_shell — those may live OUTSIDE the project — so the
+/// shell root is widened to the minimal common ancestor of project and
+/// user_dir. Hosts that don't pass skills.user_dir keep the old
+/// strictly-project-confined behavior.
+///
+/// Widening uses a three-step cascade (first match wins):
+/// 1. Project is a proper subdirectory of sandbox → widen to sandbox.
+/// 2. User dir is already inside project → no widening needed.
+/// 3. Walk project ancestors to find the closest one containing user dir.
 ///
 /// Paths are canonicalized and compared **component-wise** (`Path::strip_prefix`),
 /// not by string prefix:
@@ -229,24 +234,52 @@ pub extern "C" fn aacode_run_task_with_cb(
 fn resolve_shell_root(
     sandbox: &str,
     project: &str,
-    skills_dir_configured: bool,
+    user_dir: Option<&str>,
 ) -> (String, Option<String>) {
-    if !skills_dir_configured {
+    let Some(user_dir) = user_dir else {
         return (project.to_string(), None);
-    }
+    };
     let canon = |s: &str| {
         std::fs::canonicalize(s).unwrap_or_else(|_| std::path::PathBuf::from(s))
     };
     let sandbox_c = canon(sandbox);
     let project_c = canon(project);
+    let user_dir_c = canon(user_dir);
+
+    // Step 1: project is a proper subdirectory of sandbox → widen to sandbox.
     match project_c.strip_prefix(&sandbox_c) {
-        Ok(rel) if !rel.as_os_str().is_empty() => (
-            sandbox.to_string(),
-            Some(rel.to_string_lossy().to_string()),
-        ),
-        // Equal to the sandbox (already widest) or outside it (own jail).
-        _ => (project.to_string(), None),
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            return (sandbox.to_string(), Some(rel.to_string_lossy().to_string()));
+        }
+        _ => {}
     }
+
+    // Step 2: user_dir is already inside project → no widening needed.
+    if user_dir_c.strip_prefix(&project_c).is_ok() {
+        return (project.to_string(), None);
+    }
+
+    // Step 3: walk project ancestors to find the closest common ancestor
+    //         that also contains user_dir. Stop before the filesystem root.
+    //
+    // Example (iOS): project = /a/b/projects/Test3, user_dir = /a/b/skills
+    //   ancestors of project:  /a/b/projects  → user_dir not inside ✗
+    //                          /a/b            → user_dir inside      ✓  ← widen here
+    //   Result: shell_root = /a/b, cd_rel = projects/Test3
+    for ancestor in project_c.ancestors().skip(1) {
+        if ancestor.parent().is_none() {
+            break;
+        }
+        if user_dir_c.strip_prefix(ancestor).is_ok() {
+            if let Ok(rel) = project_c.strip_prefix(ancestor) {
+                if !rel.as_os_str().is_empty() {
+                    return (ancestor.to_string_lossy().to_string(), Some(rel.to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+
+    (project.to_string(), None)
 }
 
 /// Shared implementation: parse JSON, build runtime, run, return JSON result.
@@ -299,7 +332,25 @@ fn run_task_with_cb(input: &str, emit: impl Fn(&str) + Send + Sync + 'static) ->
         let pp = if project_path == "." { sandbox.clone() } else { project_path.clone() };
         // Shell sandbox root + optional cwd reposition (see resolve_shell_root).
         let (shell_root, cd_rel) =
-            resolve_shell_root(&sandbox, &pp, config.skills.user_dir.is_some());
+            resolve_shell_root(&sandbox, &pp, config.skills.user_dir.as_deref());
+        // Compute a VFS-internal skills path (relative to shell root) so
+        // skill prompts can use short, platform-independent paths like
+        // `/skills` instead of long absolute physical paths.
+        //
+        // Example: user_dir  = /data/.../fastshell/skills  (absolute on disk)
+        //          shell_root = /data/.../fastshell          (common ancestor)
+        //          → vfs_skills_dir = /skills               (VFS-internal)
+        //
+        // The VFS resolve() treats a leading '/' as "relative to VFS root":
+        //   ls /skills  →  <vfs_root>/skills  →  /data/.../fastshell/skills
+        // This avoids platform-specific prefixes (/data/user/0, /private/var, etc).
+        if let Some(ref user_dir) = config.skills.user_dir {
+            if let Ok(rel) = std::path::Path::new(user_dir).strip_prefix(&shell_root) {
+                if !rel.as_os_str().is_empty() {
+                    config.skills.vfs_skills_dir = Some(format!("/{}", rel.to_string_lossy()));
+                }
+            }
+        }
         let fs_arc: std::sync::Arc<std::sync::Mutex<fastshell::Fastshell>> =
             std::sync::Arc::new(std::sync::Mutex::new(fastshell::Fastshell::new()));
         {
@@ -307,6 +358,8 @@ fn run_task_with_cb(input: &str, emit: impl Fn(&str) + Send + Sync + 'static) ->
             let mut fscfg = fastshell::Config::default();
             fscfg.sandbox_path = shell_root.clone();
             fscfg.python_enabled = true;
+            fscfg.allow_subprocess = false; // mobile sandbox: no subprocess spawn
+            fscfg.network_ask_permission = false;
             if let Err(e) = ours.init(fscfg) {
                 return to_c_string(json!({"status": "error", "error": e}).to_string());
             }
@@ -588,7 +641,7 @@ mod tests {
         let base = tmp_root("nocfg");
         let sb = mkdirs(&base.join("sb"));
         let pp = mkdirs(&base.join("sb").join("proj"));
-        let (root, rel) = resolve_shell_root(&sb, &pp, false);
+        let (root, rel) = resolve_shell_root(&sb, &pp, None);
         assert_eq!(root, pp);
         assert!(rel.is_none());
     }
@@ -597,8 +650,9 @@ mod tests {
     fn project_inside_sandbox_widens_and_positions_cwd() {
         let base = tmp_root("inside");
         let sb = mkdirs(&base.join("sb"));
+        let sk = mkdirs(&base.join("sb").join("skills"));
         let pp = mkdirs(&base.join("sb").join("a").join("b"));
-        let (root, rel) = resolve_shell_root(&sb, &pp, true);
+        let (root, rel) = resolve_shell_root(&sb, &pp, Some(&sk));
         assert_eq!(root, sb);
         let rel = rel.expect("must reposition cwd");
         assert_eq!(
@@ -608,22 +662,37 @@ mod tests {
     }
 
     #[test]
-    fn project_equal_to_sandbox_not_widened() {
-        let base = tmp_root("equal");
+    fn project_equal_to_sandbox_user_dir_inside_no_widening() {
+        let base = tmp_root("equal_in");
         let sb = mkdirs(&base.join("sb"));
-        let (root, rel) = resolve_shell_root(&sb, &sb, true);
+        let sk = mkdirs(&base.join("sb").join("skills"));
+        let (root, rel) = resolve_shell_root(&sb, &sb, Some(&sk));
         assert_eq!(root, sb);
         assert!(rel.is_none());
+    }
+
+    #[test]
+    fn project_equal_to_sandbox_user_dir_outside_widens() {
+        // iOS-like: sandbox == project, but skills lives in a sibling dir.
+        let base = tmp_root("equal_out");
+        let sb = mkdirs(&base.join("sb"));
+        let sk = mkdirs(&base.join("skills"));
+        let (root, rel) = resolve_shell_root(&sb, &sb, Some(&sk));
+        let base_c = std::fs::canonicalize(&base).unwrap_or_else(|_| base.clone());
+        assert_eq!(root, base_c.to_string_lossy());
+        assert_eq!(rel.as_deref(), Some("sb"));
     }
 
     #[test]
     fn sibling_prefix_dir_is_not_inside_sandbox() {
         // Regression: /…/sb vs /…/sb2/proj — a string prefix check would
         // wrongly widen the root and then fail the cd with a hard error.
+        // user_dir under project → no widening; sb must not participate.
         let base = tmp_root("sibling");
         let sb = mkdirs(&base.join("sb"));
         let pp = mkdirs(&base.join("sb2").join("proj"));
-        let (root, rel) = resolve_shell_root(&sb, &pp, true);
+        let sk = mkdirs(&base.join("sb2").join("proj").join("skills"));
+        let (root, rel) = resolve_shell_root(&sb, &pp, Some(&sk));
         assert_eq!(root, pp, "sibling project must keep its own jail");
         assert!(rel.is_none());
     }
@@ -633,7 +702,8 @@ mod tests {
         let base = tmp_root("outside");
         let sb = mkdirs(&base.join("sb"));
         let pp = mkdirs(&base.join("elsewhere").join("proj"));
-        let (root, rel) = resolve_shell_root(&sb, &pp, true);
+        let sk = mkdirs(&base.join("elsewhere").join("proj").join("skills"));
+        let (root, rel) = resolve_shell_root(&sb, &pp, Some(&sk));
         assert_eq!(root, pp);
         assert!(rel.is_none());
     }
@@ -648,10 +718,11 @@ mod tests {
         let base = tmp_root("symlink");
         let real_sb = mkdirs(&base.join("real_sb"));
         mkdirs(&base.join("real_sb").join("proj"));
+        let sk = mkdirs(&base.join("real_sb").join("skills"));
         let link_sb = base.join("link_sb");
         std::os::unix::fs::symlink(&real_sb, &link_sb).unwrap();
         let pp_via_link = link_sb.join("proj").to_string_lossy().to_string();
-        let (root, rel) = resolve_shell_root(&real_sb, &pp_via_link, true);
+        let (root, rel) = resolve_shell_root(&real_sb, &pp_via_link, Some(&sk));
         assert_eq!(root, real_sb, "symlinked project must widen to sandbox");
         assert_eq!(rel.as_deref(), Some("proj"));
     }

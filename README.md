@@ -145,7 +145,29 @@ Configure MCP resources (stdio and sse) in aacode_config.yaml.
 
 ### Skills
 
-Skills are placed under a configured user directory, **no config file changes needed** — auto-discovered on restart.
+Skills are document-type: `run_skills` returns the SKILL.md instructions, which the agent follows using `run_shell` and other tools. There are two discovery modes:
+
+| Mode | When | Source |
+|---|---|---|
+| **Project mode** (legacy, desktop CLI) | `AACODE_SKILLS_DIR` not set | Scans `<project>/skills/` and `<project>/.aacode/skills/` |
+| **User-dir mode** (mobile hosts) | `AACODE_SKILLS_DIR` is set | Builtin skills (compiled into binary) + `<skills_dir>/*/SKILL.md` |
+
+In project mode, **no builtin skills are injected** — you must place SKILL.md files manually in the project's `skills/` directory.
+
+In user-dir mode, builtin skills are always available (compiled into the binary for zero file dependencies):
+
+| Builtin Skill | Always injected | Gated by `extra_builtins` | Description |
+|---|---|---|---|
+| `skill_creator` | Yes | No | Meta-skill for creating and updating skills |
+| `book_writer` | Yes | No | Multi-phase book writing (outline → storyline → chapters → review) |
+| `agent_cron` | No | Yes | Meta-skill for scheduling cron tasks (Android only) |
+
+To enable `agent_cron` on a mobile host, declare it in your config:
+```json
+{ "skills": { "extra_builtins": ["agent_cron"] } }
+```
+
+A user skill with the same name as a builtin overrides it.
 
 #### Directory Structure
 
@@ -167,8 +189,6 @@ What this skill does — keep to one line, shown in every system prompt.
 ## Example
 run_skills("skill_name", {"param1": "value1", "param2": "value2"})
 ```
-
-Skills are document-type: `run_skills` returns the SKILL.md instructions, which the agent follows using `run_shell` and other tools. Builtin skills include `skill_creator` (meta-skill for creating and updating skills).
 
 ## Architecture
 

@@ -3,7 +3,7 @@
 
 [package]
 name = "aacode-rs"
-version = "1.7.24"
+version = "1.8.0"
 edition = "2021"
 description = "Rust port of the AACode ReAct coding agent, built on fastshell for mobile AI agents"
 license = "GPL-3.0-only"

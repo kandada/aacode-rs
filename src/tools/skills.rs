@@ -7,13 +7,23 @@
 //! Python model: skills are document-type. `execute` returns the SKILL.md
 //! instruction guide so the model can follow it using `run_shell`.
 //!
-//! Discovery has two modes (host-configurable, platform-agnostic):
-//!  * `user_dir` configured (mobile hosts): builtin skills (embedded in the
-//!    binary) + `<user_dir>/*/SKILL.md`. Project directories are NOT scanned
-//!    (skills are app-level; also prevents prompt injection from cloned
-//!    repositories). A user skill with the same name overrides a builtin.
-//!  * `user_dir` not configured (legacy/CLI): `<project>/skills` and
-//!    `<project>/.aacode/skills`, unchanged behavior, no builtins injected.
+//! Three skill paths coexist:
+//!
+//! | Path                            | Condition                    | Scope         |
+//! |---------------------------------|------------------------------|---------------|
+//! | Builtin (compiled into binary)  | `user_dir` is set            | Global        |
+//! | `user_dir`                      | `user_dir` is set            | Global        |
+//! | `<project>/skills/` + `.aacode` | `user_dir` is NOT set (CLI)  | Per-project   |
+//!
+//! When `user_dir` is configured (mobile hosts / desktop with
+//! AACODE_SKILLS_DIR env): builtin skills + user-dir skills are loaded,
+//! project directories are NOT scanned (skills are app-level; also prevents
+//! prompt injection from cloned repos). A user skill with the same name
+//! overrides a builtin.
+//!
+//! When `user_dir` is not configured (legacy/desktop CLI without
+//! AACODE_SKILLS_DIR): only per-project `<project>/skills` and
+//! `<project>/.aacode/skills` are scanned, no builtins are injected.
 
 use super::registry::Tool;
 use super::schema::{ParamType, ToolParameter, ToolSchema};
@@ -26,12 +36,13 @@ use std::sync::atomic::AtomicBool;
 /// Builtin document skills embedded at compile time. `{SKILLS_DIR}` inside
 /// the body is replaced with the configured user skills directory.
 ///
-/// skill_creator is always injected when user_dir is set. The others are
-/// **gated by the host** via `config.skills.extra_builtins` — only hosts
-/// that explicitly declare support (e.g. Android app brings cron scheduling)
-/// will see them, keeping desktop/CLI deployments untouched.
+/// skill_creator and book_writer are always injected when user_dir is set.
+/// The others are **gated by the host** via `config.skills.extra_builtins` —
+/// only hosts that explicitly declare support (e.g. Android app brings cron
+/// scheduling) will see them, keeping desktop/CLI deployments untouched.
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("skill_creator", include_str!("builtin_skills/skill_creator.md")),
+    ("book_writer", include_str!("builtin_skills/book_writer.md")),
     ("agent_cron", include_str!("builtin_skills/agent_cron.md")),
 ];
 
@@ -58,23 +69,33 @@ fn skills_dirs(project_path: &Path) -> Vec<PathBuf> {
 ///     skills appear (e.g. `agent_cron` only when the host explicitly
 ///     declares it). Hosts that don't pass `extra_builtins` never see
 ///     platform-specific builtins.
+///
+/// `vfs_skills_dir` is an optional VFS-internal path (e.g. `/skills`)
+/// used for `{SKILLS_DIR}` substitution instead of the absolute `user_dir`.
+/// When `None`, substitution falls back to `user_dir` (legacy behaviour).
 pub fn discover_skills(
     project_path: &Path,
     user_dir: Option<&Path>,
     extra_builtins: &[String],
+    vfs_skills_dir: Option<&str>,
 ) -> Vec<SkillInfo> {
     let mut map: BTreeMap<String, SkillInfo> = BTreeMap::new();
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
 
     match user_dir {
         Some(dir) => {
+            // dir = absolute path on disk, used only for reading skill files.
+            // prompt_dir = VFS-internal path injected into skill prompts,
+            //   so the agent sees `/skills` instead of `/data/.../skills`.
+            //   Falls back to dir (legacy absolute path) when not set.
             let dir_str = dir.to_string_lossy();
+            let prompt_dir = vfs_skills_dir.unwrap_or(&dir_str);
             for (name, body) in BUILTIN_SKILLS {
-                // skill_creator is always injected. All others are gated.
-                if *name != "skill_creator" && !extra_builtins.iter().any(|x| x == *name) {
+                // skill_creator and book_writer are always injected. All others are gated.
+                if *name != "skill_creator" && *name != "book_writer" && !extra_builtins.iter().any(|x| x == *name) {
                     continue;
                 }
-                let content = body.replace("{SKILLS_DIR}", &dir_str);
+                let content = body.replace("{SKILLS_DIR}", prompt_dir);
                 map.insert(
                     (*name).to_string(),
                     SkillInfo {
@@ -159,9 +180,10 @@ pub fn skills_list_for_prompt(
     project_path: &Path,
     user_dir: Option<&Path>,
     extra_builtins: &[String],
+    vfs_skills_dir: Option<&str>,
 ) -> String {
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let skills = discover_skills(project_path, user_dir, extra_builtins);
+    let skills = discover_skills(project_path, user_dir, extra_builtins, vfs_skills_dir);
     if skills.is_empty() {
         return "(no skills installed)".to_string();
     }
@@ -176,6 +198,8 @@ pub struct RunSkillsTool {
     pub project_path: PathBuf,
     /// Configured user skills directory (None = legacy project scanning).
     pub user_dir: Option<PathBuf>,
+    /// VFS-internal path for {SKILLS_DIR} substitution (e.g. `/skills`).
+    pub vfs_skills_dir: Option<String>,
     /// Host-declared extra builtins (e.g. ["agent_cron"]).
     pub extra_builtins: Vec<String>,
 }
@@ -213,6 +237,7 @@ impl Tool for RunSkillsTool {
             &self.project_path,
             self.user_dir.as_deref(),
             &self.extra_builtins,
+            self.vfs_skills_dir.as_deref(),
         );
 
         match name.as_deref() {
@@ -281,6 +306,7 @@ mod tests {
         RunSkillsTool {
             project_path: project,
             user_dir: None,
+            vfs_skills_dir: None,
             extra_builtins: vec![],
         }
     }
@@ -335,7 +361,7 @@ mod tests {
     fn list_for_prompt() {
         let d = tmp();
         setup_skill(&d, "s1", "## Description\nfirst\n");
-        let list = skills_list_for_prompt(&d, None, &[]);
+        let list = skills_list_for_prompt(&d, None, &[], None);
         assert!(list.contains("s1"));
     }
 
@@ -346,20 +372,21 @@ mod tests {
         let hidden = d.join(".aacode").join("skills").join("dup");
         std::fs::create_dir_all(&hidden).unwrap();
         std::fs::write(hidden.join("SKILL.md"), "## Description\nfrom aacode dir\n").unwrap();
-        let skills = discover_skills(&d, None, &[]);
+        let skills = discover_skills(&d, None, &[], None);
         assert_eq!(skills.iter().filter(|s| s.name == "dup").count(), 1);
     }
 
     // ── user_dir mode ──────────────────────────────────────────────
 
     #[test]
-    fn user_dir_mode_includes_skill_creator_only_by_default() {
+    fn user_dir_mode_includes_always_injected_and_user_skills() {
         let project = tmp();
         let user = tmp();
         setup_skill_at(&user, "api_probe", "## Description\nProbe an API\n");
-        let skills = discover_skills(&project, Some(&user), &[]);
+        let skills = discover_skills(&project, Some(&user), &[], None);
         let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"skill_creator"), "skill_creator must always appear: {names:?}");
+        assert!(names.contains(&"book_writer"), "book_writer must always appear: {names:?}");
         assert!(names.contains(&"api_probe"));
         assert!(!names.contains(&"agent_cron"), "agent_cron must NOT appear without extra_builtins");
     }
@@ -368,7 +395,7 @@ mod tests {
     fn extra_builtins_gates_agent_cron() {
         let project = tmp();
         let user = tmp();
-        let skills = discover_skills(&project, Some(&user), &["agent_cron".into()]);
+        let skills = discover_skills(&project, Some(&user), &["agent_cron".into()], None);
         let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"agent_cron"));
     }
@@ -377,7 +404,7 @@ mod tests {
     fn user_dir_placeholder_substituted() {
         let project = tmp();
         let user = tmp();
-        let skills = discover_skills(&project, Some(&user), &[]);
+        let skills = discover_skills(&project, Some(&user), &[], None);
         let creator = skills.iter().find(|s| s.name == "skill_creator").unwrap();
         assert!(!creator.full_md.contains("{SKILLS_DIR}"));
         assert!(creator.full_md.contains(&user.to_string_lossy().to_string()));
@@ -388,7 +415,7 @@ mod tests {
         let project = tmp();
         let user = tmp();
         setup_skill_at(&user, "skill_creator", "## Description\ncustom override\n");
-        let skills = discover_skills(&project, Some(&user), &[]);
+        let skills = discover_skills(&project, Some(&user), &[], None);
         let creator = skills.iter().find(|s| s.name == "skill_creator").unwrap();
         assert_eq!(creator.description, "custom override");
     }
@@ -402,6 +429,7 @@ mod tests {
         let t = RunSkillsTool {
             project_path: project.clone(),
             user_dir: Some(user.clone()),
+            vfs_skills_dir: None,
             extra_builtins: vec!["agent_cron".into()],
         };
         let cancel = AtomicBool::new(false);
@@ -416,7 +444,7 @@ mod tests {
             .unwrap();
         assert!(info.contains("## Remote Endpoint"));
         assert!(info.contains("abc"));
-        let prompt = skills_list_for_prompt(&project, Some(&user), &["agent_cron".into()]);
+        let prompt = skills_list_for_prompt(&project, Some(&user), &["agent_cron".into()], None);
         assert!(prompt.contains("remote_box"));
         assert!(prompt.contains("agent_cron"));
         assert!(!prompt.contains("abc"));

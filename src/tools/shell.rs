@@ -92,7 +92,7 @@ impl Tool for ShellTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "run_shell",
-            "Execute shell commands — the universal Swiss Army knife. Use for ALL file read/write/search operations. There is no write_file, read_file or edit_file tool — use run_shell + shell commands (cat/tail for reading, echo/sed/awk for writing/editing, grep/rg/find for searching, git/python/pytest/gcc/go etc). Supports pipes (|), redirection (>), heredocs (<< 'EOF'), chaining (&& / || / ;), command substitution ($(...)), and variable expansion ($VAR). Always returns a result object with stdout, stderr, and returncode — check returncode for success.",
+            "Execute shell commands — the universal Swiss Army knife. This is the ONLY tool for ALL file operations. Use shell commands for: reading (cat/tail/head file), writing (echo text > file, cat > file << 'EOF'), editing (sed/awk), searching (grep/rg/find), running code (python/node/go/rustc/gcc), testing (pytest/cargo test), git, and more. Supports pipes (|), redirection (>), heredocs (<< 'EOF'), chaining (&& / || / ;), command substitution ($(...)), and variable expansion ($VAR). Always returns a result object with stdout, stderr, and returncode — check returncode for success.",
             vec![
                 ToolParameter::new(
                     "command",
@@ -171,7 +171,6 @@ impl Tool for ShellTool {
             "returncode": result.exit_code,
             "stdout": stdout,
             "stderr": stderr,
-            "command": command,
             "backend": self.backend.kind(),
         })
         .to_string())

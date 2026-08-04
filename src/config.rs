@@ -58,6 +58,9 @@ pub struct ModelConfig {
     pub max_tokens: u32,
     #[serde(default)]
     pub multimodal: bool,
+    /// Per-request deadline (secs). Falls back to config.timeouts.model_request.
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 fn default_model_name() -> String {
@@ -80,6 +83,7 @@ impl Default for ModelConfig {
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             multimodal: false,
+            request_timeout_secs: None,
         }
     }
 }
@@ -356,6 +360,18 @@ pub struct SkillsConfig {
     /// that don't pass this field never see platform-specific builtins.
     #[serde(default)]
     pub extra_builtins: Vec<String>,
+    /// VFS-internal path for `{SKILLS_DIR}` substitution in skill prompts.
+    /// Computed at runtime from `user_dir` relative to the shell sandbox root.
+    ///
+    /// The path starts with `/` (e.g. `/skills`) because the VFS sandbox
+    /// interprets leading-`/` paths as relative to the VFS root rather than
+    /// the real filesystem root. This keeps prompts short and platform-neutral.
+    ///
+    /// When `None`, substitution falls back to `user_dir` (legacy absolute path).
+    /// Marked `#[serde(skip)]` because the host never sets it — the shell
+    /// root widening logic in ffi.rs computes it.
+    #[serde(skip, default)]
+    pub vfs_skills_dir: Option<String>,
 }
 
 /// The complete agent configuration.
