@@ -26,6 +26,7 @@ pub struct ShellTool {
     cwd: std::path::PathBuf,
     max_output_chars: usize,
     default_timeout_secs: u64,
+    default_idle_timeout_secs: u64,
     safety: SafetyConfig,
 }
 
@@ -35,6 +36,7 @@ impl ShellTool {
         cwd: std::path::PathBuf,
         max_output_chars: usize,
         default_timeout_secs: u64,
+        default_idle_timeout_secs: u64,
         safety: SafetyConfig,
     ) -> Self {
         ShellTool {
@@ -43,6 +45,7 @@ impl ShellTool {
             cwd,
             max_output_chars,
             default_timeout_secs,
+            default_idle_timeout_secs,
             safety,
         }
     }
@@ -105,8 +108,15 @@ impl Tool for ShellTool {
                     "timeout",
                     ParamType::Integer,
                     false,
-                    "Command timeout in seconds.",
+                    "Total command timeout in seconds.",
                     &["time_limit", "max_time", "wait"],
+                ),
+                ToolParameter::new(
+                    "idle_timeout",
+                    ParamType::Integer,
+                    false,
+                    "Max seconds with no output before killing (idle timeout). Default: 30.",
+                    &["idle_time", "no_output_timeout"],
                 ),
                 ToolParameter::new(
                     "stdin_input",
@@ -151,10 +161,14 @@ impl Tool for ShellTool {
             .get("timeout")
             .and_then(|v| v.as_u64())
             .unwrap_or(self.default_timeout_secs);
+        let idle_timeout = args
+            .get("idle_timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.default_idle_timeout_secs);
 
         let result = self
             .backend
-            .run(&command, stdin_input, timeout, &self.cwd);
+            .run(&command, stdin_input, timeout, idle_timeout, &self.cwd);
 
         // Per-call max_output override; else the tool's configured cap.
         let limit = args
@@ -189,6 +203,7 @@ mod tests {
             Arc::new(NativeShell::new()),
             cwd,
             24000,
+            30,
             30,
             SafetyConfig::default(),
         )
@@ -263,7 +278,7 @@ mod tests {
         let dir = tmp();
         let mut safety = SafetyConfig::default();
         safety.dangerous_command_action = DangerAction::Reject;
-        let t = ShellTool::new(Arc::new(NativeShell::new()), dir, 24000, 30, safety);
+        let t = ShellTool::new(Arc::new(NativeShell::new()), dir, 24000, 30, 30, safety);
         let cancel = AtomicBool::new(false);
         let out = t.call(&json!({"command": "rm -rf /"}), &cancel).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -280,7 +295,7 @@ mod tests {
         cfg.python_enabled = false;
         fs.init(cfg).unwrap();
         let backend = Arc::new(FastshellBackend::new(Arc::new(Mutex::new(fs))));
-        let t = ShellTool::new(backend, dir, 24000, 30, SafetyConfig::default());
+        let t = ShellTool::new(backend, dir, 24000, 30, 30, SafetyConfig::default());
         let cancel = AtomicBool::new(false);
         let out = t.call(&json!({"command": "echo sandboxed"}), &cancel).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();

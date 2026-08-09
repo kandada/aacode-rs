@@ -10,6 +10,7 @@
 use super::sse::SseReader;
 use super::types::{ChatMessage, LlmResponse, ToolCall};
 use super::LlmClient;
+use super::truncate;
 use crate::config::ModelConfig;
 use crate::error::{AacodeError, Result};
 use crate::stream::EventSink;
@@ -205,16 +206,22 @@ pub fn parse_openai_stream<R: std::io::Read>(
         let mut sse = SseReader::new(reader);
         let mut text = String::new();
         let mut reasoning = String::new();
-        let mut thinking_seg_open = false;
         let mut tool_accs: BTreeMap<i64, ToolAcc> = BTreeMap::new();
         let mut finish_reason: Option<String> = None;
+        let mut valid_chunks: usize = 0;
+        let mut total_payloads: usize = 0;
 
-        while let Some(payload) = sse.next_data() {
+        while let Some(payload) = match sse.next_data() {
+            Ok(Some(p)) => Some(p),
+            Ok(None) => None,
+            Err(e) => return Err(AacodeError::Network(format!("SSE read error: {e}"))),
+        } {
             if cancel.load(Ordering::SeqCst) {
                 return Err(AacodeError::Cancelled);
             }
+            total_payloads += 1;
             let chunk: Value = match serde_json::from_str(&payload) {
-                Ok(v) => v,
+                Ok(v) => { valid_chunks += 1; v }
                 Err(_) => continue, // skip malformed keep-alive fragments
             };
             // In-stream error: some providers send {"error": {...}} mid-stream
@@ -248,7 +255,6 @@ pub fn parse_openai_stream<R: std::io::Read>(
                 .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()));
             if let Some(rc) = rc_opt {
                 if !rc.is_empty() {
-                    thinking_seg_open = true;
                     reasoning.push_str(rc);
                     emitter.delta("thinking", rc);
                 }
@@ -256,10 +262,6 @@ pub fn parse_openai_stream<R: std::io::Read>(
             // content (visible thought)
             if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
                 if !c.is_empty() {
-                    if thinking_seg_open {
-                        thinking_seg_open = false;
-                        emitter.seg("thinking", &reasoning);
-                    }
                     text.push_str(c);
                     emitter.delta("thought", c);
                 }
@@ -297,11 +299,21 @@ pub fn parse_openai_stream<R: std::io::Read>(
             }
         }
 
-        // Flush any dangling thinking segment (no content followed it).
-        if thinking_seg_open && !reasoning.is_empty() {
+        // If the stream produced SSE payloads but NONE were parseable JSON,
+        // the connection is producing garbage — don't silently return an empty
+        // response (which the ReAct loop misinterprets as "completed").
+        if total_payloads > 0 && valid_chunks == 0 {
+            return Err(AacodeError::Api(
+                "stream returned no parseable data (all chunks malformed)".into(),
+            ));
+        }
+
+        // Emit final segments at stream completion (same as Anthropic).
+        // Deferring seg to the end avoids mid-stream content "rollback" when
+        // a first attempt leaks partial output before a retry.
+        if !reasoning.is_empty() {
             emitter.seg("thinking", &reasoning);
         }
-        // Emit the final thought segment.
         emitter.seg("thought", &text);
 
         // Assemble tool_calls in index order.
@@ -341,17 +353,6 @@ pub fn parse_openai_stream<R: std::io::Read>(
             },
             finish_reason,
         })
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    // Char-boundary-safe truncation (byte slicing would panic on multibyte
-    // characters such as Chinese error messages).
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(n).collect();
-        format!("{head}...")
-    }
 }
 
 #[cfg(test)]
@@ -566,6 +567,297 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let r = parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel);
         assert!(matches!(r, Err(crate::error::AacodeError::Cancelled)));
+    }
+
+    /// Regression: when the SSE stream drops mid-response (socket timeout /
+    /// connection reset), the parser must return an Err — not silently
+    /// return Ok with empty tool_calls.
+    #[test]
+    fn sse_read_error_propagates_as_stream_error() {
+        struct BrokenReader;
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated timeout"))
+            }
+        }
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let r = parse_openai_stream(BrokenReader, &sink, &cancel);
+        assert!(r.is_err(), "SSE read error must propagate, not silently return Ok");
+    }
+
+    /// A partial stream that has begun but is cut off before any tool_calls:
+    /// the parser must return an error so the caller can distinguish
+    /// "connection lost" from "model finished".
+    #[test]
+    fn mid_stream_disconnect_not_empty_tool_calls() {
+        // Simulate: first chunk arrives, second read times out.
+        struct DropAfterFirst { sent: bool }
+        impl std::io::Read for DropAfterFirst {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+                } else {
+                    self.sent = true;
+                    let data = b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+            }
+        }
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let r = parse_openai_stream(DropAfterFirst { sent: false }, &sink, &cancel);
+        assert!(r.is_err(), "mid-stream disconnect must error, not return empty tool_calls");
+    }
+
+    #[test]
+    fn all_malformed_chunks_error_instead_of_empty_response() {
+        let raw = concat!(
+            "data: {this is not valid json\n\n",
+            "data: }also not json\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let r = parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel);
+        assert!(r.is_err(), "all-malformed chunks must produce an error");
+        let msg = format!("{}", r.err().unwrap());
+        assert!(msg.contains("malformed") || msg.contains("parseable"));
+    }
+
+    // ── deferred thinking seg tests ─────────────────────────────────
+
+    #[test]
+    fn thinking_seg_emitted_at_stream_end() {
+        // Reasoning deltas come first, then content. The seg("thinking")
+        // must appear AFTER all deltas (at stream completion), not mid-stream.
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think 1\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" think 2\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer 1\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" answer 2\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.text, "answer 1 answer 2");
+        assert_eq!(resp.reasoning_content.as_deref(), Some("think 1 think 2"));
+
+        let lines = sink.lines();
+        // Find the index of each event type to verify ordering.
+        let first_delta = lines
+            .iter()
+            .position(|l| l.contains(r#""type":"delta""#))
+            .expect("delta missing");
+        let thinking_seg_pos = lines
+            .iter()
+            .position(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#))
+            .expect("thinking seg missing");
+        let thought_seg_pos = lines
+            .iter()
+            .position(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#))
+            .expect("thought seg missing");
+
+        // seg("thinking") must come after all deltas and before seg("thought").
+        assert!(
+            thinking_seg_pos > first_delta,
+            "thinking seg must come after deltas, not mid-stream"
+        );
+        assert!(
+            thinking_seg_pos < thought_seg_pos,
+            "thinking seg must come before thought seg"
+        );
+    }
+
+    #[test]
+    fn reasoning_only_stream_emits_thinking_seg() {
+        // Pure reasoning stream (no content deltas). seg("thinking") must
+        // still be emitted at the end, and seg("thought") with empty text.
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking only\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.text, "");
+        assert_eq!(resp.reasoning_content.as_deref(), Some("thinking only"));
+
+        let lines = sink.lines();
+        assert!(
+            lines.iter().any(|l| l.contains(r#""seg":"thinking""#)),
+            "reasoning-only stream must emit thinking seg: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(r#""seg":"thought""#)),
+            "reasoning-only stream must emit thought seg: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn content_only_stream_no_thinking_seg() {
+        // No reasoning deltas — seg("thinking") must NOT appear.
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.text, "hello");
+        assert!(resp.reasoning_content.is_none());
+
+        let lines = sink.lines();
+        assert!(
+            !lines.iter().any(|l| l.contains(r#""seg":"thinking""#)),
+            "content-only stream must not emit thinking seg: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(r#""seg":"thought""#)),
+            "content-only stream must still emit thought seg"
+        );
+    }
+
+    #[test]
+    fn mid_stream_failure_does_not_emit_thinking_seg() {
+        // A stream that delivers reasoning deltas but then fails (SSE read
+        // error) before completing. No seg("thinking") should leak to the
+        // client because the stream never finished successfully.
+        struct FailAfterTwoReads {
+            reads: u32,
+        }
+        impl std::io::Read for FailAfterTwoReads {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads > 2 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "mid-stream disconnect",
+                    ));
+                }
+                // First two reads deliver reasoning content.
+                let data = b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial\"}}]}\n\n";
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                Ok(n)
+            }
+        }
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let r = parse_openai_stream(FailAfterTwoReads { reads: 0 }, &sink, &cancel);
+        assert!(r.is_err(), "mid-stream failure must return error");
+
+        let lines = sink.lines();
+        // Deltas may have leaked (first two reads), but seg_content("thinking")
+        // must NOT appear because the stream never completed.
+        let has_thinking_delta = lines
+            .iter()
+            .any(|l| l.contains(r#""type":"delta""#) && l.contains(r#""seg":"thinking""#));
+        assert!(
+            has_thinking_delta,
+            "thinking deltas should have reached the sink"
+        );
+        assert!(
+            !lines.iter().any(|l| {
+                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#)
+            }),
+            "failed stream must not emit thinking seg: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_seg_content_matches_accumulated_deltas() {
+        // The final seg("thinking") content must equal the sum of all
+        // delta("thinking") content.
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step 1\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" step 2\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"final\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.reasoning_content.as_deref(), Some("step 1 step 2"));
+
+        let lines = sink.lines();
+        // Find the seg_content line (not delta) for thinking.
+        let thinking_seg_line = lines
+            .iter()
+            .find(|l| {
+                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#)
+            })
+            .expect("thinking seg missing");
+        let seg_json: serde_json::Value =
+            serde_json::from_str(thinking_seg_line).expect("invalid JSON");
+        let seg_content = seg_json["content"].as_str().unwrap();
+
+        // Extract and concatenate all delta("thinking") content.
+        let accumulated_deltas: String = lines
+            .iter()
+            .filter(|l| {
+                l.contains(r#""type":"delta""#) && l.contains(r#""seg":"thinking""#)
+            })
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["content"].as_str().unwrap().to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            seg_content, accumulated_deltas,
+            "seg('thinking') content must match sum of all delta('thinking') content"
+        );
+    }
+
+    #[test]
+    fn interleaved_reasoning_content_thinking_seg_still_at_end() {
+        // Real-world scenario: reasoning/content chunks interleave.
+        // seg("thinking") must still appear at stream completion, not inline.
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I need\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Let's\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" to check\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" do it\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.text, "Let's do it");
+        assert_eq!(resp.reasoning_content.as_deref(), Some("I need to check"));
+
+        let lines = sink.lines();
+        // Count how many seg_content("thinking") lines appear — must be exactly 1.
+        let thinking_seg_count = lines
+            .iter()
+            .filter(|l| {
+                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#)
+            })
+            .count();
+        assert_eq!(
+            thinking_seg_count, 1,
+            "exactly one thinking seg at end, got {thinking_seg_count}: {lines:?}"
+        );
+        // Count seg_content("thought") lines — must be exactly 1.
+        let thought_seg_count = lines
+            .iter()
+            .filter(|l| {
+                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#)
+            })
+            .count();
+        assert_eq!(
+            thought_seg_count, 1,
+            "exactly one thought seg at end, got {thought_seg_count}: {lines:?}"
+        );
     }
 }
 

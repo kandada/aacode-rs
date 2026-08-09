@@ -168,7 +168,7 @@ mod tests {
         cfg.model.api_key = Some("x".into());
         cfg.shell_backend = ShellBackendChoice::Native;
         let rt = AgentRuntime::init(cfg, d.clone()).unwrap();
-        let out = rt.backend.run("echo hi > f.txt && cat f.txt", None, 10, &d);
+        let out = rt.backend.run("echo hi > f.txt && cat f.txt", None, 10, 0, &d);
         assert!(out.stdout.contains("hi"));
         // File created at the real project dir (no VFS jail nesting).
         assert!(d.join("f.txt").exists());
@@ -182,7 +182,7 @@ mod tests {
         cfg.shell_backend = ShellBackendChoice::Fastshell;
         let rt = AgentRuntime::init(cfg, d).unwrap();
         assert_eq!(rt.backend_kind(), "fastshell");
-        let out = rt.backend.run("echo hi", None, 10, std::path::Path::new("."));
+        let out = rt.backend.run("echo hi", None, 10, 0, std::path::Path::new("."));
         assert!(out.stdout.contains("hi"));
     }
 

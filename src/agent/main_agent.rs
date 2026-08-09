@@ -261,6 +261,7 @@ mod tests {
             _command: &str,
             _stdin_input: Option<&str>,
             _timeout_secs: u64,
+            _idle_timeout_secs: u64,
             _cwd: &std::path::Path,
         ) -> CmdOutput {
             CmdOutput { stdout: String::new(), stderr: String::new(), exit_code: 0 }

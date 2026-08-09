@@ -62,7 +62,7 @@ impl Tool for ExecutePythonTool {
         //   Desktop (NativeShell)   → sh -c "python3 /path/to/temp.py"
         //   Mobile  (FastshellBackend) → fastshell detects python3 → embedded CPython
         let cmd = format!("python3 {:?}", temp_path.to_string_lossy());
-        let result = self.backend.run(&cmd, stdin_input, self.default_timeout_secs, &self.project_path);
+        let result = self.backend.run(&cmd, stdin_input, self.default_timeout_secs, 0, &self.project_path);
 
         let rel = temp_path
             .strip_prefix(&self.project_path)

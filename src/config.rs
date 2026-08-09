@@ -165,6 +165,8 @@ impl ModelConfig {
 pub struct Timeouts {
     #[serde(default = "d_shell")]
     pub shell_command: u64,
+    #[serde(default = "d_shell_idle")]
+    pub shell_idle: u64,
     #[serde(default = "d_web")]
     pub web_request: u64,
     #[serde(default = "d_model")]
@@ -172,6 +174,9 @@ pub struct Timeouts {
 }
 fn d_shell() -> u64 {
     120
+}
+fn d_shell_idle() -> u64 {
+    30
 }
 fn d_web() -> u64 {
     15
@@ -183,6 +188,7 @@ impl Default for Timeouts {
     fn default() -> Self {
         Timeouts {
             shell_command: d_shell(),
+            shell_idle: d_shell_idle(),
             web_request: d_web(),
             model_request: d_model(),
         }
@@ -405,7 +411,7 @@ pub struct AgentConfig {
 }
 
 fn d_max_iter() -> u32 {
-    30
+    300
 }
 
 impl Default for AgentConfig {

@@ -105,6 +105,7 @@ fn register_core_tools(
         project_path.clone(),
         config.limits.tool_output_chars,
         config.timeouts.shell_command,
+        config.timeouts.shell_idle,
         config.safety.clone(),
     )));
 

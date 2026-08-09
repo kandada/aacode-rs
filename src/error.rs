@@ -64,6 +64,7 @@ impl AacodeError {
     pub fn is_retryable(&self) -> bool {
         match self {
             AacodeError::Network(_) => true,
+            AacodeError::Json(_) => true,
             AacodeError::Api(m) => {
                 let l = m.to_lowercase();
                 l.contains("timeout")
@@ -95,6 +96,7 @@ mod tests {
         assert!(AacodeError::Network("reset".into()).is_retryable());
         assert!(AacodeError::Api("HTTP 503 unavailable".into()).is_retryable());
         assert!(AacodeError::Api("rate limit exceeded".into()).is_retryable());
+        assert!(AacodeError::Json("malformed response".into()).is_retryable());
         assert!(!AacodeError::Api("HTTP 401 unauthorized".into()).is_retryable());
         assert!(!AacodeError::Config("no key".into()).is_retryable());
     }

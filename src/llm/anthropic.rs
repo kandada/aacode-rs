@@ -11,6 +11,7 @@
 use super::sse::SseReader;
 use super::types::{ChatMessage, LlmResponse, ToolCall};
 use super::LlmClient;
+use super::truncate;
 use crate::config::ModelConfig;
 use crate::error::{AacodeError, Result};
 use crate::stream::EventSink;
@@ -231,13 +232,20 @@ pub fn parse_anthropic_stream<R: std::io::Read>(
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut stop_reason: Option<String> = None;
+    let mut valid_chunks: usize = 0;
+    let mut total_payloads: usize = 0;
 
-    while let Some(payload) = sse.next_data() {
+    while let Some(payload) = match sse.next_data() {
+        Ok(Some(p)) => Some(p),
+        Ok(None) => None,
+        Err(e) => return Err(AacodeError::Network(format!("SSE read error: {e}"))),
+    } {
         if cancel.load(Ordering::SeqCst) {
             return Err(AacodeError::Cancelled);
         }
+        total_payloads += 1;
         let ev: Value = match serde_json::from_str(&payload) {
-            Ok(v) => v,
+            Ok(v) => { valid_chunks += 1; v }
             Err(_) => continue,
         };
         let etype = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -315,6 +323,21 @@ pub fn parse_anthropic_stream<R: std::io::Read>(
         }
     }
 
+    if total_payloads > 0 && valid_chunks == 0 {
+        return Err(AacodeError::Api(
+            "stream returned no parseable data (all chunks malformed)".into(),
+        ));
+    }
+
+    // Stream had content but never received a message_delta with stop_reason
+    // (connection closed before the server sent the final event). Treat as
+    // truncated so the ReAct loop knows the response may be incomplete.
+    if stop_reason.is_none()
+        && (!text.is_empty() || !reasoning.is_empty() || !blocks.is_empty())
+    {
+        stop_reason = Some("connection_closed".to_string());
+    }
+
     if !reasoning.is_empty() {
         emitter.seg("thinking", &reasoning);
     }
@@ -361,16 +384,6 @@ pub fn parse_anthropic_stream<R: std::io::Read>(
         },
         finish_reason: stop_reason,
     })
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    // Char-boundary-safe truncation (byte slicing would panic on multibyte chars).
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(n).collect();
-        format!("{head}...")
-    }
 }
 
 #[cfg(test)]
@@ -544,5 +557,49 @@ mod tests {
             parse_anthropic_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
         assert!(resp.is_truncated());
         assert!(resp.text.contains("truncated"));
+    }
+
+    #[test]
+    fn sse_read_error_propagates_in_anthropic_parser() {
+        struct BrokenReader;
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated timeout"))
+            }
+        }
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let r = parse_anthropic_stream(BrokenReader, &sink, &cancel);
+        assert!(r.is_err(), "SSE read error must propagate to Anthropic parser");
+    }
+
+    #[test]
+    fn stream_no_stop_reason_gets_connection_closed() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"content without stop\"}}\n\n"
+            // No message_delta — stream ended prematurely
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_anthropic_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.finish_reason, Some("connection_closed".to_string()));
+        assert!(resp.is_truncated());
+        assert_eq!(resp.text, "content without stop");
+    }
+
+    #[test]
+    fn all_malformed_chunks_error() {
+        let raw = concat!(
+            "data: {not valid json\n\n",
+            "data: }also not json\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let r = parse_anthropic_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel);
+        assert!(r.is_err());
+        assert!(format!("{}", r.err().unwrap()).contains("malformed"));
     }
 }

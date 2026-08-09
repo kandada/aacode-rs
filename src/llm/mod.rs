@@ -38,3 +38,14 @@ pub fn build_client(model: &ModelConfig) -> Box<dyn LlmClient> {
         Gateway::Openai => Box::new(openai::OpenAiClient::new(model.clone())),
     }
 }
+
+/// Char-boundary-safe truncation (byte slicing would panic on multibyte
+/// characters such as Chinese error messages).
+pub(crate) fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(n).collect();
+        format!("{head}...")
+    }
+}

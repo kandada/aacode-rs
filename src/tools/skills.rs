@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 /// Builtin document skills embedded at compile time. `{SKILLS_DIR}` inside
 /// the body is replaced with the configured user skills directory.
@@ -212,6 +213,13 @@ impl Tool for RunSkillsTool {
             vec![
                 ToolParameter::new("skill_name", ParamType::String, false, "Skill name or __list__/__info__", &["skill", "name"]),
                 ToolParameter::new("params", ParamType::Object, false, "Skill params (may include skill_name for __info__)", &["arguments", "args", "kwargs"]),
+                ToolParameter::new(
+                    "timeout",
+                    ParamType::Integer,
+                    false,
+                    "Max seconds for skill discovery. Default: 5.",
+                    &["time_limit", "max_time"],
+                ),
             ],
         )
     }
@@ -233,12 +241,25 @@ impl Tool for RunSkillsTool {
                 .map(|s| s.to_string())
         });
 
-        let skills = discover_skills(
-            &self.project_path,
-            self.user_dir.as_deref(),
-            &self.extra_builtins,
-            self.vfs_skills_dir.as_deref(),
-        );
+        let timeout = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pp = self.project_path.clone();
+        let ud = self.user_dir.clone();
+        let eb = self.extra_builtins.clone();
+        let vsd = self.vfs_skills_dir.clone();
+        std::thread::spawn(move || {
+            let skills = discover_skills(&pp, ud.as_deref(), &eb, vsd.as_deref());
+            let _ = tx.send(skills);
+        });
+
+        let skills = match rx.recv_timeout(Duration::from_secs(timeout)) {
+            Ok(s) => s,
+            Err(_) => return Ok("Error: skill discovery timed out".to_string()),
+        };
 
         match name.as_deref() {
             None | Some("__list__") | Some("list") | Some("--list") | Some("ls") => {
