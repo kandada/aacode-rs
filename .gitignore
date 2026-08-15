@@ -7,3 +7,6 @@ LLM_CLIENT.md
 DEPS.md
 /.backup
 USAGE.md
+/design_diff_hook.md
+/SESSION_FFI.md
+/.idea/

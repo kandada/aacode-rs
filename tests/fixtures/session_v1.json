@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "session_id": "session_1700000000_abc12345",
+  "created_at": "1700000000",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Create a hello.py file",
+      "timestamp": "1700000001",
+      "tokens": 5
+    },
+    {
+      "role": "assistant",
+      "content": "I'll create it.",
+      "timestamp": "1700000002",
+      "tokens": 12,
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "run_shell",
+          "arguments": "{\"command\":\"echo hello\"}"
+        }
+      ],
+      "reasoning_content": "I should run a shell command"
+    },
+    {
+      "role": "tool",
+      "content": "hello",
+      "timestamp": "1700000003",
+      "tokens": 1,
+      "tool_call_id": "call_1"
+    }
+  ]
+}

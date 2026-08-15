@@ -2,12 +2,13 @@
 // Licensed under GPL-3.0, see LICENSE file for full license terms.
 
 //! Concurrency integration tests: multiple agent tasks running in parallel
-//! through the real C ABI (`aacode_run_task_with_cb`), verifying stream
-//! isolation, per-task cancellation, and same-session rejection.
+//! through the real C ABI (`aacode_task_start` / `aacode_task_wait` /
+//! `aacode_task_cancel`), verifying stream isolation, per-task cancellation,
+//! and same-session rejection.
 
-use aacode_rs::ffi::{aacode_cancel_task, aacode_run_task_with_cb};
+use aacode_rs::ffi::{aacode_free_string, aacode_task_cancel, aacode_task_start, aacode_task_wait};
 use serde_json::json;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -75,11 +76,10 @@ fn tmp_project(tag: &str) -> std::path::PathBuf {
     d
 }
 
-fn task_json(addr: &str, project: &std::path::Path, task: &str, task_id: &str, session_id: Option<&str>) -> CString {
+fn task_json(addr: &str, project: &std::path::Path, task: &str, session_id: Option<&str>) -> CString {
     let mut v = json!({
         "task": task,
         "project_path": project.to_string_lossy(),
-        "client_task_id": task_id,
         "model": {
             "name": "mock-model",
             "api_key": "sk-test",
@@ -93,18 +93,24 @@ fn task_json(addr: &str, project: &std::path::Path, task: &str, task_id: &str, s
     CString::new(v.to_string()).unwrap()
 }
 
-fn run_ffi(task: &CString, cb: extern "C" fn(*const c_char)) -> String {
-    let ptr = aacode_run_task_with_cb(task.as_ptr(), cb);
+fn wait_and_free(h: *mut aacode_rs::ffi::AacodeTask) -> String {
+    let ptr = aacode_task_wait(h);
     let out = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_string() };
-    aacode_rs::ffi::aacode_free_string(ptr);
+    aacode_free_string(ptr);
+    aacode_rs::ffi::aacode_task_free(h);
     out
+}
+
+fn run_ffi(task: &CString, cb: extern "C" fn(*const c_char, *mut c_void)) -> String {
+    let h = aacode_task_start(task.as_ptr(), Some(cb), std::ptr::null_mut());
+    wait_and_free(h)
 }
 
 // Per-test static collectors (extern "C" fns can't capture closures).
 macro_rules! collector {
     ($buf:ident, $cb:ident) => {
         static $buf: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        extern "C" fn $cb(line: *const c_char) {
+        extern "C" fn $cb(line: *const c_char, _userdata: *mut c_void) {
             if line.is_null() {
                 return;
             }
@@ -128,13 +134,14 @@ fn parallel_tasks_have_isolated_streams() {
     let proj_a = tmp_project("a");
     let proj_b = tmp_project("b");
 
-    let ta = task_json(&mock_a.addr, &proj_a, "task alpha", "cc_alpha", None);
-    let tb = task_json(&mock_b.addr, &proj_b, "task bravo", "cc_bravo", None);
+    let ta = task_json(&mock_a.addr, &proj_a, "task alpha", None);
+    let tb = task_json(&mock_b.addr, &proj_b, "task bravo", None);
 
-    let ha = thread::spawn(move || run_ffi(&ta, cb_alpha));
-    let hb = thread::spawn(move || run_ffi(&tb, cb_bravo));
-    let ra = ha.join().unwrap();
-    let rb = hb.join().unwrap();
+    // Start both concurrently, then wait.
+    let h_a = aacode_task_start(ta.as_ptr(), Some(cb_alpha), std::ptr::null_mut());
+    let h_b = aacode_task_start(tb.as_ptr(), Some(cb_bravo), std::ptr::null_mut());
+    let ra = wait_and_free(h_a);
+    let rb = wait_and_free(h_b);
 
     assert!(ra.contains("completed"), "alpha result: {ra}");
     assert!(rb.contains("completed"), "bravo result: {rb}");
@@ -163,22 +170,20 @@ fn cancel_one_task_does_not_affect_the_other() {
     let proj_slow = tmp_project("slow");
     let proj_fast = tmp_project("fast");
 
-    let ts = task_json(&mock_slow.addr, &proj_slow, "slow task", "cc_slow", None);
-    let tf = task_json(&mock_fast.addr, &proj_fast, "fast task", "cc_fast", None);
+    let ts = task_json(&mock_slow.addr, &proj_slow, "slow task", None);
+    let tf = task_json(&mock_fast.addr, &proj_fast, "fast task", None);
 
-    let hs = thread::spawn(move || run_ffi(&ts, cb_slow));
-    // Give SLOW a moment to enter the sleep, then cancel ONLY it.
+    let h_slow = aacode_task_start(ts.as_ptr(), Some(cb_slow), std::ptr::null_mut());
+    // Give SLOW a moment to enter the sleep, then cancel ONLY it (by handle).
     thread::sleep(Duration::from_millis(600));
-    let id = CString::new("cc_slow").unwrap();
-    aacode_cancel_task(id.as_ptr());
+    aacode_task_cancel(h_slow);
 
-    // FAST starts after the cancel of SLOW — a global-cancel bug would have
-    // wiped it (the old code also reset flags on new task start; both broken
-    // behaviors are covered here).
-    let hf = thread::spawn(move || run_ffi(&tf, cb_fast));
+    // FAST starts after the cancel of SLOW — cancellation must be per-handle,
+    // never global.
+    let h_fast = aacode_task_start(tf.as_ptr(), Some(cb_fast), std::ptr::null_mut());
 
-    let rs = hs.join().unwrap();
-    let rf = hf.join().unwrap();
+    let rs = wait_and_free(h_slow);
+    let rf = wait_and_free(h_fast);
 
     assert!(
         rs.contains("cancelled"),
@@ -192,6 +197,28 @@ fn cancel_one_task_does_not_affect_the_other() {
 
 collector!(BUF_S1, cb_s1);
 collector!(BUF_S2, cb_s2);
+
+collector!(BUF_DONE, cb_done);
+
+#[test]
+fn terminal_done_event_carries_status_and_final_text() {
+    // The enriched `done` event (not just the return value) must carry the
+    // terminal outcome: status, iterations, final_text.
+    let mock = MockLlm::start(vec![sse_content("DONE_MARKER", "stop")]);
+    let proj = tmp_project("done_enrich");
+    let t = task_json(&mock.addr, &proj, "enrich task", None);
+    let r = run_ffi(&t, cb_done);
+    assert!(r.contains("completed"), "result: {r}");
+
+    let lines = BUF_DONE.lock().unwrap();
+    let done_line = lines
+        .iter()
+        .find(|l| l.contains(r#""type":"done""#))
+        .cloned()
+        .unwrap_or_default();
+    assert!(done_line.contains(r#""status":"completed""#), "done line: {done_line}");
+    assert!(done_line.contains("DONE_MARKER"), "final_text missing: {done_line}");
+}
 
 #[test]
 fn same_session_second_task_rejected() {
@@ -210,10 +237,10 @@ fn same_session_second_task_rejected() {
         sm.create_session("seed", None).unwrap()
     };
 
-    let t1 = task_json(&mock1.addr, &proj, "task one", "cc_s1", Some(&sid));
-    let t2 = task_json(&mock2.addr, &proj, "task two", "cc_s2", Some(&sid));
+    let t1 = task_json(&mock1.addr, &proj, "task one", Some(&sid));
+    let t2 = task_json(&mock2.addr, &proj, "task two", Some(&sid));
 
-    let h1 = thread::spawn(move || run_ffi(&t1, cb_s1));
+    let h1 = aacode_task_start(t1.as_ptr(), Some(cb_s1), std::ptr::null_mut());
     thread::sleep(Duration::from_millis(500));
     let start = std::time::Instant::now();
     let r2 = run_ffi(&t2, cb_s2);
@@ -225,12 +252,12 @@ fn same_session_second_task_rejected() {
     );
     assert!(elapsed.as_millis() < 500, "rejection must be immediate");
 
-    let r1 = h1.join().unwrap();
+    let r1 = wait_and_free(h1);
     assert!(r1.contains("completed"), "first task unaffected: {r1}");
 
     // After t1 finishes, the session is free again.
     let mock3 = MockLlm::start(vec![sse_content("t3 done", "stop")]);
-    let t3 = task_json(&mock3.addr, &proj, "task three", "cc_s3", Some(&sid));
+    let t3 = task_json(&mock3.addr, &proj, "task three", Some(&sid));
     let r3 = run_ffi(&t3, cb_s2);
     assert!(r3.contains("completed"), "session must be reusable: {r3}");
 }

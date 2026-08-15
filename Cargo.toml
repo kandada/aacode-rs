@@ -3,7 +3,7 @@
 
 [package]
 name = "aacode-rs"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 description = "Rust port of the AACode ReAct coding agent, built on fastshell for mobile AI agents"
 license = "GPL-3.0-only"
@@ -18,22 +18,20 @@ name = "aacode"
 path = "src/bin/aacode.rs"
 
 [dependencies]
-# Development: when fastshell sits alongside at ../fastshell, use the path dep.
-# Standalone: replace with git dep after fastshell is published.
-#   fastshell = { git = "https://github.com/xxx/fastshell", rev = "v0.2.2" }
-# Features:
-#   * "git"              — built-in git2-rs engine (required by AACodeApp).
-#   * "python-rustpython"— embedded RustPython (pure Rust; replaces the former
-#     Chaquopy CPython which crashed on real devices). LGPL malachite deps are
-#     replaced by clean-room shims — see fastshell/num_bigint/README.md.
-fastshell = { path = "../fastshell", features = ["git", "python-rustpython"] }
+fastshell = { path = "../fastshell", features = ["git", "python-rustpython", "js-oxc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2", features = ["json", "tls"] }
 regex = "1"
+tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
+reqwest = { version = "0.12", features = ["json", "stream", "blocking", "rustls-tls"], default-features = false }
+futures = "0.3"
+bytes = "1"
+async-trait = "0.1"
 
 [dev-dependencies]
 tiny_http = "0.12"
+tokio = { version = "1", features = ["full"] }

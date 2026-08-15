@@ -18,6 +18,8 @@ use crate::tools::ToolRegistry;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Outcome of a run.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,10 +30,35 @@ pub enum RunStatus {
     Error(String),
 }
 
+impl RunStatus {
+    /// Stable wire name for the status (used by the `done` event and the
+    /// terminal JSON returned by the FFI `wait`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunStatus::Completed => "completed",
+            RunStatus::MaxIterations => "max_iterations",
+            RunStatus::Cancelled => "cancelled",
+            RunStatus::Error(_) => "error",
+        }
+    }
+}
+
 pub struct RunResult {
     pub status: RunStatus,
     pub iterations: u32,
     pub final_text: String,
+}
+
+impl RunResult {
+    /// Serialize the terminal outcome as JSON (shared by `done` enrichment and
+    /// the FFI `wait` return value).
+    pub fn to_result_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": self.status.as_str(),
+            "iterations": self.iterations,
+            "final_text": self.final_text,
+        })
+    }
 }
 
 /// The ReAct loop driver. Borrows the collaborators for the duration of a run.
@@ -60,13 +87,14 @@ impl<'a> ReactLoop<'a> {
 
     /// Run the loop. `messages` starts with the system prompt + history + task.
     /// New messages are persisted to `session` incrementally.
-    pub fn run(
+    pub async fn run(
         &self,
         mut messages: Vec<ChatMessage>,
         session: &mut SessionManager,
         emitter: &dyn EventSink,
         cancel: &AtomicBool,
     ) -> Result<RunResult> {
+        let cancel_notify = Arc::new(Notify::new());
         let mut stale = StaleTracker::default();
         // Frozen compaction state: keeps the request prefix byte-stable
         // across iterations so the provider KV cache keeps hitting.
@@ -86,7 +114,7 @@ impl<'a> ReactLoop<'a> {
             }
 
             // Build compact view for the model call (does not mutate messages).
-            let (mut view, _compacted, tokens) =
+            let (mut view, compacted, tokens) =
                 build_compact_view_cached(&messages, &self.config.context, &mut compact_cache);
             // Enforce hard context limit: if even the compacted view exceeds
             // max_context_tokens the request would be rejected or silently
@@ -99,10 +127,14 @@ impl<'a> ReactLoop<'a> {
                     messages.len(),
                 )));
             }
-            // Last line of defense: never send a broken tool_calls pairing.
-            crate::agent::sanitize::sanitize_history(&mut view);
+            // Only re-sanitize after compaction — uncompacted views were
+            // already sanitized in MainAgent (history repair) and the ReAct
+            // loop never creates broken tool_calls/tool pairings on its own.
+            if compacted {
+                crate::agent::sanitize::sanitize_history(view.to_mut());
+            }
 
-            let resp = match self.chat_with_retry(&view, emitter, cancel) {
+            let resp = match self.chat_with_retry(&view, emitter, cancel, &cancel_notify).await {
                 Ok(r) => r,
                 Err(AacodeError::Cancelled) => {
                     emitter.error("cancelled");
@@ -155,7 +187,7 @@ impl<'a> ReactLoop<'a> {
                 };
                 messages.push(assistant.clone());
                 let _ = session.add_message(SessionMessage::from_chat(&assistant));
-                emitter.done(&session_id);
+                emitter.done_result(&session_id, "completed", iteration + 1, &last_text);
                 return Ok(RunResult {
                     status: RunStatus::Completed,
                     iterations: iteration + 1,
@@ -178,40 +210,83 @@ impl<'a> ReactLoop<'a> {
             messages.push(assistant_msg.clone());
             let _ = session.add_message(SessionMessage::from_chat(&assistant_msg));
 
-            // Execute each tool call.
-            for tc in &resp.tool_calls {
-                if cancel.load(Ordering::SeqCst) {
-                    emitter.error("cancelled");
-                    return Ok(RunResult {
-                        status: RunStatus::Cancelled,
-                        iterations: iteration + 1,
-                        final_text: String::new(),
-                    });
+            // Execute tool calls.
+            let tool_count = resp.tool_calls.len();
+            if tool_count > 1 {
+                use futures::future::join_all;
+                let cancel_arc = Arc::new(AtomicBool::new(false));
+                let cancel_ref = cancel as &AtomicBool; // reference from outer scope
+
+                let futures: Vec<_> = resp.tool_calls.iter().map(|tc| {
+                    let name = tc.name.clone();
+                    let args = tc.parsed_args();
+                    let cancel = cancel_arc.clone();
+                    async move {
+                        if cancel_ref.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
+                            return (tc.id.clone(), tc.name.clone(), "cancelled".to_string());
+                        }
+                        let obs = self.execute_with_retry(&name, args, emitter, cancel.as_ref()).await;
+                        (tc.id.clone(), tc.name.clone(), obs)
+                    }
+                }).collect();
+
+                let results = join_all(futures).await;
+
+                for (tc_id, tc_name, observation) in results {
+                    if cancel.load(Ordering::SeqCst) {
+                        emitter.error("cancelled");
+                        return Ok(RunResult {
+                            status: RunStatus::Cancelled,
+                            iterations: iteration + 1,
+                            final_text: String::new(),
+                        });
+                    }
+                    if tc_name == "fetch_url" {
+                        let url = resp.tool_calls.iter()
+                            .find(|tc| tc.id == tc_id)
+                            .and_then(|tc| tc.parsed_args().get("url")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        stale.record_fetch(&url, &observation);
+                    }
+                    emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
+                    let tool_msg = ChatMessage::tool_result(tc_id, observation);
+                    messages.push(tool_msg.clone());
+                    let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
                 }
-                let args = tc.parsed_args();
-                let observation = self.execute_with_retry(&tc.name, args, emitter, cancel);
-                // Record for stale detection (fetch_url).
-                if tc.name == "fetch_url" {
-                    let url = tc
-                        .parsed_args()
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    stale.record_fetch(&url, &observation);
+            } else {
+                // Single tool: sequential path
+                for tc in &resp.tool_calls {
+                    if cancel.load(Ordering::SeqCst) {
+                        emitter.error("cancelled");
+                        return Ok(RunResult {
+                            status: RunStatus::Cancelled,
+                            iterations: iteration + 1,
+                            final_text: String::new(),
+                        });
+                    }
+                    let args = tc.parsed_args();
+                    let observation = self.execute_with_retry(&tc.name, args, emitter, cancel).await;
+                    if tc.name == "fetch_url" {
+                        let url = tc.parsed_args().get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        stale.record_fetch(&url, &observation);
+                    }
+                    emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
+                    let tool_msg = ChatMessage::tool_result(tc.id.clone(), observation);
+                    messages.push(tool_msg.clone());
+                    let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
                 }
-                // Emit observation segment (preview) + persist full result.
-                emitter.seg("observation", &preview(&observation, self.config.limits.display_preview_chars));
-                let tool_msg = ChatMessage::tool_result(tc.id.clone(), observation);
-                messages.push(tool_msg.clone());
-                let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
             }
 
             // Context growth check (informational; compact view is built each iter).
             let _ = estimate_messages_tokens(&messages);
         }
 
-        emitter.done(&session_id);
+        emitter.done_result(&session_id, "max_iterations", self.config.max_iterations, &last_text);
         Ok(RunResult {
             status: RunStatus::MaxIterations,
             iterations: self.config.max_iterations,
@@ -220,11 +295,12 @@ impl<'a> ReactLoop<'a> {
     }
 
     /// Call the model with retry on transient (network/5xx/timeout) errors.
-    fn chat_with_retry(
+    async fn chat_with_retry(
         &self,
         view: &[ChatMessage],
         emitter: &dyn EventSink,
         cancel: &AtomicBool,
+        cancel_notify: &Notify,
     ) -> Result<crate::llm::types::LlmResponse> {
         let max = self.config.limits.max_retries.max(1);
         let mut last: Option<AacodeError> = None;
@@ -244,16 +320,19 @@ impl<'a> ReactLoop<'a> {
             // owned), so the CollectingSink borrow ends before we move it.
             let (result, buffered): (_, Option<CollectingSink>) = if use_buffered {
                 let b = CollectingSink::new(false);
-                let r = self
-                    .llm
-                    .chat_stream(view, &self.native_tools, &b, cancel);
+                let fut = self.llm.chat_stream(view, &self.native_tools, &b, cancel);
+                let r = tokio::select! {
+                    r = fut => r,
+                    _ = cancel_checker(cancel, cancel_notify) => Err(AacodeError::Cancelled),
+                };
                 (r, Some(b))
             } else {
-                (
-                    self.llm
-                        .chat_stream(view, &self.native_tools, emitter, cancel),
-                    None,
-                )
+                let fut = self.llm.chat_stream(view, &self.native_tools, emitter, cancel);
+                let r = tokio::select! {
+                    r = fut => r,
+                    _ = cancel_checker(cancel, cancel_notify) => Err(AacodeError::Cancelled),
+                };
+                (r, None)
             };
 
             match result {
@@ -298,7 +377,7 @@ impl<'a> ReactLoop<'a> {
                     } else {
                         delay * 1000
                     };
-                    std::thread::sleep(std::time::Duration::from_millis(actual));
+                    tokio::time::sleep(std::time::Duration::from_millis(actual)).await;
                 }
             }
         }
@@ -306,7 +385,7 @@ impl<'a> ReactLoop<'a> {
     }
 
     /// Execute a tool, retrying transient failures per config.limits.max_retries.
-    fn execute_with_retry(
+    async fn execute_with_retry(
         &self,
         name: &str,
         args: Value,
@@ -319,11 +398,13 @@ impl<'a> ReactLoop<'a> {
             if cancel.load(Ordering::SeqCst) {
                 return "cancelled".to_string();
             }
-            let obs = self.tools.execute(name, args.clone(), cancel);
+            let obs = self.tools.execute(name, args.clone(), cancel).await;
             let lower = obs.to_lowercase();
             let retryable = lower.contains("timeout")
+                || lower.contains("timed out")
                 || lower.contains("connection")
-                || lower.contains("temporary");
+                || lower.contains("temporary")
+                || lower.contains("network");
             last = obs;
             if !retryable || attempt + 1 >= max_retries {
                 break;
@@ -348,18 +429,6 @@ fn classify_api_error(e: &AacodeError) -> String {
     } else {
         s
     }
-}
-
-/// Truncate an observation to a preview length for display (agent still gets full).
-fn preview(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let head: String = text.chars().take(max).collect();
-    format!(
-        "{head}...\n\n(Display truncated, {} chars total. Agent received full content.)",
-        text.chars().count()
-    )
 }
 
 /// Tracks fetch_url results per domain to detect stale loops (mirrors Python).
@@ -435,8 +504,9 @@ mod tests {
     struct ScriptedLlm {
         responses: Mutex<Vec<LlmResponse>>,
     }
+    #[async_trait::async_trait]
     impl LlmClient for ScriptedLlm {
-        fn chat_stream(
+        async fn chat_stream(
             &self,
             _m: &[ChatMessage],
             _t: &[Value],
@@ -451,12 +521,13 @@ mod tests {
             emitter.seg("thought", &r.text);
             Ok(r)
         }
-        fn validate(&self) -> Result<()> {
+        async fn validate(&self) -> Result<()> {
             Ok(())
         }
     }
 
     struct EchoTool;
+    #[async_trait::async_trait]
     impl Tool for EchoTool {
         fn schema(&self) -> ToolSchema {
             ToolSchema::new(
@@ -465,7 +536,7 @@ mod tests {
                 vec![ToolParameter::new("text", ParamType::String, true, "t", &[])],
             )
         }
-        fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+        async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
             Ok(format!("echoed: {}", args["text"].as_str().unwrap_or("")))
         }
     }
@@ -488,8 +559,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn completes_when_no_tool_calls() {
+    #[tokio::test]
+    async fn completes_when_no_tool_calls() {
         let llm = ScriptedLlm {
             responses: Mutex::new(vec![LlmResponse {
                 text: "all done".into(),
@@ -508,14 +579,14 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
-        let res = loop_.run(msgs, &mut sm, &sink, &cancel).unwrap();
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         assert_eq!(res.final_text, "all done");
         assert!(sink.lines().iter().any(|l| l.contains(r#""type":"done""#)));
     }
 
-    #[test]
-    fn executes_tool_then_completes() {
+    #[tokio::test]
+    async fn executes_tool_then_completes() {
         let llm = ScriptedLlm {
             responses: Mutex::new(vec![
                 LlmResponse {
@@ -541,7 +612,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("echo hey")];
-        let res = loop_.run(msgs, &mut sm, &sink, &cancel).unwrap();
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         // observation emitted
         assert!(sink.lines().iter().any(|l| l.contains("echoed: hey")));
@@ -550,8 +621,8 @@ mod tests {
         assert!(sm.messages.iter().any(|m| m.role == "tool"));
     }
 
-    #[test]
-    fn respects_cancel_before_start() {
+    #[tokio::test]
+    async fn respects_cancel_before_start() {
         let llm = ScriptedLlm {
             responses: Mutex::new(vec![]),
         };
@@ -564,13 +635,13 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(true);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Cancelled);
     }
 
-    #[test]
-    fn max_iterations_reached() {
+    #[tokio::test]
+    async fn max_iterations_reached() {
         // Always returns a tool call → never completes.
         let responses: Vec<LlmResponse> = (0..5)
             .map(|_| LlmResponse {
@@ -593,20 +664,20 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::MaxIterations);
         assert_eq!(res.iterations, 3);
     }
 
-    #[test]
-    fn domain_parse() {
+    #[tokio::test]
+    async fn domain_parse() {
         assert_eq!(domain_of("https://example.com/path"), "example.com");
         assert_eq!(domain_of("http://a.b.c/x/y"), "a.b.c");
     }
 
-    #[test]
-    fn classify_errors() {
+    #[tokio::test]
+    async fn classify_errors() {
         assert!(classify_api_error(&AacodeError::Api("HTTP 401 no".into())).contains("authentication"));
         assert!(classify_api_error(&AacodeError::Api("rate limit".into())).contains("quota"));
         assert!(classify_api_error(&AacodeError::Network("reset".into())).contains("Network"));
@@ -617,8 +688,9 @@ mod tests {
     struct FlakyLlm {
         remaining_failures: Mutex<u32>,
     }
+    #[async_trait::async_trait]
     impl LlmClient for FlakyLlm {
-        fn chat_stream(
+        async fn chat_stream(
             &self,
             _m: &[ChatMessage],
             _t: &[Value],
@@ -635,13 +707,13 @@ mod tests {
                 ..Default::default()
             })
         }
-        fn validate(&self) -> Result<()> {
+        async fn validate(&self) -> Result<()> {
             Ok(())
         }
     }
 
-    #[test]
-    fn retries_transient_llm_errors() {
+    #[tokio::test]
+    async fn retries_transient_llm_errors() {
         let llm = FlakyLlm {
             remaining_failures: Mutex::new(1),
         };
@@ -656,14 +728,14 @@ mod tests {
         let mut sm = SessionManager::new(&proj);
         sm.create_session("t", None).unwrap();
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         assert_eq!(res.final_text, "recovered");
     }
 
-    #[test]
-    fn truncated_response_not_completed() {
+    #[tokio::test]
+    async fn truncated_response_not_completed() {
         // Truncated response with no tool calls → injects "continue" →
         // needs another LLM response. We provide a chain so the loop can
         // exhaust iterations without crashing on empty ScriptedLlm.
@@ -687,7 +759,7 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         // Truncated response with no tool calls should NOT complete — it
         // should loop until max_iterations and then return MaxIterations.
@@ -695,8 +767,8 @@ mod tests {
             "truncated response must not be treated as completed");
     }
 
-    #[test]
-    fn max_iterations_returns_last_text() {
+    #[tokio::test]
+    async fn max_iterations_returns_last_text() {
         let responses: Vec<LlmResponse> = (0..5)
             .map(|i| LlmResponse {
                 text: format!("iter {}", i),
@@ -716,7 +788,7 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::MaxIterations);
         assert!(!res.final_text.is_empty(), "max_iterations must return last response text");
@@ -728,8 +800,9 @@ mod tests {
     struct FailThenStreamLlm {
         remaining_failures: Mutex<u32>,
     }
+    #[async_trait::async_trait]
     impl LlmClient for FailThenStreamLlm {
-        fn chat_stream(
+        async fn chat_stream(
             &self,
             _m: &[ChatMessage],
             _t: &[Value],
@@ -749,7 +822,7 @@ mod tests {
                 ..Default::default()
             })
         }
-        fn validate(&self) -> Result<()> {
+        async fn validate(&self) -> Result<()> {
             Ok(())
         }
     }
@@ -760,8 +833,9 @@ mod tests {
     struct EmitThenFailLlm {
         call: Mutex<u32>,
     }
+    #[async_trait::async_trait]
     impl LlmClient for EmitThenFailLlm {
-        fn chat_stream(
+        async fn chat_stream(
             &self,
             _m: &[ChatMessage],
             _t: &[Value],
@@ -786,15 +860,16 @@ mod tests {
                 ..Default::default()
             })
         }
-        fn validate(&self) -> Result<()> {
+        async fn validate(&self) -> Result<()> {
             Ok(())
         }
     }
 
     /// Fails every call (never succeeds). Used for exhausted-retry tests.
     struct AlwaysFailLlm;
+    #[async_trait::async_trait]
     impl LlmClient for AlwaysFailLlm {
-        fn chat_stream(
+        async fn chat_stream(
             &self,
             _m: &[ChatMessage],
             _t: &[Value],
@@ -803,13 +878,14 @@ mod tests {
         ) -> Result<LlmResponse> {
             Err(AacodeError::Network("always fails".into()))
         }
-        fn validate(&self) -> Result<()> {
+        async fn validate(&self) -> Result<()> {
             Ok(())
         }
     }
 
     /// A tool that always returns "timeout" observation — triggers retry.
     struct TimeoutTool;
+    #[async_trait::async_trait]
     impl Tool for TimeoutTool {
         fn schema(&self) -> ToolSchema {
             ToolSchema::new(
@@ -818,13 +894,145 @@ mod tests {
                 vec![ToolParameter::new("x", ParamType::String, true, "x", &[])],
             )
         }
-        fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+        async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
             Ok("command timed out after 10s".to_string())
         }
     }
 
-    #[test]
-    fn execute_with_retry_respects_cancel() {
+    /// Counts how many times its tool was invoked.
+    struct CountingTool {
+        count: std::sync::Arc<Mutex<u32>>,
+        tool_name: &'static str,
+        response: String,
+    }
+    impl CountingTool {
+        fn new(name: &'static str, response: String) -> (Self, std::sync::Arc<Mutex<u32>>) {
+            let count = std::sync::Arc::new(Mutex::new(0u32));
+            (CountingTool { count: count.clone(), tool_name: name, response }, count)
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(self.tool_name, self.tool_name, vec![])
+        }
+        async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+            *self.count.lock().unwrap() += 1;
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_retries_on_network() {
+        let mut reg = ToolRegistry::new();
+        let (tool, counter) = CountingTool::new(
+            "understand_image",
+            r#"{"success":false,"error":"network error: vision: error sending request for url (https://api.moonshot.cn/v1/chat/completions)"}"#.to_string(),
+        );
+        reg.register(Box::new(tool));
+        let mut cfg = AgentConfig::default();
+        cfg.limits.max_retries = 3;
+        cfg.max_iterations = 1;
+        let responses = vec![LlmResponse {
+            text: "try".into(),
+            tool_calls: vec![tc("understand_image", r#"{"image_path":"a.jpg","prompt":"desc"}"#)],
+            ..Default::default()
+        }];
+        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
+        let invocations = *counter.lock().unwrap();
+        assert!(invocations >= 2, "network error must trigger retry, got {invocations} invocations");
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_does_not_retry_on_config_error() {
+        let mut reg = ToolRegistry::new();
+        let (tool, counter) = CountingTool::new(
+            "understand_image",
+            r#"{"success":false,"error":"config error: no multimodal model configured"}"#.to_string(),
+        );
+        reg.register(Box::new(tool));
+        let mut cfg = AgentConfig::default();
+        cfg.limits.max_retries = 3;
+        cfg.max_iterations = 1;
+        let responses = vec![LlmResponse {
+            text: "try".into(),
+            tool_calls: vec![tc("understand_image", r#"{"image_path":"a.jpg","prompt":"desc"}"#)],
+            ..Default::default()
+        }];
+        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
+        assert_eq!(*counter.lock().unwrap(), 1, "config error must not trigger retry");
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_timeout_retried() {
+        let mut reg = ToolRegistry::new();
+        let (tool, counter) = CountingTool::new(
+            "timeout_cmd",
+            "command timed out after 10s".to_string(),
+        );
+        reg.register(Box::new(tool));
+        let mut cfg = AgentConfig::default();
+        cfg.limits.max_retries = 3;
+        cfg.max_iterations = 1;
+        let responses = vec![LlmResponse {
+            text: "try".into(),
+            tool_calls: vec![tc("timeout_cmd", r#"{"x":"1"}"#)],
+            ..Default::default()
+        }];
+        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
+        assert!(*counter.lock().unwrap() >= 2, "timeout must trigger retry");
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_connection_retried() {
+        let mut reg = ToolRegistry::new();
+        let (tool, counter) = CountingTool::new(
+            "fetch_url",
+            "connection reset".to_string(),
+        );
+        reg.register(Box::new(tool));
+        let mut cfg = AgentConfig::default();
+        cfg.limits.max_retries = 3;
+        cfg.max_iterations = 1;
+        let responses = vec![LlmResponse {
+            text: "try".into(),
+            tool_calls: vec![tc("fetch_url", r#"{"url":"http://x"}"#)],
+            ..Default::default()
+        }];
+        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
+        assert!(*counter.lock().unwrap() >= 2, "connection must trigger retry");
+    }
+
+    #[tokio::test]
+    async fn execute_with_retry_respects_cancel() {
         let responses = vec![LlmResponse {
             text: "try".into(),
             tool_calls: vec![tc("timeout_cmd", "{\"x\":\"1\"}")],
@@ -843,15 +1051,15 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(true); // pre-set cancel
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         // Must not retry forever — cancel check in first iteration returns
         // Cancelled before tool execution even starts.
         assert_eq!(res.status, RunStatus::Cancelled);
     }
 
-    #[test]
-    fn max_context_tokens_enforced_and_errors() {
+    #[tokio::test]
+    async fn max_context_tokens_enforced_and_errors() {
         let llm = ScriptedLlm {
             responses: Mutex::new(vec![LlmResponse {
                 text: "done".into(),
@@ -875,7 +1083,7 @@ mod tests {
             ChatMessage::system("you are a helpful assistant who provides detailed responses"),
             ChatMessage::user("do something"),
         ];
-        let res = loop_.run(msgs, &mut sm, &sink, &cancel);
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await;
         assert!(res.is_err(), "context over max must error, not silently proceed");
         let msg = format!("{}", res.err().unwrap());
         assert!(
@@ -886,8 +1094,8 @@ mod tests {
 
     // ── retry buffering tests ────────────────────────────────────────
 
-    #[test]
-    fn pipe_mode_retry_buffers_and_replays() {
+    #[tokio::test]
+    async fn pipe_mode_retry_buffers_and_replays() {
         // FlakyLlm fails once then returns Ok (no events emitted).
         // With buffering, the emitter must only see output from the
         // retry attempt — nothing leaked from the failed first attempt.
@@ -907,7 +1115,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         assert_eq!(res.final_text, "complete response");
@@ -924,8 +1132,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tty_mode_never_buffers_retries() {
+    #[tokio::test]
+    async fn tty_mode_never_buffers_retries() {
         // In TTY mode, attempts > 0 still use the real emitter directly.
         let llm = FailThenStreamLlm {
             remaining_failures: Mutex::new(1),
@@ -943,7 +1151,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
 
@@ -959,8 +1167,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn multiple_retries_only_last_success_replayed() {
+    #[tokio::test]
+    async fn multiple_retries_only_last_success_replayed() {
         // Fail twice, succeed on third. Each failure must be discarded;
         // only the successful attempt's events reach the real emitter.
         let llm = FailThenStreamLlm {
@@ -978,7 +1186,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
 
@@ -996,8 +1204,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn first_attempt_streams_directly_leak_is_allowed() {
+    #[tokio::test]
+    async fn first_attempt_streams_directly_leak_is_allowed() {
         // Attempt 0 emits events DIRECTLY to real emitter then fails.
         // Attempt 1 (buffered) retries. The real emitter will contain
         // BOTH the leaked attempt-0 events AND the replayed attempt-1
@@ -1018,7 +1226,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         assert_eq!(res.final_text, "final complete text");
@@ -1038,8 +1246,8 @@ mod tests {
         // seg_content that the iOS side should use.
     }
 
-    #[test]
-    fn buffered_retry_replays_all_event_types() {
+    #[tokio::test]
+    async fn buffered_retry_replays_all_event_types() {
         // Verify that the buffered CollectingSink captures and replays
         // all event types: delta, seg_content (thinking + thought).
         let llm = FailThenStreamLlm {
@@ -1057,7 +1265,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
 
@@ -1085,8 +1293,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn buffered_retry_respects_cancel() {
+    #[tokio::test]
+    async fn buffered_retry_respects_cancel() {
         // Pre-set cancel: the cancel check at the top of each iteration
         // (in ReactLoop::run) catches it before chat_with_retry is called.
         let llm = FailThenStreamLlm {
@@ -1104,13 +1312,13 @@ mod tests {
         let cancel = AtomicBool::new(true);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert_eq!(res.status, RunStatus::Cancelled);
     }
 
-    #[test]
-    fn cancel_during_retry_backoff_stops_cleanly() {
+    #[tokio::test]
+    async fn cancel_during_retry_backoff_stops_cleanly() {
         use std::sync::Arc;
         let llm = FailThenStreamLlm {
             remaining_failures: Mutex::new(2),
@@ -1140,7 +1348,7 @@ mod tests {
                 &sink,
                 cancel.as_ref(),
             )
-            .unwrap();
+            .await.unwrap();
         assert_eq!(
             res.status,
             RunStatus::Cancelled,
@@ -1148,8 +1356,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exhausted_retries_buffers_discarded_no_events() {
+#[tokio::test]
+    async fn exhausted_retries_buffers_discarded_no_events() {
         // When all retries fail, no buffered content should reach the
         // real emitter (each buffer was discarded on failure).
         let llm = AlwaysFailLlm;
@@ -1165,7 +1373,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
             .unwrap();
         assert!(matches!(res.status, RunStatus::Error(_)));
         // The react_loop emits an error event on the real emitter.
@@ -1191,6 +1399,21 @@ mod tests {
     }
 }
 
+/// Returns a future that completes when the cancel flag is set.
+/// Uses Notify for immediate wakeup, with 1s polling fallback.
+async fn cancel_checker(cancel: &AtomicBool, notify: &Notify) {
+    use std::time::Duration;
+    loop {
+        tokio::select! {
+            _ = notify.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+}
+
 /// Short one-line error description for UI status lines.
 fn brief(e: &crate::error::AacodeError) -> String {
     let s = e.to_string();
@@ -1201,3 +1424,4 @@ fn brief(e: &crate::error::AacodeError) -> String {
     }
     out
 }
+

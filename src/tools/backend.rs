@@ -211,6 +211,7 @@ fn wait_with_timeout(
             }
         });
     }
+    drop(chunk_tx);
 
     let pid = child.id();
     let (exit_tx, exit_rx) = mpsc::channel();

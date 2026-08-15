@@ -83,7 +83,6 @@ pub fn build_default_registry_with_holder(
         project_path: project_path.clone(),
         sub_registry: factory,
     }));
-    reg.register(Box::new(delegate::CreateSubAgentTool));
 
     (reg, holder)
 }
@@ -121,7 +120,6 @@ fn register_core_tools(
     reg.register(Box::new(todo::UpdateTodoTool { store: todo_store.clone() }));
     reg.register(Box::new(todo::TodoSummaryTool { store: todo_store.clone() }));
     reg.register(Box::new(todo::ListTodoFilesTool { store: todo_store }));
-    reg.register(Box::new(todo::AddExecutionRecordTool));
 
     // Web tools
     reg.register(Box::new(web::SearchWebTool::new(config.search.clone(), config.timeouts.web_request)));
@@ -144,7 +142,10 @@ fn register_core_tools(
 
     // Session tools
     reg.register(Box::new(session_tools::ListSessionsTool { project_path: project_path.clone() }));
-    reg.register(Box::new(session_tools::GetConversationHistoryTool { project_path: project_path.clone() }));
+    reg.register(Box::new(session_tools::GetConversationHistoryTool {
+        project_path: project_path.clone(),
+        active_session_id: session_id_holder.clone(),
+    }));
     reg.register(Box::new(session_tools::GetSessionStatsTool { project_path: project_path.clone() }));
     reg.register(Box::new(session_tools::DeleteSessionTool { project_path: project_path.clone() }));
     reg.register(Box::new(session_tools::SwitchSessionTool { project_path: project_path.clone() }));
@@ -158,11 +159,11 @@ fn register_core_tools(
     reg.register(Box::new(code_tools::AnalyzeCodeTool { project_path: project_path.clone() }));
 
     // Multimodal tools
-    let mm_ctx = multimodal::MultimodalCtx {
-        model: config.multimodal.clone(),
-        project_path: project_path.clone(),
-        timeout_secs: config.timeouts.web_request,
-    };
+    let mm_ctx = multimodal::MultimodalCtx::new(
+        config.multimodal.clone(),
+        project_path.clone(),
+        config.timeouts.web_request,
+    );
     reg.register(Box::new(multimodal::UnderstandImageTool { ctx: mm_ctx.clone() }));
     reg.register(Box::new(multimodal::UnderstandVideoTool { ctx: mm_ctx.clone() }));
     reg.register(Box::new(multimodal::UnderstandUiDesignTool { ctx: mm_ctx.clone() }));
@@ -199,7 +200,6 @@ mod tests {
             "update_todo_item",
             "get_todo_summary",
             "list_todo_files",
-            "add_execution_record",
             "search_web",
             "fetch_url",
             "search_code",
@@ -219,7 +219,6 @@ mod tests {
             "call_mcp_tool",
             "get_mcp_status",
             "delegate_task",
-            "create_sub_agent",
         ] {
             assert!(reg.contains(name), "missing tool: {name}");
         }

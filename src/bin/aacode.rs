@@ -44,6 +44,9 @@ fn load_dotenv(path: &std::path::Path) {
 }
 
 fn main() {
+    let tokio_rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+    let _args: Vec<String> = std::env::args().collect();
     let args: Vec<String> = std::env::args().collect();
     let mut project = ".".to_string();
     let mut session_id: Option<String> = None;
@@ -97,7 +100,7 @@ fn main() {
     }
 
     let project_path = std::path::PathBuf::from(&project);
-    let rt = match AgentRuntime::init(config, project_path) {
+    let agent_rt = match AgentRuntime::init(config, project_path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to initialize: {e}");
@@ -109,17 +112,19 @@ fn main() {
     let cancel = AtomicBool::new(false);
 
     if interactive {
-        run_interactive(&rt, &sink, &cancel);
+        run_interactive(&tokio_rt, &agent_rt, &sink, &cancel);
         return;
     }
 
     let task = task_parts.join(" ");
     if task.trim().is_empty() {
-        run_interactive(&rt, &sink, &cancel);
+        run_interactive(&tokio_rt, &agent_rt, &sink, &cancel);
         return;
     }
 
-    match rt.run_task(&task, session_id.as_deref(), &sink, &cancel) {
+    match tokio_rt.block_on(
+        agent_rt.run_task(&task, session_id.as_deref(), &sink, &cancel)
+    ) {
         Ok(res) => {
             println!("\n[status: {:?}, iterations: {}]", res.status, res.iterations);
         }
@@ -130,7 +135,12 @@ fn main() {
     }
 }
 
-fn run_interactive(rt: &AgentRuntime, sink: &StdoutSink, cancel: &AtomicBool) {
+fn run_interactive(
+    tokio_rt: &tokio::runtime::Runtime,
+    agent_rt: &AgentRuntime,
+    sink: &StdoutSink,
+    cancel: &AtomicBool,
+) {
     println!("aacode-rs interactive mode. Type a task, or 'exit' to quit.");
     loop {
         print!("\n> ");
@@ -147,7 +157,9 @@ fn run_interactive(rt: &AgentRuntime, sink: &StdoutSink, cancel: &AtomicBool) {
             println!("bye");
             break;
         }
-        match rt.run_task(task, None, sink, cancel) {
+        match tokio_rt.block_on(
+            agent_rt.run_task(task, None, sink, cancel)
+        ) {
             Ok(res) => println!("\n[status: {:?}, iterations: {}]", res.status, res.iterations),
             Err(e) => eprintln!("error: {e}"),
         }

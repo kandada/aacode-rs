@@ -1,22 +1,27 @@
 // Copyright (c) 2026 xiefujin <490021684@qq.com>
 // Licensed under GPL-3.0, see LICENSE file for full license terms.
 
-//! C ABI for embedding aacode-rs into the Android app (via `jni_glue.c`) and
-//! other hosts. Mirrors the design in `design.md` §11.
+//! C ABI for embedding aacode-rs into mobile hosts (Android via `jni_glue.c`,
+//! iOS via the Swift bridge) and other hosts.
 //!
-//! Contract:
-//!   * `aacode_register_stream_callback(cb)` — cb receives each JSONL event line.
-//!   * `aacode_run_task(task_json)` — blocking; streams events via the callback;
-//!     returns a JSON result string (caller frees with `aacode_free_string`).
-//!   * `aacode_run_task_with_cb(task_json, cb)` — per-task callback; safe for
-//!     concurrent tasks. `task_json` may include `"client_task_id": "<id>"` to
-//!     enable per-task cancellation via `aacode_cancel_task`.
-//!   * `aacode_cancel_task(task_id)` — cancels only the task registered with
-//!     that `client_task_id`.
-//!   * `aacode_cancel()` — cancels ALL in-flight tasks (legacy behavior).
+//! Contract (handle-based, userdata-carrying, single event stream):
+//!   * `aacode_task_start(task_json, cb, userdata)` — non-blocking. Returns an
+//!     opaque handle. Each JSONL event line is delivered via `cb(line, userdata)`
+//!     from the tokio worker threads. Early failures (bad JSON, missing task,
+//!     session already running, init/cd failure) emit an `error` event and a
+//!     handle whose `wait` immediately returns the error.
+//!   * `aacode_task_wait(handle)` — blocks until the task finishes; returns a
+//!     JSON result string (caller frees with `aacode_free_string`).
+//!   * `aacode_task_cancel(handle)` — non-blocking; the running task observes
+//!     it asynchronously.
+//!   * `aacode_task_free(handle)` — free a finished handle.
 //!   * `aacode_validate_api_key(config_json)` — returns `{"valid":bool,...}`.
 //!   * `aacode_list_sessions(project_path)` / `aacode_get_session_messages(...)`.
 //!   * `aacode_free_string(ptr)` — free any returned string.
+//!
+//! The terminal event is an enriched `done` (`{"type":"done","session_id":...,
+//! "status":...,"iterations":...,"final_text":...}`); `wait` returns the same
+//! outcome for hosts that prefer a return value. Events are authoritative.
 
 // C-ABI surface: every extern fn validates pointers (null-checked, then
 // CStr::from_ptr) per the documented host contract; `unsafe fn` would not
@@ -24,69 +29,41 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::config::AgentConfig;
-use crate::runtime::AgentRuntime;
-use crate::session::SessionManager;
+use crate::runtime::{AgentRuntime, TOKIO_RT};
+use crate::session::{valid_session_id, SessionManager, SessionMessage, SCHEMA_VERSION};
 use crate::stream::CallbackSink;
-#[cfg(test)]
-use crate::stream::EventSink;
 use serde_json::json;
-use std::collections::HashMap;
-use std::ffi::{c_char, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc;
 
-/// The C stream callback type: receives one NUL-terminated UTF-8 line.
-pub type StreamCallback = extern "C" fn(*const c_char);
+/// The C stream callback type: receives one NUL-terminated UTF-8 line plus the
+/// opaque `userdata` context supplied at `aacode_task_start`. The userdata lets
+/// each host bind per-task state without thread-local or global hacks.
+pub type StreamCallback = extern "C" fn(*const c_char, *mut c_void);
 
-// Global state: the registered (legacy) callback + per-task cancel flags.
-static CALLBACK: OnceLock<Mutex<Option<StreamCallback>>> = OnceLock::new();
-/// Per-task cancel flags, keyed by client_task_id (or an auto-generated id).
-/// Each task owns its own flag — cancelling one task never affects others,
-/// and starting a new task never clears a pending cancel for another.
-static CANCEL_MAP: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-/// Monotonic counter for auto-generated task ids.
-static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
-
-fn callback_slot() -> &'static Mutex<Option<StreamCallback>> {
-    CALLBACK.get_or_init(|| Mutex::new(None))
+/// Opaque task handle returned by `aacode_task_start`.
+pub struct AacodeTask {
+    cancel: Arc<AtomicBool>,
+    result_rx: mpsc::Receiver<String>,
 }
 
-fn cancel_map() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-    CANCEL_MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// Wrapper making the raw `userdata` pointer safe to move into the tokio task
+/// (the host guarantees the pointed-to context outlives the task).
+struct SendUserData(*mut c_void);
+// SAFETY: the host contract requires `userdata` to remain valid until the task
+// completes and `aacode_task_free` is called. It is only passed back verbatim
+// to the host callback.
+unsafe impl Send for SendUserData {}
+unsafe impl Sync for SendUserData {}
 
-/// Register a fresh cancel flag for `task_id`. If a flag with the same id is
-/// already registered (duplicate client id), the same flag is shared so a
-/// cancel reaches both.
-fn register_cancel_flag(task_id: &str) -> Arc<AtomicBool> {
-    let mut map = cancel_map().lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(task_id.to_string())
-        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-        .clone()
-}
-
-/// Remove the flag when the task finishes (avoids unbounded growth).
-fn deregister_cancel_flag(task_id: &str) {
-    let mut map = cancel_map().lock().unwrap_or_else(|e| e.into_inner());
-    map.remove(task_id);
-}
-
-/// RAII guard so the flag is deregistered even on early return.
-struct CancelRegistration {
-    task_id: String,
-    flag: Arc<AtomicBool>,
-}
-
-impl CancelRegistration {
-    fn new(task_id: String) -> Self {
-        let flag = register_cancel_flag(&task_id);
-        CancelRegistration { task_id, flag }
-    }
-}
-
-impl Drop for CancelRegistration {
-    fn drop(&mut self) {
-        deregister_cancel_flag(&self.task_id);
+impl SendUserData {
+    /// Raw pointer access via a method so closures capture the whole wrapper
+    /// (and its `Send`/`Sync` impls) rather than the bare `*mut c_void` field.
+    #[inline]
+    fn ptr(&self) -> *mut c_void {
+        self.0
     }
 }
 
@@ -123,28 +100,6 @@ impl Drop for SessionGuard {
     }
 }
 
-/// An EventSink that forwards each line to the registered C callback.
-/// Production code streams through per-task closures (`run_task_with_cb`);
-/// this sink only backs the legacy-callback unit test.
-#[cfg(test)]
-struct FfiSink;
-
-#[cfg(test)]
-impl EventSink for FfiSink {
-    fn emit_line(&self, line: &str) {
-        if let Ok(guard) = callback_slot().lock() {
-            if let Some(cb) = *guard {
-                if let Ok(cs) = CString::new(line) {
-                    cb(cs.as_ptr());
-                }
-            }
-        }
-    }
-    fn is_tty(&self) -> bool {
-        false
-    }
-}
-
 /// Convert a C string pointer to a Rust &str safely.
 unsafe fn cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
     if ptr.is_null() {
@@ -158,54 +113,6 @@ fn to_c_string(s: String) -> *mut c_char {
     CString::new(s)
         .unwrap_or_else(|_| CString::new("").unwrap())
         .into_raw()
-}
-
-/// Register (or clear with null) the stream callback.
-#[no_mangle]
-pub extern "C" fn aacode_register_stream_callback(cb: Option<StreamCallback>) {
-    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    if let Ok(mut guard) = callback_slot().lock() {
-        *guard = cb;
-    }
-}
-
-/// Run a task described by `task_json`. Blocks until completion. Streams events
-/// through the registered callback. Returns a JSON result string.
-/// **Deprecated**: use `aacode_run_task_with_cb` instead to support concurrency.
-#[no_mangle]
-pub extern "C" fn aacode_run_task(task_json: *const c_char) -> *mut c_char {
-    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let input = match unsafe { cstr(task_json) } {
-        Some(s) => s.to_string(),
-        None => return to_c_string(json!({"status": "error", "error": "null task_json"}).to_string()),
-    };
-    run_task_with_cb(&input, |line| {
-        if let Ok(cs) = CString::new(line) {
-            if let Ok(guard) = callback_slot().lock() {
-                if let Some(cb) = *guard { cb(cs.as_ptr()); }
-            }
-        }
-    })
-}
-
-/// Run a task described by `task_json` with a **per-task** streaming callback.
-/// Supports concurrent tasks — each caller provides its own callback, no shared
-/// global state is used. Blocks until completion. Returns a JSON result string.
-#[no_mangle]
-pub extern "C" fn aacode_run_task_with_cb(
-    task_json: *const c_char,
-    cb: StreamCallback,
-) -> *mut c_char {
-    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let input = match unsafe { cstr(task_json) } {
-        Some(s) => s.to_string(),
-        None => return to_c_string(json!({"status": "error", "error": "null task_json"}).to_string()),
-    };
-    run_task_with_cb(&input, move |line| {
-        if let Ok(cs) = CString::new(line) {
-            cb(cs.as_ptr());
-        }
-    })
 }
 
 /// Decide the shell sandbox root for the SDK (mobile/embedded host) path.
@@ -282,77 +189,34 @@ fn resolve_shell_root(
     (project.to_string(), None)
 }
 
-/// Shared implementation: parse JSON, build runtime, run, return JSON result.
-/// The `emit` closure handles streaming output — it is invoked once per line.
-fn run_task_with_cb(input: &str, emit: impl Fn(&str) + Send + Sync + 'static) -> *mut c_char {
-    let v: serde_json::Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(e) => return to_c_string(json!({"status": "error", "error": format!("bad task_json: {e}")}).to_string()),
-    };
-    let task = v.get("task").and_then(|x| x.as_str()).unwrap_or("");
-    if task.is_empty() {
-        return to_c_string(json!({"status": "error", "error": "missing task"}).to_string());
-    }
-    let project_path = v.get("project_path").and_then(|x| x.as_str()).unwrap_or(".").to_string();
-    let session_id = v.get("session_id").and_then(|x| x.as_str()).map(|s| s.to_string());
-
-    // Per-task cancel flag. The host may pass "client_task_id" to enable
-    // targeted cancellation (aacode_cancel_task); otherwise an internal id is
-    // generated. The flag is removed when this function returns.
-    let task_id = v
-        .get("client_task_id")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("__auto_{}", TASK_SEQ.fetch_add(1, Ordering::SeqCst)));
-    let registration = CancelRegistration::new(task_id);
-    let cancel = registration.flag.clone();
-
-    // Reject a second concurrent task on the same session (would corrupt the
-    // session file). New sessions (no session_id) are always allowed.
-    let _session_guard = match &session_id {
-        Some(sid) => {
-            let key = format!("{project_path}::{sid}");
-            match SessionGuard::try_acquire(key) {
-                Some(g) => Some(g),
-                None => {
-                    return to_c_string(
-                        json!({"status": "error", "error": format!("session '{sid}' already has a task running")}).to_string(),
-                    );
-                }
-            }
-        }
-        None => None,
-    };
-
-    let mut config: AgentConfig = serde_json::from_value(v.clone()).unwrap_or_default();
-    config.apply_env();
-
-    let rt = if let Some(sdk) = fastshell::sdk::try_get_sdk_instance() {
-        let sandbox = { let guard = sdk.lock().unwrap_or_else(|e| e.into_inner()); guard.vfs_root() };
-        let pp = if project_path == "." { sandbox.clone() } else { project_path.clone() };
+/// Build the agent runtime for the parsed config + project path. Returns an
+/// error string suitable for an `error` event / terminal JSON.
+fn build_runtime(
+    config: &AgentConfig,
+    project_path: &str,
+) -> Result<AgentRuntime, String> {
+    if let Some(sdk) = fastshell::sdk::try_get_sdk_instance() {
+        let sandbox = {
+            let guard = sdk.lock().unwrap_or_else(|e| e.into_inner());
+            guard.vfs_root()
+        };
+        let pp = if project_path == "." { sandbox.clone() } else { project_path.to_string() };
         // Shell sandbox root + optional cwd reposition (see resolve_shell_root).
         let (shell_root, cd_rel) =
             resolve_shell_root(&sandbox, &pp, config.skills.user_dir.as_deref());
         // Compute a VFS-internal skills path (relative to shell root) so
         // skill prompts can use short, platform-independent paths like
         // `/skills` instead of long absolute physical paths.
-        //
-        // Example: user_dir  = /data/.../fastshell/skills  (absolute on disk)
-        //          shell_root = /data/.../fastshell          (common ancestor)
-        //          → vfs_skills_dir = /skills               (VFS-internal)
-        //
-        // The VFS resolve() treats a leading '/' as "relative to VFS root":
-        //   ls /skills  →  <vfs_root>/skills  →  /data/.../fastshell/skills
-        // This avoids platform-specific prefixes (/data/user/0, /private/var, etc).
-        if let Some(ref user_dir) = config.skills.user_dir {
+        let mut cfg = config.clone();
+        if let Some(ref user_dir) = cfg.skills.user_dir {
             if let Ok(rel) = std::path::Path::new(user_dir).strip_prefix(&shell_root) {
                 if !rel.as_os_str().is_empty() {
-                    config.skills.vfs_skills_dir = Some(format!("/{}", rel.to_string_lossy()));
+                    cfg.skills.vfs_skills_dir = Some(format!("/{}", rel.to_string_lossy()));
                 }
             }
         }
-        let fs_arc: std::sync::Arc<std::sync::Mutex<fastshell::Fastshell>> =
-            std::sync::Arc::new(std::sync::Mutex::new(fastshell::Fastshell::new()));
+        let fs_arc: Arc<Mutex<fastshell::Fastshell>> =
+            Arc::new(Mutex::new(fastshell::Fastshell::new()));
         {
             let mut ours = fs_arc.lock().unwrap();
             let mut fscfg = fastshell::Config::default();
@@ -361,65 +225,156 @@ fn run_task_with_cb(input: &str, emit: impl Fn(&str) + Send + Sync + 'static) ->
             fscfg.allow_subprocess = false; // mobile sandbox: no subprocess spawn
             fscfg.network_ask_permission = false;
             if let Err(e) = ours.init(fscfg) {
-                return to_c_string(json!({"status": "error", "error": e}).to_string());
+                return Err(e.to_string());
             }
             if let Some(rel) = cd_rel {
                 // Position the persistent shell session inside the project so
                 // relative paths behave exactly as before the root widening.
                 let r = ours.execute(&format!("cd '{}'", rel.replace('\'', "'\\''")));
                 if r.exit_code != 0 {
-                    return to_c_string(
-                        json!({"status": "error", "error": format!("cd to project failed: {}", r.stderr)}).to_string(),
-                    );
+                    return Err(format!("cd to project failed: {}", r.stderr));
                 }
             }
         }
-        AgentRuntime::with_fastshell(config, std::path::PathBuf::from(pp), fs_arc)
+        Ok(AgentRuntime::with_fastshell(cfg, std::path::PathBuf::from(pp), fs_arc))
     } else {
-        match AgentRuntime::init(config, std::path::PathBuf::from(project_path)) {
-            Ok(r) => r,
-            Err(e) => return to_c_string(json!({"status": "error", "error": e.to_string()}).to_string()),
-        }
-    };
-
-    let result = match rt.run_task(task, session_id.as_deref(), &CallbackSink::new(Box::new(emit)), &cancel) {
-        Ok(res) => {
-            let status = match res.status {
-                crate::agent::RunStatus::Completed => "completed",
-                crate::agent::RunStatus::MaxIterations => "max_iterations",
-                crate::agent::RunStatus::Cancelled => "cancelled",
-                crate::agent::RunStatus::Error(_) => "error",
-            };
-            to_c_string(json!({"status": status, "iterations": res.iterations, "final_text": res.final_text}).to_string())
-        }
-        Err(e) => to_c_string(json!({"status": "error", "error": e.to_string()}).to_string()),
-    };
-    drop(registration); // deregister the cancel flag
-    result
-}
-
-/// Cancel ALL in-flight tasks (legacy behavior, kept for compatibility).
-#[no_mangle]
-pub extern "C" fn aacode_cancel() {
-    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let map = cancel_map().lock().unwrap_or_else(|e| e.into_inner());
-    for flag in map.values() {
-        flag.store(true, Ordering::SeqCst);
+        AgentRuntime::init(config.clone(), std::path::PathBuf::from(project_path))
+            .map_err(|e| e.to_string())
     }
 }
 
-/// Cancel only the task registered with `client_task_id`. No-op if the task
-/// already finished or the id is unknown.
+/// Start a task described by `task_json`. Non-blocking; events stream through
+/// `cb(line, userdata)`. Returns an opaque handle (NULL on catastrophic OOM).
 #[no_mangle]
-pub extern "C" fn aacode_cancel_task(task_id: *const c_char) {
+pub extern "C" fn aacode_task_start(
+    task_json: *const c_char,
+    cb: Option<StreamCallback>,
+    userdata: *mut c_void,
+) -> *mut AacodeTask {
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let id = match unsafe { cstr(task_id) } {
-        Some(s) => s,
-        None => return,
+    let (tx, rx) = mpsc::channel::<String>();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let ud = SendUserData(userdata);
+    let emit = move |line: &str| {
+        if let Some(cb) = cb {
+            if let Ok(cs) = CString::new(line) {
+                cb(cs.as_ptr(), ud.ptr());
+            }
+        }
     };
-    let map = cancel_map().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(flag) = map.get(id) {
-        flag.store(true, Ordering::SeqCst);
+
+    let input = match unsafe { cstr(task_json) } {
+        Some(s) => s.to_string(),
+        None => {
+            let msg = "null task_json";
+            emit(&json!({"type": "error", "message": msg}).to_string());
+            let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
+            return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+        }
+    };
+
+    let v: serde_json::Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("bad task_json: {e}");
+            emit(&json!({"type": "error", "message": msg}).to_string());
+            let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
+            return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+        }
+    };
+    let task = v.get("task").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if task.is_empty() {
+        let msg = "missing task";
+        emit(&json!({"type": "error", "message": msg}).to_string());
+        let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
+        return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+    }
+    let project_path = v.get("project_path").and_then(|x| x.as_str()).unwrap_or(".").to_string();
+    let session_id = v.get("session_id").and_then(|x| x.as_str()).map(|s| s.to_string());
+
+    // Reject a second concurrent task on the same session (would corrupt the
+    // session file). New sessions (no session_id) are always allowed.
+    let session_guard = match &session_id {
+        Some(sid) => {
+            let key = format!("{project_path}::{sid}");
+            match SessionGuard::try_acquire(key) {
+                Some(g) => Some(g),
+                None => {
+                    let msg = format!("session '{sid}' already has a task running");
+                    emit(&json!({"type": "error", "message": msg}).to_string());
+                    let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
+                    return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mut config: AgentConfig = serde_json::from_value(v).unwrap_or_default();
+    config.apply_env();
+
+    let rt = match build_runtime(&config, &project_path) {
+        Ok(rt) => rt,
+        Err(e) => {
+            emit(&json!({"type": "error", "message": e}).to_string());
+            let _ = tx.send(json!({"status": "error", "error": e}).to_string());
+            return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+        }
+    };
+
+    let cancel2 = cancel.clone();
+    let _join = TOKIO_RT.spawn(async move {
+        // Hold the session guard for the duration of the task.
+        let _guard = session_guard;
+        let result = rt
+            .run_task(&task, session_id.as_deref(), &CallbackSink::new(Box::new(emit)), &cancel2)
+            .await;
+        let json = match result {
+            Ok(res) => res.to_result_json().to_string(),
+            Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
+        };
+        let _ = tx.send(json);
+    });
+
+    Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }))
+}
+
+/// Block until the task finishes; return the terminal JSON result string
+/// (caller frees with `aacode_free_string`).
+#[no_mangle]
+pub extern "C" fn aacode_task_wait(handle: *mut AacodeTask) -> *mut c_char {
+    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+    if handle.is_null() {
+        return to_c_string(json!({"status": "error", "error": "null handle"}).to_string());
+    }
+    let h = unsafe { &*handle };
+    let result = h.result_rx.recv().unwrap_or_else(|_| {
+        json!({"status": "error", "error": "task was dropped before completion"}).to_string()
+    });
+    to_c_string(result)
+}
+
+/// Signal cancellation. Non-blocking; the running task observes it async.
+#[no_mangle]
+pub extern "C" fn aacode_task_cancel(handle: *mut AacodeTask) {
+    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+    if handle.is_null() {
+        return;
+    }
+    let h = unsafe { &*handle };
+    h.cancel.store(true, Ordering::SeqCst);
+}
+
+/// Free a finished handle.
+#[no_mangle]
+pub extern "C" fn aacode_task_free(handle: *mut AacodeTask) {
+    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
     }
 }
 
@@ -435,10 +390,15 @@ pub extern "C" fn aacode_validate_api_key(config_json: *const c_char) -> *mut c_
     let mut config: AgentConfig = serde_json::from_str(&input).unwrap_or_default();
     config.apply_env();
     let client = crate::llm::build_client(&config.model);
-    let out = match client.validate() {
-        Ok(()) => json!({"valid": true}),
-        Err(e) => json!({"valid": false, "error": e.to_string()}),
-    };
+    let handle = TOKIO_RT.handle().clone();
+    let out = std::thread::scope(|s| {
+        s.spawn(move || match handle.block_on(async { client.validate().await }) {
+            Ok(()) => json!({"valid": true}),
+            Err(e) => json!({"valid": false, "error": e.to_string()}),
+        })
+        .join()
+        .unwrap()
+    });
     to_c_string(out.to_string())
 }
 
@@ -495,6 +455,220 @@ pub extern "C" fn aacode_get_session_messages(
     to_c_string(json!({"success": true, "messages": arr}).to_string())
 }
 
+// ── Session store FFI (see SESSION_FFI.md) ─────────────────────────
+
+/// Serializes all session-store write FFI calls so concurrent callers can't
+/// interleave read-modify-write on the shared index/session files (in-process
+/// serialization; the agent's own writes are not under this lock).
+static SESSION_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize one persisted message into the SESSION_FFI wire shape.
+fn message_to_json(m: &SessionMessage) -> serde_json::Value {
+    json!({
+        "role": m.role,
+        "content": m.content,
+        "timestamp": m.timestamp,
+        "tokens": m.tokens,
+        "tool_calls": m.tool_calls,
+        "tool_call_id": m.tool_call_id,
+        "reasoning_content": m.reasoning_content,
+    })
+}
+
+/// Build the `{"success": false, "error": ...}` failure envelope.
+fn session_err(msg: &str) -> *mut c_char {
+    to_c_string(json!({"success": false, "error": msg}).to_string())
+}
+
+/// Parse `project` + `session_id` C strings into owned Strings, validating the
+/// session id so it cannot escape the sessions directory.
+fn session_id_args(
+    project_path: *const c_char,
+    session_id: *const c_char,
+) -> Result<(String, String), String> {
+    let pp = unsafe { cstr(project_path) }
+        .ok_or_else(|| "null project_path".to_string())?
+        .to_string();
+    let sid = unsafe { cstr(session_id) }
+        .ok_or_else(|| "null session_id".to_string())?
+        .to_string();
+    if !valid_session_id(&sid) {
+        return Err("invalid session_id".to_string());
+    }
+    Ok((pp, sid))
+}
+
+/// Current on-disk session schema version (see SESSION_FFI.md §6).
+#[no_mangle]
+pub extern "C" fn aacode_session_version() -> u32 {
+    SCHEMA_VERSION
+}
+
+/// List sessions for a project (SESSION_FFI contract). Returns a JSON array.
+#[no_mangle]
+pub extern "C" fn aacode_session_list(project_path: *const c_char) -> *mut c_char {
+    let pp = match unsafe { cstr(project_path) } {
+        Some(s) => s.to_string(),
+        None => return session_err("null project_path"),
+    };
+    let sm = SessionManager::new(std::path::Path::new(&pp));
+    let sessions: Vec<serde_json::Value> = sm
+        .list_sessions()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "session_id": s.session_id,
+                "title": s.title,
+                "created_at": s.created_at,
+                "last_activity": s.last_activity,
+                "total_messages": s.total_messages,
+                "total_tokens": s.total_tokens,
+                "status": s.status,
+            })
+        })
+        .collect();
+    to_c_string(json!({"success": true, "sessions": sessions}).to_string())
+}
+
+/// Paginated session messages (SESSION_FFI contract).
+#[no_mangle]
+pub extern "C" fn aacode_session_messages(
+    project_path: *const c_char,
+    session_id: *const c_char,
+    offset: u32,
+    limit: u32,
+) -> *mut c_char {
+    let (pp, sid) = match session_id_args(project_path, session_id) {
+        Ok(v) => v,
+        Err(e) => return session_err(&e),
+    };
+    let sm = SessionManager::new(std::path::Path::new(&pp));
+    let all = sm.read_session_messages(&sid);
+    let total = all.len();
+    let offset = offset as usize;
+    let limit = limit as usize;
+    let end = total.saturating_sub(offset);
+    let start = end.saturating_sub(limit);
+    let slice: Vec<serde_json::Value> = if start < end {
+        all[start..end].iter().map(message_to_json).collect()
+    } else {
+        Vec::new()
+    };
+    to_c_string(
+        json!({
+            "success": true,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "messages": slice,
+        })
+        .to_string(),
+    )
+}
+
+/// Idempotent create-or-touch a session (SESSION_FFI contract).
+#[no_mangle]
+pub extern "C" fn aacode_session_ensure(
+    project_path: *const c_char,
+    session_id: *const c_char,
+    title: *const c_char,
+) -> *mut c_char {
+    let (pp, sid) = match session_id_args(project_path, session_id) {
+        Ok(v) => v,
+        Err(e) => return session_err(&e),
+    };
+    let title = unsafe { cstr(title) }.unwrap_or("").to_string();
+    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sm = SessionManager::new(std::path::Path::new(&pp));
+    match sm.ensure_session(&sid, &title) {
+        Ok(()) => to_c_string(json!({"success": true}).to_string()),
+        Err(e) => session_err(&e.to_string()),
+    }
+}
+
+/// Set an explicit title on a session (SESSION_FFI contract).
+#[no_mangle]
+pub extern "C" fn aacode_session_rename(
+    project_path: *const c_char,
+    session_id: *const c_char,
+    title: *const c_char,
+) -> *mut c_char {
+    let (pp, sid) = match session_id_args(project_path, session_id) {
+        Ok(v) => v,
+        Err(e) => return session_err(&e),
+    };
+    let title = unsafe { cstr(title) }.unwrap_or("").to_string();
+    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sm = SessionManager::new(std::path::Path::new(&pp));
+    match sm.rename_session(&sid, &title) {
+        Ok(()) => to_c_string(json!({"success": true}).to_string()),
+        Err(e) => session_err(&e.to_string()),
+    }
+}
+
+/// Bump `last_activity` of a session (SESSION_FFI contract).
+#[no_mangle]
+pub extern "C" fn aacode_session_touch(
+    project_path: *const c_char,
+    session_id: *const c_char,
+) -> *mut c_char {
+    let (pp, sid) = match session_id_args(project_path, session_id) {
+        Ok(v) => v,
+        Err(e) => return session_err(&e),
+    };
+    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sm = SessionManager::new(std::path::Path::new(&pp));
+    match sm.touch_session(&sid) {
+        Ok(()) => to_c_string(json!({"success": true}).to_string()),
+        Err(e) => session_err(&e.to_string()),
+    }
+}
+
+/// Delete a session (idempotent; SESSION_FFI contract).
+#[no_mangle]
+pub extern "C" fn aacode_session_delete(
+    project_path: *const c_char,
+    session_id: *const c_char,
+) -> *mut c_char {
+    let (pp, sid) = match session_id_args(project_path, session_id) {
+        Ok(v) => v,
+        Err(e) => return session_err(&e),
+    };
+    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sm = SessionManager::new(std::path::Path::new(&pp));
+    match sm.delete_session(&sid) {
+        Ok(_) => to_c_string(json!({"success": true}).to_string()),
+        Err(e) => session_err(&e.to_string()),
+    }
+}
+
+/// Append messages to a session (SESSION_FFI contract).
+#[no_mangle]
+pub extern "C" fn aacode_session_append(
+    project_path: *const c_char,
+    session_id: *const c_char,
+    msgs_json: *const c_char,
+) -> *mut c_char {
+    let (pp, sid) = match session_id_args(project_path, session_id) {
+        Ok(v) => v,
+        Err(e) => return session_err(&e),
+    };
+    let msgs_str = match unsafe { cstr(msgs_json) } {
+        Some(s) => s,
+        None => return session_err("null msgs_json"),
+    };
+    let msgs: Vec<SessionMessage> = match serde_json::from_str(msgs_str) {
+        Ok(v) => v,
+        Err(e) => return session_err(&format!("bad msgs_json: {e}")),
+    };
+    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sm = SessionManager::new(std::path::Path::new(&pp));
+    match sm.append_session_messages(&sid, msgs) {
+        Ok(()) => to_c_string(json!({"success": true}).to_string()),
+        Err(e) => session_err(&e.to_string()),
+    }
+}
+
 /// Free a string previously returned by this library.
 #[no_mangle]
 pub extern "C" fn aacode_free_string(ptr: *mut c_char) {
@@ -511,86 +685,116 @@ pub extern "C" fn aacode_free_string(ptr: *mut c_char) {
 mod tests {
     use super::*;
 
-    extern "C" fn noop_cb(_line: *const c_char) {}
-    fn rt(json: &str) -> String {
-        // NUL-terminate properly — passing str::as_ptr() directly is UB.
+    extern "C" fn capture_cb(line: *const c_char, userdata: *mut c_void) {
+        if line.is_null() {
+            return;
+        }
+        let l = unsafe { CStr::from_ptr(line).to_str().unwrap_or("").to_string() };
+        let sink = userdata as *mut Mutex<Vec<String>>;
+        if !sink.is_null() {
+            unsafe {
+                if let Ok(mut v) = (*sink).lock() {
+                    v.push(l);
+                }
+            }
+        }
+    }
+
+    fn run_task(json: &str) -> (String, Vec<String>) {
         let c = CString::new(json).unwrap();
-        unsafe {
-            CStr::from_ptr(aacode_run_task_with_cb(c.as_ptr(), noop_cb))
-                .to_str()
-                .unwrap()
-                .to_string()
+        let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let ud = &lines as *const _ as *mut c_void;
+        let h = aacode_task_start(c.as_ptr(), Some(capture_cb), ud);
+        let result = unsafe {
+            let p = aacode_task_wait(h);
+            let s = CStr::from_ptr(p).to_str().unwrap().to_string();
+            aacode_free_string(p);
+            aacode_task_free(h);
+            s
+        };
+        let captured = lines.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    #[test]
+    fn run_task_bad_json() {
+        let (out, events) = run_task("not json");
+        assert!(out.contains("bad task_json"), "got: {out}");
+        assert!(
+            events.iter().any(|l| l.contains(r#""type":"error""#) && l.contains("bad task_json")),
+            "error event must be emitted: {events:?}"
+        );
+    }
+
+    #[test]
+    fn run_task_missing_task() {
+        let (out, events) = run_task(r#"{"project_path":"/tmp"}"#);
+        assert!(out.contains("error"), "got: {out}");
+        assert!(events.iter().any(|l| l.contains(r#""type":"error""#)));
+    }
+
+    #[test]
+    fn callback_receives_userdata_on_early_error() {
+        use std::sync::atomic::AtomicUsize;
+        static RECEIVED_UD: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn ud_cb(_line: *const c_char, ud: *mut c_void) {
+            RECEIVED_UD.store(ud as usize, Ordering::SeqCst);
         }
+        let c = CString::new(r#"{"project_path":"/tmp"}"#).unwrap();
+        let marker = 0xABCD1234usize as *mut c_void;
+        let h = aacode_task_start(c.as_ptr(), Some(ud_cb), marker);
+        let p = aacode_task_wait(h);
+        let s = unsafe { CStr::from_ptr(p).to_str().unwrap().to_string() };
+        aacode_free_string(p);
+        aacode_task_free(h);
+        assert!(s.contains("missing task"), "got: {s}");
+        // The host's opaque userdata must be passed back verbatim to the callback.
+        assert_eq!(RECEIVED_UD.load(Ordering::SeqCst), 0xABCD1234usize);
     }
 
     #[test]
-    fn run_task_bad_json() { let out = rt("not json"); assert!(out.contains("bad task_json")); }
-    #[test]
-    fn run_task_missing_task() { let out = rt(r#"{"project_path":"/tmp"}"#); assert!(out.contains("error"), "got: {out}"); }
-    #[test]
-    fn run_task_missing_key_reports_error() {
-        let d = std::env::temp_dir().join(format!("ffi_{}", uuid::Uuid::new_v4().simple()));
-        let input = json!({
-            "task": "do x",
-            "project_path": d.to_string_lossy(),
-            "model": {"name": "deepseek-chat"} // no api key
-        })
-        .to_string();
-        let out = rt(&input);
-        assert!(out.contains("error"));
+    fn start_with_null_callback_still_returns_terminal_result() {
+        let c = CString::new("not json").unwrap();
+        let h = aacode_task_start(c.as_ptr(), None, std::ptr::null_mut());
+        let p = aacode_task_wait(h);
+        let s = unsafe { CStr::from_ptr(p).to_str().unwrap().to_string() };
+        aacode_free_string(p);
+        aacode_task_free(h);
+        assert!(s.contains("bad task_json"), "got: {s}");
     }
 
     #[test]
-    fn cancel_task_targets_only_its_flag() {
-        let flag_a = register_cancel_flag("task_a");
-        let flag_b = register_cancel_flag("task_b");
-        let id = CString::new("task_a").unwrap();
-        aacode_cancel_task(id.as_ptr());
-        assert!(flag_a.load(Ordering::SeqCst), "task_a must be cancelled");
-        assert!(!flag_b.load(Ordering::SeqCst), "task_b must NOT be cancelled");
-        deregister_cancel_flag("task_a");
-        deregister_cancel_flag("task_b");
+    fn null_task_json() {
+        let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let ud = &lines as *const _ as *mut c_void;
+        let h = aacode_task_start(std::ptr::null(), Some(capture_cb), ud);
+        let result = unsafe {
+            let p = aacode_task_wait(h);
+            let s = CStr::from_ptr(p).to_str().unwrap().to_string();
+            aacode_free_string(p);
+            aacode_task_free(h);
+            s
+        };
+        assert!(result.contains("null task_json"));
     }
 
     #[test]
-    fn cancel_all_sets_every_flag() {
-        let flag_a = register_cancel_flag("all_a");
-        let flag_b = register_cancel_flag("all_b");
-        aacode_cancel();
-        assert!(flag_a.load(Ordering::SeqCst));
-        assert!(flag_b.load(Ordering::SeqCst));
-        deregister_cancel_flag("all_a");
-        deregister_cancel_flag("all_b");
+    fn wait_null_handle_is_safe() {
+        let p = aacode_task_wait(std::ptr::null_mut());
+        let s = unsafe { CStr::from_ptr(p).to_str().unwrap().to_string() };
+        aacode_free_string(p);
+        assert!(s.contains("error"));
     }
 
     #[test]
-    fn cancel_unknown_task_is_noop() {
-        let id = CString::new("nonexistent").unwrap();
-        aacode_cancel_task(id.as_ptr()); // must not panic
-        aacode_cancel_task(std::ptr::null());
+    fn cancel_null_handle_is_safe() {
+        aacode_task_cancel(std::ptr::null_mut());
     }
 
     #[test]
-    fn new_task_does_not_clear_other_cancels() {
-        // Regression: starting task B must not reset a pending cancel on A.
-        let flag_a = register_cancel_flag("pending_a");
-        let id = CString::new("pending_a").unwrap();
-        aacode_cancel_task(id.as_ptr());
-        assert!(flag_a.load(Ordering::SeqCst));
-        // Register another task — A's flag must stay cancelled.
-        let _flag_b = register_cancel_flag("pending_b");
-        assert!(flag_a.load(Ordering::SeqCst), "cancel on A must survive B's start");
-        deregister_cancel_flag("pending_a");
-        deregister_cancel_flag("pending_b");
-    }
-
-    #[test]
-    fn registration_guard_deregisters_on_drop() {
-        {
-            let _reg = CancelRegistration::new("guard_x".to_string());
-            assert!(cancel_map().lock().unwrap().contains_key("guard_x"));
-        }
-        assert!(!cancel_map().lock().unwrap().contains_key("guard_x"));
+    fn free_null_is_safe() {
+        aacode_task_free(std::ptr::null_mut());
+        aacode_free_string(std::ptr::null_mut());
     }
 
     #[test]
@@ -605,24 +809,27 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_tasks_same_session_rejected_via_ffi() {
-        // Two tasks with the same session_id: one must be rejected while the
-        // first is still registered. We simulate the first by holding a guard.
+    fn concurrent_tasks_same_session_rejected() {
         let _hold = SessionGuard::try_acquire("/tmp/proj::sess_dup".to_string()).unwrap();
-        let input = json!({
-            "task": "do x",
-            "project_path": "/tmp/proj",
-            "session_id": "sess_dup",
-            "model": {"name": "m", "api_key": "k"}
-        })
-        .to_string();
-        let out = rt(&input);
+        let (out, _events) = run_task(
+            r#"{"task":"do x","project_path":"/tmp/proj","session_id":"sess_dup","model":{"name":"m","api_key":"k"}}"#,
+        );
         assert!(out.contains("already has a task running"), "got: {out}");
     }
 
     #[test]
-    fn free_null_is_safe() {
-        aacode_free_string(std::ptr::null_mut());
+    fn list_sessions_ffi() {
+        let d = std::env::temp_dir().join(format!("ffi_ls_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        {
+            let mut sm = SessionManager::new(&d);
+            sm.create_session("task", None).unwrap();
+        }
+        let c = CString::new(d.to_string_lossy().to_string()).unwrap();
+        let ptr = aacode_list_sessions(c.as_ptr());
+        let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_string() };
+        aacode_free_string(ptr);
+        assert!(s.contains("\"success\":true"));
     }
 
     // ── resolve_shell_root (skills user_dir root widening) ─────────
@@ -673,7 +880,6 @@ mod tests {
 
     #[test]
     fn project_equal_to_sandbox_user_dir_outside_widens() {
-        // iOS-like: sandbox == project, but skills lives in a sibling dir.
         let base = tmp_root("equal_out");
         let sb = mkdirs(&base.join("sb"));
         let sk = mkdirs(&base.join("skills"));
@@ -685,9 +891,6 @@ mod tests {
 
     #[test]
     fn sibling_prefix_dir_is_not_inside_sandbox() {
-        // Regression: /…/sb vs /…/sb2/proj — a string prefix check would
-        // wrongly widen the root and then fail the cd with a hard error.
-        // user_dir under project → no widening; sb must not participate.
         let base = tmp_root("sibling");
         let sb = mkdirs(&base.join("sb"));
         let pp = mkdirs(&base.join("sb2").join("proj"));
@@ -711,10 +914,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_project_path_still_recognized() {
-        // Android: /data/user/0/<pkg> is a symlink to /data/data/<pkg>;
-        // macOS/iOS: /var → /private/var. The host may pass the symlink form
-        // for the project while the sandbox root is canonical (or vice
-        // versa) — canonicalization must reconcile them.
         let base = tmp_root("symlink");
         let real_sb = mkdirs(&base.join("real_sb"));
         mkdirs(&base.join("real_sb").join("proj"));
@@ -727,32 +926,181 @@ mod tests {
         assert_eq!(rel.as_deref(), Some("proj"));
     }
 
-    #[test]
-    fn list_sessions_ffi() {
-        let d = std::env::temp_dir().join(format!("ffi_ls_{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&d).unwrap();
-        {
-            let mut sm = SessionManager::new(&d);
-            sm.create_session("task", None).unwrap();
-        }
-        let c = CString::new(d.to_string_lossy().to_string()).unwrap();
-        let ptr = aacode_list_sessions(c.as_ptr());
-        let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_string() };
-        aacode_free_string(ptr);
-        assert!(s.contains("\"success\":true"));
+    // ── SESSION_FFI store functions ──────────────────────────────────
+
+    fn call_str(f: impl FnOnce() -> *mut c_char) -> String {
+        let p = f();
+        let s = unsafe { CStr::from_ptr(p).to_str().unwrap().to_string() };
+        aacode_free_string(p);
+        s
     }
 
     #[test]
-    fn callback_roundtrip() {
-        use std::sync::atomic::AtomicUsize;
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        extern "C" fn cb(_line: *const c_char) {
-            COUNT.fetch_add(1, Ordering::SeqCst);
+    fn session_version_is_one() {
+        assert_eq!(aacode_session_version(), SCHEMA_VERSION);
+        assert_eq!(aacode_session_version(), 1);
+    }
+
+    #[test]
+    fn session_lifecycle_roundtrip() {
+        let proj = mkdirs(&tmp_root("sess_life"));
+        let pp = CString::new(proj).unwrap();
+        let sid = CString::new("sess_a").unwrap();
+
+        // ensure (create)
+        let title = CString::new("My Session").unwrap();
+        let r = call_str(|| aacode_session_ensure(pp.as_ptr(), sid.as_ptr(), title.as_ptr()));
+        assert!(r.contains("\"success\":true"), "ensure: {r}");
+
+        // append two messages
+        let msgs = r#"[{"role":"user","content":"hello","timestamp":"1700000001"},{"role":"assistant","content":"hi","timestamp":"1700000002"}]"#;
+        let mj = CString::new(msgs).unwrap();
+        let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), mj.as_ptr()));
+        assert!(r.contains("\"success\":true"), "append: {r}");
+
+        // rename
+        let new_title = CString::new("Renamed").unwrap();
+        let r = call_str(|| aacode_session_rename(pp.as_ptr(), sid.as_ptr(), new_title.as_ptr()));
+        assert!(r.contains("\"success\":true"), "rename: {r}");
+
+        // list
+        let r = call_str(|| aacode_session_list(pp.as_ptr()));
+        assert!(r.contains("\"success\":true"), "list: {r}");
+        assert!(r.contains("sess_a"));
+        assert!(r.contains("Renamed"));
+
+        // paginated messages
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 50));
+        assert!(r.contains("\"success\":true"), "messages: {r}");
+        assert!(r.contains("\"total\":2"));
+        assert!(r.contains("hello"));
+
+        // touch
+        let r = call_str(|| aacode_session_touch(pp.as_ptr(), sid.as_ptr()));
+        assert!(r.contains("\"success\":true"), "touch: {r}");
+
+        // delete (idempotent)
+        let r = call_str(|| aacode_session_delete(pp.as_ptr(), sid.as_ptr()));
+        assert!(r.contains("\"success\":true"), "delete: {r}");
+        let r = call_str(|| aacode_session_delete(pp.as_ptr(), sid.as_ptr()));
+        assert!(r.contains("\"success\":true"), "delete again (idempotent): {r}");
+    }
+
+    #[test]
+    fn session_append_bad_json_errors() {
+        let proj = mkdirs(&tmp_root("sess_bad"));
+        let pp = CString::new(proj).unwrap();
+        let sid = CString::new("s1").unwrap();
+        let bad = CString::new("not json").unwrap();
+        let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), bad.as_ptr()));
+        assert!(r.contains("\"success\":false"), "bad msgs_json must error: {r}");
+        assert!(r.contains("bad msgs_json"));
+    }
+
+    #[test]
+    fn session_messages_pagination() {
+        let proj = mkdirs(&tmp_root("sess_page"));
+        let pp = CString::new(proj.clone()).unwrap();
+        let sid = CString::new("s1").unwrap();
+        {
+            let mut sm = SessionManager::new(std::path::Path::new(&proj));
+            sm.ensure_session("s1", "").unwrap();
+            for i in 0..5 {
+                sm.append_session_messages(
+                    "s1",
+                    vec![SessionMessage {
+                        role: "user".to_string(),
+                        content: format!("m{i}"),
+                        timestamp: format!("17000000{i:02}"),
+                        tokens: 1,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    }],
+                )
+                .unwrap();
+            }
         }
-        aacode_register_stream_callback(Some(cb));
-        let sink = FfiSink;
-        sink.done("s1");
-        assert!(COUNT.load(Ordering::SeqCst) >= 1);
-        aacode_register_stream_callback(None);
+        // offset=0 limit=2 → newest two (m3, m4)
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 2));
+        assert!(r.contains("\"total\":5"), "total: {r}");
+        assert!(r.contains("m4") && r.contains("m3") && !r.contains("m0"), "page0: {r}");
+        // offset=2 limit=2 → m1, m2
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 2, 2));
+        assert!(r.contains("m2") && r.contains("m1") && !r.contains("m3"), "page1: {r}");
+    }
+
+    #[test]
+    fn session_messages_null_args_error() {
+        let r = call_str(|| aacode_session_messages(std::ptr::null(), std::ptr::null(), 0, 50));
+        assert!(r.contains("\"success\":false"), "null args: {r}");
+    }
+
+    #[test]
+    fn session_ffi_rejects_path_traversal_sid() {
+        let proj = mkdirs(&tmp_root("sess_trav"));
+        let pp = CString::new(proj).unwrap();
+        let evil = CString::new("../escape").unwrap();
+        let r = call_str(|| aacode_session_ensure(pp.as_ptr(), evil.as_ptr(), std::ptr::null()));
+        assert!(r.contains("\"success\":false"), "path traversal must be rejected: {r}");
+        assert!(r.contains("invalid session_id"));
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), evil.as_ptr(), 0, 50));
+        assert!(r.contains("\"success\":false"));
+        let r = call_str(|| aacode_session_delete(pp.as_ptr(), evil.as_ptr()));
+        assert!(r.contains("\"success\":false"));
+    }
+
+    #[test]
+    fn session_messages_limit_zero_and_beyond_total() {
+        let proj = mkdirs(&tmp_root("sess_l0"));
+        let pp = CString::new(proj.clone()).unwrap();
+        let sid = CString::new("s1").unwrap();
+        {
+            let mut sm = SessionManager::new(std::path::Path::new(&proj));
+            sm.ensure_session("s1", "").unwrap();
+            sm.append_session_messages(
+                "s1",
+                vec![SessionMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                    timestamp: "1".to_string(),
+                    tokens: 1,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        }
+        // limit=0 → no messages, total still reported.
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 0));
+        assert!(r.contains("\"total\":1"), "limit=0 total: {r}");
+        assert!(!r.contains("\"hi\""), "limit=0 must return no messages: {r}");
+        // offset beyond total → empty.
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 5, 10));
+        assert!(r.contains("\"total\":1"));
+        assert!(!r.contains("\"hi\""), "offset beyond total must be empty: {r}");
+    }
+
+    #[test]
+    fn session_unicode_content_roundtrip() {
+        let proj = mkdirs(&tmp_root("sess_uni"));
+        let pp = CString::new(proj).unwrap();
+        let sid = CString::new("s1").unwrap();
+        let msgs = r#"[{"role":"user","content":"你好，世界 🌍","timestamp":"1700000001"}]"#;
+        let mj = CString::new(msgs).unwrap();
+        let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), mj.as_ptr()));
+        assert!(r.contains("\"success\":true"), "append unicode: {r}");
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 50));
+        assert!(r.contains("你好，世界"), "unicode content preserved: {r}");
+    }
+
+    #[test]
+    fn session_list_empty_project() {
+        let proj = mkdirs(&tmp_root("sess_empty"));
+        let pp = CString::new(proj).unwrap();
+        let r = call_str(|| aacode_session_list(pp.as_ptr()));
+        assert!(r.contains("\"success\":true"));
+        assert!(r.contains("\"sessions\":[]"), "empty project: {r}");
     }
 }

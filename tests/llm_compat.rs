@@ -409,9 +409,9 @@ fn anthropic_in_stream_error() {
 use aacode_rs::config::{Gateway, ModelConfig};
 use aacode_rs::llm::{build_client, ChatMessage};
 
-#[test]
+#[tokio::test]
 #[ignore = "requires a real LLM_API_KEY"]
-fn live_openai_streams_text() {
+async fn live_openai_streams_text() {
     let mut model = ModelConfig {
         name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| "deepseek-chat".into()),
         api_key: std::env::var("LLM_API_KEY").ok(),
@@ -429,14 +429,15 @@ fn live_openai_streams_text() {
     ];
     let resp = client
         .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
         .expect("live call failed");
     eprintln!("LIVE text = {:?}", resp.text);
     assert!(!resp.text.trim().is_empty(), "expected non-empty response");
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires a real LLM_API_KEY"]
-fn live_openai_tool_call() {
+async fn live_openai_tool_call() {
     let mut model = ModelConfig {
         name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| "deepseek-chat".into()),
         api_key: std::env::var("LLM_API_KEY").ok(),
@@ -467,6 +468,7 @@ fn live_openai_tool_call() {
     ];
     let resp = client
         .chat_stream(&msgs, &tools, &sink, &cancel)
+        .await
         .expect("live call failed");
     eprintln!("LIVE tool_calls = {:?}", resp.tool_calls);
     assert!(!resp.tool_calls.is_empty(), "expected a tool call");
@@ -475,9 +477,9 @@ fn live_openai_tool_call() {
     assert!(resp.tool_calls[0].parsed_args().get("command").is_some());
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires a real Anthropic-compatible LLM_API_KEY"]
-fn live_anthropic_streams_text() {
+async fn live_anthropic_streams_text() {
     let mut model = ModelConfig {
         name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| "claude-3-5-sonnet-20241022".into()),
         api_key: std::env::var("LLM_API_KEY").ok(),
@@ -496,14 +498,15 @@ fn live_anthropic_streams_text() {
     ];
     let resp = client
         .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
         .expect("live call failed");
     eprintln!("LIVE anthropic text = {:?}", resp.text);
     assert!(!resp.text.trim().is_empty());
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires a real Anthropic-compatible LLM_API_KEY"]
-fn live_anthropic_tool_call() {
+async fn live_anthropic_tool_call() {
     let mut model = ModelConfig {
         name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| "claude-3-5-sonnet-20241022".into()),
         api_key: std::env::var("LLM_API_KEY").ok(),
@@ -531,6 +534,7 @@ fn live_anthropic_tool_call() {
     ];
     let resp = client
         .chat_stream(&msgs, &tools, &sink, &cancel)
+        .await
         .expect("live call failed");
     eprintln!("LIVE anthropic tool_calls = {:?}", resp.tool_calls);
     eprintln!("LIVE anthropic finish_reason = {:?}", resp.finish_reason);

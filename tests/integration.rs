@@ -91,8 +91,8 @@ fn config_for(addr: &str) -> AgentConfig {
     cfg
 }
 
-#[test]
-fn full_loop_completes_immediately() {
+#[tokio::test]
+async fn full_loop_completes_immediately() {
     let mock = MockLlm::start(vec![sse_content("Task finished, nothing to do.", "stop")]);
     let cfg = config_for(&mock.addr);
     let proj = tmp_project();
@@ -100,7 +100,7 @@ fn full_loop_completes_immediately() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task("say hello", None, &sink, &cancel).unwrap();
+    let res = rt.run_task("say hello", None, &sink, &cancel).await.unwrap();
     assert_eq!(
         format!("{:?}", res.status),
         "Completed",
@@ -113,8 +113,8 @@ fn full_loop_completes_immediately() {
     assert!(lines.iter().any(|l| l.contains(r#""type":"done""#)));
 }
 
-#[test]
-fn full_loop_runs_shell_tool_then_completes() {
+#[tokio::test]
+async fn full_loop_runs_shell_tool_then_completes() {
     // First response: call run_shell to write a file. Second: complete.
     let mock = MockLlm::start(vec![
         sse_tool_call("c1", "run_shell", "{\"command\":\"echo integration > out.txt\"}"),
@@ -126,7 +126,7 @@ fn full_loop_runs_shell_tool_then_completes() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task("write a file", None, &sink, &cancel).unwrap();
+    let res = rt.run_task("write a file", None, &sink, &cancel).await.unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
 
     // The observation for run_shell must have been emitted.
@@ -155,8 +155,8 @@ fn full_loop_runs_shell_tool_then_completes() {
     assert!(msgs.iter().any(|m| m.role == "tool"));
 }
 
-#[test]
-fn event_protocol_ordering_and_shapes() {
+#[tokio::test]
+async fn event_protocol_ordering_and_shapes() {
     let mock = MockLlm::start(vec![
         sse_tool_call("c1", "run_shell", "{\"command\":\"echo hi\"}"),
         sse_content("done", "stop"),
@@ -166,7 +166,7 @@ fn event_protocol_ordering_and_shapes() {
     let rt = AgentRuntime::init(cfg, proj).unwrap();
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
-    rt.run_task("t", None, &sink, &cancel).unwrap();
+    rt.run_task("t", None, &sink, &cancel).await.unwrap();
 
     let lines = sink.lines();
     // start comes before done
@@ -188,8 +188,8 @@ fn event_protocol_ordering_and_shapes() {
 
 /// The core "write code → run it → observe result" loop, exercising the
 /// run_shell → fastshell → python routing. Requires a desktop python3.
-#[test]
-fn python_write_and_test_closed_loop() {
+#[tokio::test]
+async fn python_write_and_test_closed_loop() {
     // 1) write a python file, 2) run it with -c, 3) complete.
     let mock = MockLlm::start(vec![
         sse_tool_call(
@@ -211,7 +211,7 @@ fn python_write_and_test_closed_loop() {
     let cancel = AtomicBool::new(false);
 
     let res = rt
-        .run_task("write add() and test it", None, &sink, &cancel)
+        .run_task("write add() and test it", None, &sink, &cancel).await
         .unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
 
@@ -231,8 +231,8 @@ fn python_write_and_test_closed_loop() {
 
 /// `python <script.py>` routing (the fastshell enhancement) executed via the
 /// shell tool through a completing loop.
-#[test]
-fn python_script_file_execution() {
+#[tokio::test]
+async fn python_script_file_execution() {
     let mock = MockLlm::start(vec![
         sse_tool_call(
             "c1",
@@ -247,7 +247,7 @@ fn python_script_file_execution() {
     let rt = AgentRuntime::init(cfg, proj.clone()).unwrap();
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
-    let res = rt.run_task("run a script", None, &sink, &cancel).unwrap();
+    let res = rt.run_task("run a script", None, &sink, &cancel).await.unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
     assert!(proj.join("run.py").exists());
     // If python executed the script, "42" appears in an observation.
@@ -260,8 +260,8 @@ fn python_script_file_execution() {
 
 /// A server that accepts the TCP connection but never sends a byte — the
 /// classic flaky-mobile-network hang. The client's read timeout must fire.
-#[test]
-fn llm_read_timeout_fires_instead_of_hanging() {
+#[tokio::test]
+async fn llm_read_timeout_fires_instead_of_hanging() {
     std::env::set_var("AACODE_LLM_READ_TIMEOUT", "2");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -279,7 +279,7 @@ fn llm_read_timeout_fires_instead_of_hanging() {
     let cancel = AtomicBool::new(false);
 
     let start = std::time::Instant::now();
-    let res = client.chat_stream(&[], &[], &sink, &cancel);
+    let res = client.chat_stream(&[], &[], &sink, &cancel).await;
     let elapsed = start.elapsed();
     std::env::remove_var("AACODE_LLM_READ_TIMEOUT");
 
@@ -293,8 +293,8 @@ fn llm_read_timeout_fires_instead_of_hanging() {
 /// First connection is dropped (transport error), second serves a valid SSE
 /// stream: the retry loop must recover AND emit a visible tool_progress
 /// status so the UI doesn't look frozen during backoff.
-#[test]
-fn llm_retry_recovers_and_reports_status() {
+#[tokio::test]
+async fn llm_retry_recovers_and_reports_status() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
@@ -349,7 +349,7 @@ fn llm_retry_recovers_and_reports_status() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task("say hi", None, &sink, &cancel).unwrap();
+    let res = rt.run_task("say hi", None, &sink, &cancel).await.unwrap();
     assert_eq!(
         format!("{:?}", res.status),
         "Completed",
@@ -374,8 +374,8 @@ fn llm_retry_recovers_and_reports_status() {
 /// assistant(tool_calls) message (no tool results recorded) is resumed. The
 /// request body reaching the API must contain a repaired, fully-paired
 /// history — and the task must complete instead of 400-looping forever.
-#[test]
-fn resumed_session_with_dangling_tool_calls_is_repaired() {
+#[tokio::test]
+async fn resumed_session_with_dangling_tool_calls_is_repaired() {
     use aacode_rs::llm::types::{ChatMessage, ToolCall};
     use aacode_rs::session::{SessionManager, SessionMessage};
     use std::sync::{Arc, Mutex};
@@ -446,7 +446,7 @@ fn resumed_session_with_dangling_tool_calls_is_repaired() {
     let rt = AgentRuntime::init(cfg, proj).unwrap();
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
-    let res = rt.run_task("continue the task", Some(&sid), &sink, &cancel).unwrap();
+    let res = rt.run_task("continue the task", Some(&sid), &sink, &cancel).await.unwrap();
 
     assert_eq!(format!("{:?}", res.status), "Completed", "{:?}", res.status);
 
@@ -476,3 +476,4 @@ fn resumed_session_with_dangling_tool_calls_is_repaired() {
         "synthetic tool result missing from the request"
     );
 }
+

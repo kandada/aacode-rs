@@ -237,6 +237,7 @@ fn mark_in_content(content: &str, todo_id: Option<&str>, pattern: Option<&str>) 
 pub struct AddTodoTool {
     pub store: Arc<TodoStore>,
 }
+#[async_trait::async_trait]
 impl Tool for AddTodoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -249,14 +250,20 @@ impl Tool for AddTodoTool {
             ],
         )
     }
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
         let desc = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
         if desc.is_empty() {
             return Ok(json!({"success": false, "error": "missing description"}).to_string());
         }
         let priority = args.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
         let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("Task");
-        let id = self.store.add(desc, priority, category);
+        let store = self.store.clone();
+        let desc_owned = desc.to_string();
+        let priority_owned = priority.to_string();
+        let category_owned = category.to_string();
+        let id = tokio::task::spawn_blocking(move || store.add(&desc_owned, &priority_owned, &category_owned))
+            .await
+            .unwrap();
         Ok(json!({
             "success": true,
             "todo_id": id,
@@ -269,6 +276,7 @@ impl Tool for AddTodoTool {
 pub struct MarkTodoTool {
     pub store: Arc<TodoStore>,
 }
+#[async_trait::async_trait]
 impl Tool for MarkTodoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -280,11 +288,14 @@ impl Tool for MarkTodoTool {
             ],
         )
     }
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
         let id = args.get("todo_id").and_then(|v| v.as_str());
         let pat = args.get("item_pattern").and_then(|v| v.as_str());
         if id.is_none() && pat.is_none() {
-            let hint = self.store.pending_hint();
+            let store = self.store.clone();
+            let hint = tokio::task::spawn_blocking(move || store.pending_hint())
+                .await
+                .unwrap();
             let err = if hint.is_empty() {
                 "provide todo_id or item_pattern".to_string()
             } else {
@@ -292,7 +303,14 @@ impl Tool for MarkTodoTool {
             };
             return Ok(json!({"success": false, "error": err, "todo_id": id, "item_pattern": pat}).to_string());
         }
-        let ok = self.store.mark_done(id, pat);
+        let store = self.store.clone();
+        let id_owned = id.map(|s| s.to_string());
+        let pat_owned = pat.map(|s| s.to_string());
+        let ok = tokio::task::spawn_blocking(move || {
+            store.mark_done(id_owned.as_deref(), pat_owned.as_deref())
+        })
+        .await
+        .unwrap();
         Ok(json!({"success": ok, "todo_id": id, "item_pattern": pat}).to_string())
     }
 }
@@ -300,6 +318,7 @@ impl Tool for MarkTodoTool {
 pub struct UpdateTodoTool {
     pub store: Arc<TodoStore>,
 }
+#[async_trait::async_trait]
 impl Tool for UpdateTodoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -311,10 +330,15 @@ impl Tool for UpdateTodoTool {
             ],
         )
     }
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
         let old = args.get("old_pattern").and_then(|v| v.as_str()).unwrap_or("");
         let new = args.get("new_item").and_then(|v| v.as_str()).unwrap_or("");
-        let ok = self.store.update(old, new);
+        let store = self.store.clone();
+        let old = old.to_string();
+        let new = new.to_string();
+        let ok = tokio::task::spawn_blocking(move || store.update(&old, &new))
+            .await
+            .unwrap();
         Ok(json!({"success": ok}).to_string())
     }
 }
@@ -322,12 +346,16 @@ impl Tool for UpdateTodoTool {
 pub struct TodoSummaryTool {
     pub store: Arc<TodoStore>,
 }
+#[async_trait::async_trait]
 impl Tool for TodoSummaryTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new("get_todo_summary", "Get a summary of the todo list.", vec![])
     }
-    fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
-        let (total, done, pending) = self.store.summary();
+    async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+        let store = self.store.clone();
+        let (total, done, pending) = tokio::task::spawn_blocking(move || store.summary())
+            .await
+            .unwrap();
         let rate = if total > 0 { (done as f64 / total as f64) * 100.0 } else { 0.0 };
         Ok(json!({
             "success": true,
@@ -343,27 +371,17 @@ impl Tool for TodoSummaryTool {
 pub struct ListTodoFilesTool {
     pub store: Arc<TodoStore>,
 }
+#[async_trait::async_trait]
 impl Tool for ListTodoFilesTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new("list_todo_files", "List all todo list files.", vec![])
     }
-    fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
-        let files = self.store.list_files();
+    async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+        let store = self.store.clone();
+        let files = tokio::task::spawn_blocking(move || store.list_files())
+            .await
+            .unwrap();
         Ok(json!({"success": true, "files": files, "count": files.len()}).to_string())
-    }
-}
-
-pub struct AddExecutionRecordTool;
-impl Tool for AddExecutionRecordTool {
-    fn schema(&self) -> ToolSchema {
-        ToolSchema::new(
-            "add_execution_record",
-            "(Deprecated) Execution records merged into logging; silently succeeds.",
-            vec![ToolParameter::new("record", ParamType::String, false, "record text", &["description", "details", "message", "summary", "content", "text", "note"])],
-        )
-    }
-    fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
-        Ok(json!({"success": true, "message": "recorded"}).to_string())
     }
 }
 
@@ -382,50 +400,50 @@ mod tests {
         (Arc::new(TodoStore::new(&d)), d)
     }
 
-    #[test]
-    fn add_returns_id_and_marks_done() {
+    #[tokio::test]
+    async fn add_returns_id_and_marks_done() {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
         let add = AddTodoTool { store: s.clone() };
-        let out = add.call(&json!({"description": "write tests"}), &cancel).unwrap();
+        let out = add.call(&json!({"description": "write tests"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let id = v["todo_id"].as_str().unwrap().to_string();
         assert_eq!(id, "t1");
 
         let mark = MarkTodoTool { store: s.clone() };
-        let out = mark.call(&json!({"todo_id": id}), &cancel).unwrap();
+        let out = mark.call(&json!({"todo_id": id}), &cancel).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], true);
 
         let sum = TodoSummaryTool { store: s.clone() };
-        let out = sum.call(&json!({}), &cancel).unwrap();
+        let out = sum.call(&json!({}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_todos"], 1);
         assert_eq!(v["completed_todos"], 1);
     }
 
-    #[test]
-    fn mark_by_pattern() {
+    #[tokio::test]
+    async fn mark_by_pattern() {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: s.clone() }.call(&json!({"description": "implement login"}), &cancel).unwrap();
+        AddTodoTool { store: s.clone() }.call(&json!({"description": "implement login"}), &cancel).await.unwrap();
         assert!(s.mark_done(None, Some("login")));
     }
 
-    #[test]
-    fn missing_id_gives_hint() {
+    #[tokio::test]
+    async fn missing_id_gives_hint() {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: s.clone() }.call(&json!({"description": "test"}), &cancel).unwrap();
+        AddTodoTool { store: s.clone() }.call(&json!({"description": "test"}), &cancel).await.unwrap();
         let mark = MarkTodoTool { store: s.clone() };
-        let out = mark.call(&json!({}), &cancel).unwrap();
+        let out = mark.call(&json!({}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], false);
         // Should list pending todos.
         assert!(v["error"].as_str().unwrap().contains("Available"));
     }
 
-    #[test]
-    fn session_isolation() {
+    #[tokio::test]
+    async fn session_isolation() {
         let d = std::env::temp_dir().join(format!("aacode_sess_todo_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
 
@@ -438,31 +456,31 @@ mod tests {
         ));
 
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: store.clone() }.call(&json!({"description": "task a"}), &cancel).unwrap();
+        AddTodoTool { store: store.clone() }.call(&json!({"description": "task a"}), &cancel).await.unwrap();
 
         // Switch session.
         *session_id.lock().unwrap() = Some("sess_b".to_string());
 
-        let out = AddTodoTool { store: store.clone() }.call(&json!({"description": "task b"}), &cancel).unwrap();
+        let out = AddTodoTool { store: store.clone() }.call(&json!({"description": "task b"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["todo_id"], "t2"); // next_id is global (cross-session)
 
         // Back to sess_a, should see the t1 from earlier.
         *session_id.lock().unwrap() = Some("sess_a".to_string());
         let sum = TodoSummaryTool { store: store.clone() };
-        let out = sum.call(&json!({}), &cancel).unwrap();
+        let out = sum.call(&json!({}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_todos"], 1);
     }
 
-    #[test]
-    fn update_item() {
+    #[tokio::test]
+    async fn update_item() {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: s.clone() }.call(&json!({"description": "old desc"}), &cancel).unwrap();
+        AddTodoTool { store: s.clone() }.call(&json!({"description": "old desc"}), &cancel).await.unwrap();
         let upd = UpdateTodoTool { store: s.clone() };
         assert!(serde_json::from_str::<Value>(
-            &upd.call(&json!({"old_pattern": "old desc", "new_item": "new desc"}), &cancel).unwrap()
+            &upd.call(&json!({"old_pattern": "old desc", "new_item": "new desc"}), &cancel).await.unwrap()
         ).unwrap()["success"].as_bool().unwrap());
         assert!(s.read().contains("new desc"));
     }

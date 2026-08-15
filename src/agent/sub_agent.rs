@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 /// Run a delegated sub-task to completion and return its final summary text.
-pub fn run_sub_agent(
+pub async fn run_sub_agent(
     agent_type: &str,
     task: &str,
     llm: &dyn LlmClient,
@@ -52,7 +52,7 @@ pub fn run_sub_agent(
     sub_cfg.max_iterations = config.max_iterations.min(15);
 
     let loop_ = ReactLoop::new(llm, registry, &sub_cfg, native);
-    let result = loop_.run(messages, &mut sub_session, emitter, cancel)?;
+    let result = loop_.run(messages, &mut sub_session, emitter, cancel).await?;
 
     match result.status {
         RunStatus::Completed => Ok(result.final_text),
@@ -76,8 +76,9 @@ mod tests {
     struct OneShotLlm {
         text: Mutex<Option<String>>,
     }
+    #[async_trait::async_trait]
     impl LlmClient for OneShotLlm {
-        fn chat_stream(
+        async fn chat_stream(
             &self,
             _m: &[ChatMessage],
             _t: &[Value],
@@ -90,13 +91,13 @@ mod tests {
                 ..Default::default()
             })
         }
-        fn validate(&self) -> Result<()> {
+        async fn validate(&self) -> Result<()> {
             Ok(())
         }
     }
 
-    #[test]
-    fn sub_agent_returns_summary() {
+    #[tokio::test]
+    async fn sub_agent_returns_summary() {
         let llm = OneShotLlm {
             text: Mutex::new(Some("sub done".into())),
         };
@@ -111,7 +112,7 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let out =
-            run_sub_agent("code", "do x", &llm, &reg, &cfg, &dir, &sink, &cancel).unwrap();
+            run_sub_agent("code", "do x", &llm, &reg, &cfg, &dir, &sink, &cancel).await.unwrap();
         assert_eq!(out, "sub done");
     }
 }

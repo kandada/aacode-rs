@@ -560,7 +560,7 @@ mod tests {
         let cfg = AgentConfig::default();
         let s = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.max_iterations, 30);
+        assert_eq!(back.max_iterations, 300);
         assert_eq!(back.model.name, "deepseek-chat");
     }
 
@@ -569,7 +569,7 @@ mod tests {
         let cfg: AgentConfig =
             serde_json::from_str(r#"{"model":{"name":"gpt-4","api_key":"x"}}"#).unwrap();
         assert_eq!(cfg.model.name, "gpt-4");
-        assert_eq!(cfg.max_iterations, 30);
+        assert_eq!(cfg.max_iterations, 300);
         assert_eq!(cfg.model.temperature, 0.1);
     }
 

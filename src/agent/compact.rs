@@ -13,6 +13,7 @@
 use crate::config::ContextConfig;
 use crate::llm::types::ChatMessage;
 use crate::session::estimate_tokens;
+use std::borrow::Cow;
 
 /// Estimate tokens of a whole message list.
 pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
@@ -102,16 +103,19 @@ pub struct CompactCache {
 /// Build a compact view using (and maintaining) a [`CompactCache`] so the
 /// view prefix stays stable across iterations. Returns
 /// (view, was_compacted, token_count).
-pub fn build_compact_view_cached(
-    messages: &[ChatMessage],
+///
+/// On the fast path (no compaction needed) the view borrows from `messages`
+/// via `Cow::Borrowed`, avoiding a full clone.
+pub fn build_compact_view_cached<'a>(
+    messages: &'a [ChatMessage],
     cfg: &ContextConfig,
     cache: &mut Option<CompactCache>,
-) -> (Vec<ChatMessage>, bool, usize) {
+) -> (Cow<'a, [ChatMessage]>, bool, usize) {
     let total = estimate_messages_tokens(messages);
 
     // Fast path: under budget and no compaction has happened yet.
     if cache.is_none() && total <= cfg.compact_trigger_tokens {
-        return (messages.to_vec(), false, total);
+        return (Cow::Borrowed(messages), false, total);
     }
 
     // Reuse the frozen boundary + summary while the compact view fits.
@@ -129,7 +133,7 @@ pub fn build_compact_view_cached(
             }
             let view_total = estimate_messages_tokens(&view);
             if view_total <= c.recompact_at {
-                return (view, true, view_total);
+                return (Cow::Owned(view), true, view_total);
             }
             // Tail grew too large again → fall through to re-compact
             // (one intentional cache miss, then stable again).
@@ -162,7 +166,7 @@ pub fn build_compact_view_cached(
             recompact_at: (tokens + tokens / 2).max(cfg.compact_trigger_tokens),
         });
     }
-    (view, compacted, tokens)
+    (Cow::Owned(view), compacted, tokens)
 }
 
 /// The summary system message (byte-stable formatting).
@@ -410,13 +414,13 @@ mod tests {
         let mut msgs = convo(2);
         let (v1, c1, _) = build_compact_view_cached(&msgs, &cfg(1_000_000), &mut cache);
         assert!(!c1);
+        let v1_fp = fingerprint(&v1);
+        let v1_len = v1.len();
+        drop(v1); // release borrow before mutating msgs
         msgs.push(ChatMessage::user("next question"));
         let (v2, _, _) = build_compact_view_cached(&msgs, &cfg(1_000_000), &mut cache);
-        assert_eq!(
-            fingerprint(&v1),
-            fingerprint(&v2[..v1.len()]),
-            "prefix must be stable"
-        );
+        let v2_fp = fingerprint(&v2);
+        assert_eq!(v1_fp, v2_fp[..v1_len], "prefix must be stable");
     }
 
     #[test]
@@ -430,23 +434,22 @@ mod tests {
         assert!(c1, "should compact");
         assert!(cache.is_some(), "cache must be populated");
 
+        let v1_fp = fingerprint(&v1);
+        let v1_len = v1.len();
+        drop(v1); // release borrow before mutating msgs
+
         // Simulate two more agent iterations (append-only growth).
         msgs.push(ChatMessage::user("follow-up 1"));
         let (v2, _, _) = build_compact_view_cached(&msgs, &cfg(10), &mut cache);
-        assert!(v2.len() > v1.len());
-        assert_eq!(
-            fingerprint(&v1),
-            fingerprint(&v2[..v1.len()]),
-            "compacted view prefix must be byte-stable"
-        );
+        assert!(v2.len() > v1_len);
+        let v2_fp = fingerprint(&v2);
+        assert_eq!(v1_fp, v2_fp[..v1_len], "compacted view prefix must be byte-stable");
+        let v2_len = v2.len();
+        drop(v2);
 
         msgs.push(ChatMessage::user("follow-up 2"));
         let (v3, _, _) = build_compact_view_cached(&msgs, &cfg(10), &mut cache);
-        assert_eq!(
-            fingerprint(&v2),
-            fingerprint(&v3[..v2.len()]),
-            "second append must also extend the prefix"
-        );
+        assert_eq!(v2_fp, fingerprint(&v3[..v2_len]), "second append must also extend the prefix");
     }
 
     #[test]
@@ -473,6 +476,18 @@ mod tests {
         // And the re-frozen view must again be smaller than the raw messages.
         assert!(tokens < estimate_messages_tokens(&msgs));
         assert!(view.iter().any(|m| m.content.contains("History Summary")));
+    }
+
+    #[test]
+    fn fast_path_avoids_clone_with_cow() {
+        // The fast-path view should be Cow::Borrowed, avoiding a full clone.
+        let mut cache = None;
+        let msgs = convo(3);
+        let (view, compacted, _) = build_compact_view_cached(&msgs, &cfg(1_000_000), &mut cache);
+        assert!(!compacted);
+        // Content should be identical.
+        assert_eq!(view.len(), msgs.len());
+        assert_eq!(view[0].content, msgs[0].content);
     }
 
     #[test]

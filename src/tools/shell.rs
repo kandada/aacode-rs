@@ -12,7 +12,7 @@ use super::backend::ShellBackend;
 use super::registry::Tool;
 use super::schema::{ParamType, ToolParameter, ToolSchema};
 use crate::config::{DangerAction, SafetyConfig};
-use crate::error::Result;
+use crate::error::{AacodeError, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -91,17 +91,18 @@ impl ShellTool {
     }
 }
 
+#[async_trait::async_trait]
 impl Tool for ShellTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "run_shell",
-            "Execute shell commands — the universal Swiss Army knife. This is the ONLY tool for ALL file operations. Use shell commands for: reading (cat/tail/head file), writing (echo text > file, cat > file << 'EOF'), editing (sed/awk), searching (grep/rg/find), running code (python/node/go/rustc/gcc), testing (pytest/cargo test), git, and more. Supports pipes (|), redirection (>), heredocs (<< 'EOF'), chaining (&& / || / ;), command substitution ($(...)), and variable expansion ($VAR). Always returns a result object with stdout, stderr, and returncode — check returncode for success.",
+            "Execute shell commands — the universal Swiss Army knife. This is the ONLY tool for ALL file operations. Use shell commands for: locating (grep -n pattern file, find), reading full content (cat/tail/head file), writing (echo text > file, cat > file << 'EOF'), editing (sed/awk), running code (python/node/go/rustc/gcc), testing (pytest/cargo test), git, and more. Supports pipes (|), redirection (>), heredocs (<< 'EOF'), chaining (&& / || / ;), command substitution ($(...)), and variable expansion ($VAR). Always returns a result object with stdout, stderr, and returncode — check returncode for success.",
             vec![
                 ToolParameter::new(
                     "command",
                     ParamType::String,
                     true,
-                    "The shell command to execute. For multi-line files, use heredoc: cat > file << 'EOF'\\n...\\nEOF. Supports pipes (|), redirection (>), chaining (&& / ;). Always quote filenames with spaces/special chars.",
+                    "The shell command to execute. Supports pipes (|), redirection (>), chaining (&& / ;). Always quote filenames with spaces/special chars.",
                     &["cmd", "shell", "script", "exec"],
                 ),
                 ToolParameter::new(
@@ -129,14 +130,14 @@ impl Tool for ShellTool {
                     "max_output",
                     ParamType::Integer,
                     false,
-                    "Limit returned output characters. Default: no limit.",
+                    "Limit returned output characters (default 24000). Pass a smaller number to save context; omit to keep the default cap.",
                     &["max_chars", "limit", "output_limit"],
                 ),
             ],
         )
     }
 
-    fn call(&self, args: &Value, _cancel: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, _cancel: &AtomicBool) -> Result<String> {
         // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
         let command = args
             .get("command")
@@ -166,9 +167,13 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(self.default_idle_timeout_secs);
 
-        let result = self
-            .backend
-            .run(&command, stdin_input, timeout, idle_timeout, &self.cwd);
+        let stdin_owned = stdin_input.map(|s| s.to_string());
+        let backend = self.backend.clone();
+        let cwd = self.cwd.clone();
+        let command2 = command.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            backend.run(&command2, stdin_owned.as_deref(), timeout, idle_timeout, &cwd)
+        }).await.map_err(|e| AacodeError::Other(format!("shell spawn: {e}")))?;
 
         // Per-call max_output override; else the tool's configured cap.
         let limit = args
@@ -219,12 +224,12 @@ mod tests {
         d
     }
 
-    #[test]
-    fn native_echo_roundtrip() {
+    #[tokio::test]
+    async fn native_echo_roundtrip() {
         let dir = tmp();
         let t = native_tool(dir);
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"command": "echo hello"}), &cancel).unwrap();
+        let out = t.call(&json!({"command": "echo hello"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], true);
         assert_eq!(v["returncode"], 0);
@@ -232,62 +237,49 @@ mod tests {
         assert!(v["stdout"].as_str().unwrap().contains("hello"));
     }
 
-    #[test]
-    fn native_writes_to_real_cwd() {
+    #[tokio::test]
+    async fn native_writes_to_real_cwd() {
         let dir = tmp();
         let t = native_tool(dir.clone());
         let cancel = AtomicBool::new(false);
-        t.call(&json!({"command": "echo content > note.txt"}), &cancel)
-            .unwrap();
-        // File exists at the REAL working directory, not a VFS jail.
+        t.call(&json!({"command": "echo content > note.txt"}), &cancel).await.unwrap();
         assert!(dir.join("note.txt").exists());
     }
 
-    #[test]
-    fn native_heredoc_via_tool() {
+    #[tokio::test]
+    async fn native_heredoc_via_tool() {
         let dir = tmp();
         let t = native_tool(dir);
         let cancel = AtomicBool::new(false);
-        let out = t
-            .call(
-                &json!({"command": "cat > x.txt <<'EOF'\nhi\nEOF\ncat x.txt"}),
-                &cancel,
-            )
-            .unwrap();
+        let out = t.call(&json!({"command": "cat > x.txt <<'EOF'\nhi\nEOF\ncat x.txt"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v["stdout"].as_str().unwrap().contains("hi"));
     }
 
-    #[test]
-    fn max_output_truncation() {
+    #[tokio::test]
+    async fn max_output_truncation() {
         let dir = tmp();
         let t = native_tool(dir);
         let cancel = AtomicBool::new(false);
-        let out = t
-            .call(
-                &json!({"command": "for i in $(seq 1 500); do echo linelineline; done", "max_output": 100}),
-                &cancel,
-            )
-            .unwrap();
+        let out = t.call(&json!({"command": "for i in $(seq 1 500); do echo linelineline; done", "max_output": 100}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v["stdout"].as_str().unwrap().len() < 5000);
     }
 
-    #[test]
-    fn dangerous_reject_mode() {
+    #[tokio::test]
+    async fn dangerous_reject_mode() {
         let dir = tmp();
         let mut safety = SafetyConfig::default();
         safety.dangerous_command_action = DangerAction::Reject;
         let t = ShellTool::new(Arc::new(NativeShell::new()), dir, 24000, 30, 30, safety);
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"command": "rm -rf /"}), &cancel).unwrap();
+        let out = t.call(&json!({"command": "rm -rf /"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], false);
     }
 
-    #[test]
-    fn fastshell_backend_still_works() {
-        // The sandbox backend must remain functional (mobile path).
+    #[tokio::test]
+    async fn fastshell_backend_still_works() {
         let dir = tmp();
         let mut fs = Fastshell::new();
         let mut cfg = Config::default();
@@ -297,7 +289,7 @@ mod tests {
         let backend = Arc::new(FastshellBackend::new(Arc::new(Mutex::new(fs))));
         let t = ShellTool::new(backend, dir, 24000, 30, 30, SafetyConfig::default());
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"command": "echo sandboxed"}), &cancel).unwrap();
+        let out = t.call(&json!({"command": "echo sandboxed"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["backend"], "fastshell");
         assert!(v["stdout"].as_str().unwrap().contains("sandboxed"));

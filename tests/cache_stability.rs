@@ -96,8 +96,8 @@ fn extract_session_id(sink: &CollectingSink) -> String {
 
 // ───────── tests ─────────
 
-#[test]
-fn execute_produces_user_and_assistant_only() {
+#[tokio::test]
+async fn execute_produces_user_and_assistant_only() {
     let mock = MockLlm::start(vec![sse_content("Task completed.", "stop")]);
     let cfg = config_for(&mock.addr);
     let proj = tmp_project();
@@ -105,7 +105,7 @@ fn execute_produces_user_and_assistant_only() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task("analyze the project", None, &sink, &cancel).unwrap();
+    let res = rt.run_task("analyze the project", None, &sink, &cancel).await.unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
 
     let sid = extract_session_id(&sink);
@@ -125,8 +125,8 @@ fn execute_produces_user_and_assistant_only() {
     assert_eq!(system_count, 0, "no system messages should be persisted (found {system_count})");
 }
 
-#[test]
-fn consecutive_tasks_preserve_history() {
+#[tokio::test]
+async fn consecutive_tasks_preserve_history() {
     let mock = MockLlm::start(vec![
         sse_content("First task done.", "stop"),
         sse_content("Second task done.", "stop"),
@@ -138,13 +138,13 @@ fn consecutive_tasks_preserve_history() {
 
     // Task 1
     let sink1 = CollectingSink::new(false);
-    let res1 = rt.run_task("task one", None, &sink1, &cancel).unwrap();
+    let res1 = rt.run_task("task one", None, &sink1, &cancel).await.unwrap();
     assert_eq!(format!("{:?}", res1.status), "Completed");
     let sid = extract_session_id(&sink1);
 
     // Task 2 — continues the same session
     let sink2 = CollectingSink::new(false);
-    let res2 = rt.run_task("task two", Some(&sid), &sink2, &cancel).unwrap();
+    let res2 = rt.run_task("task two", Some(&sid), &sink2, &cancel).await.unwrap();
     assert_eq!(format!("{:?}", res2.status), "Completed");
 
     // Read final session state.
@@ -226,12 +226,14 @@ fn compact_view_prefix_stable_within_call() {
     let mut msgs = convo(12);
 
     let (v1, c1, _) = build_compact_view_cached(&msgs, &cfg, &mut cache);
+    let v1 = v1.into_owned();
     assert!(c1, "should trigger compaction");
     assert!(cache.is_some(), "cache must be populated");
 
     // Simulate another agent turn (append-only growth).
     msgs.push(ChatMessage::user("follow-up question"));
     let (v2, _, _) = build_compact_view_cached(&msgs, &cfg, &mut cache);
+    let v2 = v2.into_owned();
     assert!(v2.len() > v1.len(), "view should grow");
 
     let p1 = view_prefix(&v1);
@@ -245,6 +247,7 @@ fn compact_view_prefix_stable_within_call() {
     // Another iteration — still stable.
     msgs.push(ChatMessage::user("another follow-up"));
     let (v3, _, _) = build_compact_view_cached(&msgs, &cfg, &mut cache);
+    let v3 = v3.into_owned();
     let p3 = view_prefix(&v3);
     assert_eq!(
         p2,

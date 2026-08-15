@@ -19,7 +19,23 @@ use crate::tools::backend::{BackendKind, FastshellBackend, NativeShell, ShellBac
 use fastshell::{Config, Fastshell};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
+
+/// Lazily-initialized shared tokio runtime for async LLM calls.
+/// Created once on first use, shared across all FFI calls and validation.
+/// Uses 2 worker threads (enough for concurrent HTTP SSE reads) with a small
+/// blocking pool for shell execution — mobile devices benefit from fewer
+/// threads (~4 MB vs ~2 MB default on 6-core devices).
+pub(crate) static TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(4)
+        .thread_name("aacode-tokio")
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime for aacode-rs")
+});
 
 /// A prepared agent runtime bound to a project directory + shell backend.
 pub struct AgentRuntime {
@@ -46,6 +62,11 @@ impl AgentRuntime {
         // Wire config.timeouts.model_request into model's per-request deadline
         if config.model.request_timeout_secs.is_none() {
             config.model.request_timeout_secs = Some(config.timeouts.model_request);
+        }
+        if let Some(mm) = config.multimodal.as_mut() {
+            if mm.request_timeout_secs.is_none() {
+                mm.request_timeout_secs = Some(config.timeouts.model_request);
+            }
         }
         // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
         std::fs::create_dir_all(&project_path)
@@ -84,6 +105,11 @@ impl AgentRuntime {
         if config.model.request_timeout_secs.is_none() {
             config.model.request_timeout_secs = Some(config.timeouts.model_request);
         }
+        if let Some(mm) = config.multimodal.as_mut() {
+            if mm.request_timeout_secs.is_none() {
+                mm.request_timeout_secs = Some(config.timeouts.model_request);
+            }
+        }
         AgentRuntime {
             config,
             project_path,
@@ -97,14 +123,21 @@ impl AgentRuntime {
     }
 
     /// Validate the configured API key with a lightweight probe.
+    /// Uses a dedicated OS thread to avoid runtime nesting issues, reusing the
+    /// shared runtime handle (no per-call `Runtime::new()` thread churn).
     pub fn validate_api_key(&self) -> Result<()> {
         let client = build_client(&self.config.model);
-        client.validate()
+        let handle = TOKIO_RT.handle().clone();
+        std::thread::scope(|s| {
+            s.spawn(move || handle.block_on(async { client.validate().await }))
+                .join()
+                .unwrap()
+        })
     }
 
     /// Run a task to completion, streaming events to `emitter`.
     /// `session_id` optionally continues an existing session.
-    pub fn run_task(
+    pub async fn run_task(
         &self,
         task: &str,
         session_id: Option<&str>,
@@ -133,13 +166,14 @@ impl AgentRuntime {
             self.project_path.clone(),
             self.backend.clone(),
         );
-        agent.execute(task, &mut session, emitter, cancel)
+        agent.execute(task, &mut session, emitter, cancel).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelConfig;
     use crate::stream::CollectingSink;
 
     fn tmp() -> PathBuf {
@@ -186,15 +220,59 @@ mod tests {
         assert!(out.stdout.contains("hi"));
     }
 
-    #[test]
-    fn run_task_missing_key_errors() {
+    #[tokio::test]
+    async fn run_task_missing_key_errors() {
         let d = tmp();
         let cfg = AgentConfig::default(); // no api key
         let rt = AgentRuntime::init(cfg, d).unwrap();
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
-        let res = rt.run_task("do x", None, &sink, &cancel).unwrap();
+        let res = rt.run_task("do x", None, &sink, &cancel).await.unwrap();
         assert!(matches!(res.status, RunStatus::Error(_)));
         assert!(sink.lines().iter().any(|l| l.contains("error")));
+    }
+
+    #[test]
+    fn multimodal_timeout_wired_to_model_request() {
+        let d = tmp();
+        let mut cfg = AgentConfig::default();
+        cfg.model.api_key = Some("sk-test".into());
+        cfg.multimodal = Some(ModelConfig {
+            name: "kimi-k2.5".into(),
+            api_key: Some("sk-mm".into()),
+            ..Default::default()
+        });
+        assert!(cfg.multimodal.as_ref().unwrap().request_timeout_secs.is_none(),
+            "before init, request_timeout_secs should be None");
+        let rt = AgentRuntime::init(cfg, d).unwrap();
+        assert_eq!(
+            rt.config.multimodal.as_ref().unwrap().request_timeout_secs,
+            Some(rt.config.timeouts.model_request),
+            "multimodal request_timeout_secs must be wired to model_request after init"
+        );
+    }
+
+    #[test]
+    fn multimodal_timeout_wired_with_fastshell() {
+        let d = tmp();
+        let mut cfg = AgentConfig::default();
+        cfg.model.api_key = Some("sk-test".into());
+        cfg.multimodal = Some(ModelConfig {
+            name: "kimi-k2.5".into(),
+            api_key: Some("sk-mm".into()),
+            ..Default::default()
+        });
+        assert!(cfg.multimodal.as_ref().unwrap().request_timeout_secs.is_none());
+        let mut fs = Fastshell::new();
+        let mut fscfg = Config::default();
+        fscfg.sandbox_path = d.to_string_lossy().to_string();
+        fscfg.python_enabled = true;
+        fs.init(fscfg).unwrap();
+        let rt = AgentRuntime::with_fastshell(cfg, d, Arc::new(Mutex::new(fs)));
+        assert_eq!(
+            rt.config.multimodal.as_ref().unwrap().request_timeout_secs,
+            Some(rt.config.timeouts.model_request),
+            "multimodal request_timeout_secs must be wired to model_request in with_fastshell too"
+        );
     }
 }

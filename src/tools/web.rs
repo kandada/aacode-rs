@@ -23,7 +23,8 @@ use crate::error::{AacodeError, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 /// Max time (secs) to establish a TCP+TLS connection before declaring the
 /// engine unreachable. Keeps dead LAN SearXNG hosts from stalling searches.
@@ -37,14 +38,12 @@ const FAILURES_TO_OPEN: u32 = 1;
 /// Minimum window always granted to the final HTML-scrape fallback.
 const SCRAPE_MIN_SECS: f64 = 3.0;
 
-/// Build an HTTP agent with a fast connect timeout and an overall deadline.
-fn http_agent(total_secs: f64) -> ureq::Agent {
-    let total = if total_secs < 0.5 { 0.5 } else { total_secs };
-    ureq::builder()
-        .timeout_connect(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .timeout(std::time::Duration::from_secs_f64(total))
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .build()
-}
+        .expect("reqwest client")
+});
 
 // ──────────────────────────── search_web ────────────────────────────────
 
@@ -131,31 +130,39 @@ impl SearchWebTool {
 
     /// Rate limit: sleep (bounded by the remaining budget) until the engine's
     /// minimum interval has elapsed since its previous call.
-    fn enforce_rate_limit(&self, engine: &str, remaining: f64) {
-        let mut guard = engine_health().lock().unwrap_or_else(|e| e.into_inner());
-        let rate = match engine {
-            "searxng" => 0.5,
-            _ => 1.0,
-        };
-        let now = current_time();
-        let h = guard.entry(engine.to_string()).or_default();
-        if h.last_call > 0.0 {
-            let wait = rate - (now - h.last_call);
-            if wait > 0.0 {
-                let wait = wait.min(remaining.max(0.0));
-                drop(guard);
-                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
-                let mut guard = engine_health().lock().unwrap_or_else(|e| e.into_inner());
-                guard.entry(engine.to_string()).or_default().last_call = current_time();
-                return;
+    async fn enforce_rate_limit(&self, engine: &str, remaining: f64) {
+        let do_wait = {
+            let mut guard = engine_health().lock().unwrap_or_else(|e| e.into_inner());
+            let rate = match engine {
+                "searxng" => 0.5,
+                _ => 1.0,
+            };
+            let now = current_time();
+            let h = guard.entry(engine.to_string()).or_default();
+            if h.last_call > 0.0 {
+                let wait = rate - (now - h.last_call);
+                if wait > 0.0 {
+                    let wait = wait.min(remaining.max(0.0));
+                    Some(wait)
+                } else {
+                    h.last_call = current_time();
+                    None
+                }
+            } else {
+                h.last_call = current_time();
+                None
             }
+        };
+        if let Some(wait) = do_wait {
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+            let mut guard = engine_health().lock().unwrap_or_else(|e| e.into_inner());
+            guard.entry(engine.to_string()).or_default().last_call = current_time();
         }
-        h.last_call = current_time();
     }
 
     /// Try all configured backends in priority order, with fallback.
     /// Returns (success, engine, results, engines_tried diagnostics).
-    fn search_with_fallback(
+    async fn search_with_fallback(
         &self,
         query: &str,
         max_results: usize,
@@ -188,7 +195,7 @@ impl SearchWebTool {
                 tried.push(format!("{eng}:skipped(budget)"));
                 continue;
             }
-            match self.try_engine(eng, query, max_results, remaining) {
+            match self.try_engine(eng, query, max_results, remaining).await {
                 Attempt::Ok(results) => {
                     tried.push(format!("{eng}:ok"));
                     self.record_outcome(eng, true);
@@ -212,7 +219,7 @@ impl SearchWebTool {
         // it a minimum window even if the engines used up the budget.
         if !cancel.load(Ordering::Relaxed) {
             let remaining = (deadline - current_time()).max(SCRAPE_MIN_SECS);
-            if let Some((name, results)) = fallback_scrape(query, max_results, remaining) {
+            if let Some((name, results)) = fallback_scrape(query, max_results, remaining).await {
                 if !results.is_empty() {
                     tried.push(format!("{name}:ok"));
                     return (true, name, results, tried);
@@ -224,7 +231,7 @@ impl SearchWebTool {
         (false, engine.to_string(), vec![], tried)
     }
 
-    fn try_engine(
+    async fn try_engine(
         &self,
         engine: &str,
         query: &str,
@@ -246,7 +253,7 @@ impl SearchWebTool {
         if self.circuit_open(engine) {
             return Attempt::Skipped("circuit-open");
         }
-        self.enforce_rate_limit(engine, remaining);
+        self.enforce_rate_limit(engine, remaining).await;
         let budget = remaining.min(PER_ENGINE_CAP_SECS);
         let r = match engine {
             "searxng" => searxng_search(
@@ -254,32 +261,32 @@ impl SearchWebTool {
                 query,
                 max_results,
                 budget,
-            ),
+            ).await,
             "brave" => brave_search(
                 self.cfg.brave_api_key.as_deref().unwrap_or(""),
                 query,
                 max_results,
                 budget,
-            ),
+            ).await,
             "google_cse" => google_cse_search(
                 self.cfg.google_cse_key.as_deref().unwrap_or(""),
                 self.cfg.google_cse_cx.as_deref().unwrap_or(""),
                 query,
                 max_results,
                 budget,
-            ),
+            ).await,
             "bing" => bing_search(
                 self.cfg.bing_api_key.as_deref().unwrap_or(""),
                 query,
                 max_results,
                 budget,
-            ),
+            ).await,
             "serpapi" => serpapi_search(
                 self.cfg.serpapi_key.as_deref().unwrap_or(""),
                 query,
                 max_results,
                 budget,
-            ),
+            ).await,
             _ => return Attempt::Skipped("unknown-engine"),
         };
         match r {
@@ -300,6 +307,7 @@ fn brief_err(e: &str) -> String {
     s
 }
 
+#[async_trait::async_trait]
 impl Tool for SearchWebTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -313,7 +321,7 @@ impl Tool for SearchWebTool {
         )
     }
 
-    fn call(&self, args: &Value, cancel: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, cancel: &AtomicBool) -> Result<String> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
         let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(self.timeout_secs);
@@ -323,7 +331,7 @@ impl Tool for SearchWebTool {
         }
 
         let (success, engine, results, tried) =
-            self.search_with_fallback(query, max_results, timeout, cancel);
+            self.search_with_fallback(query, max_results, timeout, cancel).await;
 
         Ok(json!({
             "success": success,
@@ -339,34 +347,30 @@ impl Tool for SearchWebTool {
 
 // ──────────────────── Engine-specific search helpers ────────────────────
 
-fn searxng_search(base: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+async fn searxng_search(base: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
     let url = format!("{}/search", base.trim_end_matches('/'));
-    let resp = http_agent(budget)
+    let resp = HTTP_CLIENT
         .get(&url)
-        .query("q", query)
-        .query("format", "json")
-        .call();
-    let body = match resp {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(e) => return Err(AacodeError::Network(e.to_string())),
-    };
+        .query(&[("q", query), ("format", "json")])
+        .timeout(Duration::from_secs_f64(budget))
+        .send().await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(extract_results(&v, max_results, "title", "url", "content"))
 }
 
-fn brave_search(api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
-    let resp = http_agent(budget)
+async fn brave_search(api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+    let resp = HTTP_CLIENT
         .get("https://api.search.brave.com/res/v1/web/search")
-        .set("Accept", "application/json")
-        .set("Accept-Encoding", "gzip")
-        .set("X-Subscription-Token", api_key)
-        .query("q", query)
-        .query("count", &max_results.to_string())
-        .call();
-    let body = match resp {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(e) => return Err(AacodeError::Network(e.to_string())),
-    };
+        .header("Accept", "application/json")
+        .header("Accept-Encoding", "gzip")
+        .header("X-Subscription-Token", api_key)
+        .query(&[("q", query), ("count", &max_results.to_string())])
+        .timeout(Duration::from_secs_f64(budget))
+        .send().await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     let mut out = Vec::new();
     if let Some(arr) = v.get("web").and_then(|r| r.get("results")).and_then(|r| r.as_array()) {
@@ -381,35 +385,28 @@ fn brave_search(api_key: &str, query: &str, max_results: usize, budget: f64) -> 
     Ok(out)
 }
 
-fn google_cse_search(api_key: &str, cx: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
-    let resp = http_agent(budget)
+async fn google_cse_search(api_key: &str, cx: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+    let resp = HTTP_CLIENT
         .get("https://www.googleapis.com/customsearch/v1")
-        .query("key", api_key)
-        .query("cx", cx)
-        .query("q", query)
-        .query("num", &max_results.to_string())
-        .call();
-    let body = match resp {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(e) => return Err(AacodeError::Network(e.to_string())),
-    };
+        .query(&[("key", api_key), ("cx", cx), ("q", query), ("num", &max_results.to_string())])
+        .timeout(Duration::from_secs_f64(budget))
+        .send().await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(extract_results(&v, max_results, "title", "link", "snippet"))
 }
 
-fn bing_search(_api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+async fn bing_search(_api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
     // Bing v7 API requires Ocp-Apim-Subscription-Key.
-    let resp = http_agent(budget)
+    let resp = HTTP_CLIENT
         .get("https://api.bing.microsoft.com/v7.0/search")
-        .set("Ocp-Apim-Subscription-Key", _api_key)
-        .query("q", query)
-        .query("count", &max_results.to_string())
-        .query("mkt", "en-US")
-        .call();
-    let body = match resp {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(e) => return Err(AacodeError::Network(e.to_string())),
-    };
+        .header("Ocp-Apim-Subscription-Key", _api_key)
+        .query(&[("q", query), ("count", &max_results.to_string()), ("mkt", "en-US")])
+        .timeout(Duration::from_secs_f64(budget))
+        .send().await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     let mut out = Vec::new();
     if let Some(arr) = v.get("webPages").and_then(|r| r.get("value")).and_then(|r| r.as_array()) {
@@ -424,18 +421,14 @@ fn bing_search(_api_key: &str, query: &str, max_results: usize, budget: f64) -> 
     Ok(out)
 }
 
-fn serpapi_search(api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
-    let resp = http_agent(budget)
+async fn serpapi_search(api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+    let resp = HTTP_CLIENT
         .get("https://serpapi.com/search")
-        .query("api_key", api_key)
-        .query("q", query)
-        .query("engine", "google")
-        .query("num", &max_results.to_string())
-        .call();
-    let body = match resp {
-        Ok(r) => r.into_string().unwrap_or_default(),
-        Err(e) => return Err(AacodeError::Network(e.to_string())),
-    };
+        .query(&[("api_key", api_key), ("q", query), ("engine", "google"), ("num", &max_results.to_string())])
+        .timeout(Duration::from_secs_f64(budget))
+        .send().await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(extract_results(&v, max_results, "title", "link", "snippet"))
 }
@@ -460,7 +453,7 @@ fn extract_results(v: &Value, max_results: usize, title_k: &str, url_k: &str, sn
 
 // ──────────────────────── HTML fallback scrape ──────────────────────────
 
-fn fallback_scrape(query: &str, max_results: usize, budget: f64) -> Option<(String, Vec<Value>)> {
+async fn fallback_scrape(query: &str, max_results: usize, budget: f64) -> Option<(String, Vec<Value>)> {
     if budget <= 0.5 {
         return None;
     }
@@ -492,29 +485,29 @@ fn fallback_scrape(query: &str, max_results: usize, budget: f64) -> Option<(Stri
         ),
     ];
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<Value>)>(3);
     for (name, base_url, result_re, clean_re, ua) in &scrapers {
         let q = query.to_string();
-        let n = *name;
-        let bu = *base_url;
+        let n = name.to_string();
+        let bu = base_url.to_string();
         let re = result_re.to_string();
         let cr = clean_re.to_string();
         let ua = ua.to_string();
         let tx = tx.clone();
         let budget = budget * 0.9; // all run in parallel with (nearly) full budget
-        std::thread::spawn(move || {
-            let scraped = scrape_one(n, bu, &q, max_results, budget, &re, &cr, &ua);
+        tokio::spawn(async move {
+            let scraped = scrape_one(&n, &bu, &q, max_results, budget, &re, &cr, &ua).await;
             if let Some(v) = scraped {
-                let _ = tx.send((n.to_string(), v));
+                let _ = tx.send((n, v)).await;
             }
         });
     }
     drop(tx);
 
-    rx.recv_timeout(std::time::Duration::from_secs_f64(budget)).ok()
+    tokio::time::timeout(Duration::from_secs_f64(budget), rx.recv()).await.ok().flatten()
 }
 
-fn scrape_one(
+async fn scrape_one(
     name: &str,
     base_url: &str,
     query: &str,
@@ -524,17 +517,18 @@ fn scrape_one(
     clean_re: &str,
     ua: &str,
 ) -> Option<Vec<Value>> {
-    let resp = http_agent(budget)
+    let resp = HTTP_CLIENT
         .get(base_url)
-        .set("User-Agent", ua)
-        .set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        .query("q", query)
-        .call();
+        .header("User-Agent", ua)
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .query(&[("q", query)])
+        .timeout(Duration::from_secs_f64(budget))
+        .send().await;
     let resp = match resp {
         Ok(r) => r,
         Err(_) => return None,
     };
-    let html = match resp.into_string() {
+    let html = match resp.text().await {
         Ok(s) => s,
         Err(_) => return None,
     };
@@ -670,6 +664,7 @@ pub struct FetchUrlTool {
     pub timeout_secs: u64,
 }
 
+#[async_trait::async_trait]
 impl Tool for FetchUrlTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -683,7 +678,7 @@ impl Tool for FetchUrlTool {
         )
     }
 
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
         if url.is_empty() {
             return Ok(json!({"success": false, "error": "empty url"}).to_string());
@@ -691,17 +686,15 @@ impl Tool for FetchUrlTool {
         let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(self.timeout_secs);
         let max_len = args.get("max_content_length").and_then(|v| v.as_u64()).unwrap_or(5000) as usize;
 
-        let resp = http_agent(timeout as f64)
+        let resp = HTTP_CLIENT
             .get(url)
-            .set("User-Agent", "aacode-rs/0.1")
-            .call();
+            .header("User-Agent", "aacode-rs/0.1")
+            .timeout(Duration::from_secs_f64(timeout as f64))
+            .send().await;
         let (status, body) = match resp {
             Ok(r) => {
-                let status = r.status();
-                (status, r.into_string().unwrap_or_default())
-            }
-            Err(ureq::Error::Status(code, r)) => {
-                (code, r.into_string().unwrap_or_default())
+                let status = r.status().as_u16();
+                (status, r.text().await.unwrap_or_default())
             }
             Err(e) => {
                 return Ok(json!({"success": false, "url": url, "error": e.to_string()}).to_string());
@@ -809,6 +802,7 @@ pub struct SearchCodeTool {
     pub timeout_secs: u64,
 }
 
+#[async_trait::async_trait]
 impl Tool for SearchCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -820,7 +814,7 @@ impl Tool for SearchCodeTool {
             ],
         )
     }
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         if query.is_empty() {
             return Ok(json!({"success": false, "error": "empty query"}).to_string());
@@ -831,15 +825,14 @@ impl Tool for SearchCodeTool {
         // host degrades to the GitHub fallback quickly).
         if let Some(base) = &self.cfg.searxng_url {
             let url = format!("{}/search", base.trim_end_matches('/'));
-            match http_agent(PER_ENGINE_CAP_SECS)
+            match HTTP_CLIENT
                 .get(&url)
-                .query("q", query)
-                .query("format", "json")
-                .query("categories", "it")
-                .call()
+                .query(&[("q", query), ("format", "json"), ("categories", "it")])
+                .timeout(Duration::from_secs_f64(PER_ENGINE_CAP_SECS))
+                .send().await
             {
                 Ok(r) => {
-                    let body = r.into_string().unwrap_or_default();
+                    let body = r.text().await.unwrap_or_default();
                     if let Ok(v) = serde_json::from_str::<Value>(&body) {
                         let results = extract_results(&v, max, "title", "url", "content");
                         if !results.is_empty() {
@@ -857,14 +850,15 @@ impl Tool for SearchCodeTool {
             urlencode(query),
             max
         );
-        let resp = http_agent(self.timeout_secs as f64)
+        let resp = HTTP_CLIENT
             .get(&url)
-            .set("User-Agent", "aacode-rs")
-            .set("Accept", "application/vnd.github+json")
-            .call();
+            .header("User-Agent", "aacode-rs")
+            .header("Accept", "application/vnd.github+json")
+            .timeout(Duration::from_secs_f64(self.timeout_secs as f64))
+            .send().await;
         match resp {
             Ok(r) => {
-                let body = r.into_string().unwrap_or_default();
+                let body = r.text().await.unwrap_or_default();
                 let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
                 let mut items = Vec::new();
                 if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
@@ -923,21 +917,21 @@ mod tests {
         assert_eq!(detect_engine_type("https://myserver.com"), "searxng");
     }
 
-    #[test]
-    fn search_web_no_backend() {
+    #[tokio::test]
+    async fn search_web_no_backend() {
         let t = SearchWebTool::new(SearchConfig::default(), 5);
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"query": "rust"}), &cancel).unwrap();
+        let out = t.call(&json!({"query": "rust"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         // Falls back to scrape or reports no results.
         let _ = v["success"].as_bool();
     }
 
-    #[test]
-    fn fetch_url_empty() {
+    #[tokio::test]
+    async fn fetch_url_empty() {
         let t = FetchUrlTool { project_path: std::env::temp_dir(), timeout_secs: 5 };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"url": ""}), &cancel).unwrap();
+        let out = t.call(&json!({"url": ""}), &cancel).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], false);
     }
 
@@ -970,19 +964,19 @@ mod tests {
         assert!(!a.circuit_open("test_engine_shared"));
     }
 
-    #[test]
-    fn unconfigured_engines_are_skipped_fast() {
+    #[tokio::test]
+    async fn unconfigured_engines_are_skipped_fast() {
         // With nothing configured, every API engine must be skipped without
         // network I/O; only the scrape fallback may take time.
         let t = SearchWebTool::new(SearchConfig::default(), 5);
         let start = std::time::Instant::now();
-        let a = t.try_engine("brave", "q", 3, 5.0);
+        let a = t.try_engine("brave", "q", 3, 5.0).await;
         assert!(matches!(a, Attempt::Skipped("not-configured")));
-        let a = t.try_engine("google_cse", "q", 3, 5.0);
+        let a = t.try_engine("google_cse", "q", 3, 5.0).await;
         assert!(matches!(a, Attempt::Skipped("not-configured")));
-        let a = t.try_engine("serpapi", "q", 3, 5.0);
+        let a = t.try_engine("serpapi", "q", 3, 5.0).await;
         assert!(matches!(a, Attempt::Skipped("not-configured")));
-        let a = t.try_engine("searxng", "q", 3, 5.0);
+        let a = t.try_engine("searxng", "q", 3, 5.0).await;
         assert!(matches!(a, Attempt::Skipped("not-configured")));
         assert!(start.elapsed().as_millis() < 200, "skips must not hit the network");
     }
@@ -990,8 +984,8 @@ mod tests {
     /// Serializes tests that touch the process-wide "searxng" breaker entry.
     static SEARXNG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn refused_searxng_fails_fast_and_opens_circuit() {
+    #[tokio::test]
+    async fn refused_searxng_fails_fast_and_opens_circuit() {
         let _l = SEARXNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Connection refused on localhost is immediate; the second call must
         // then be skipped by the circuit breaker.
@@ -1001,16 +995,16 @@ mod tests {
         };
         let t = SearchWebTool::new(cfg, 5);
         t.record_outcome("searxng", true); // reset shared breaker state
-        let a = t.try_engine("searxng", "q", 3, 5.0);
+        let a = t.try_engine("searxng", "q", 3, 5.0).await;
         assert!(matches!(a, Attempt::TransportError(_)));
         t.record_outcome("searxng", false);
-        let a = t.try_engine("searxng", "q", 3, 5.0);
+        let a = t.try_engine("searxng", "q", 3, 5.0).await;
         assert!(matches!(a, Attempt::Skipped("circuit-open")));
         t.record_outcome("searxng", true); // clean up for other tests
     }
 
-    #[test]
-    fn search_reports_engines_tried() {
+    #[tokio::test]
+    async fn search_reports_engines_tried() {
         let _l = SEARXNG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = SearchConfig {
             searxng_url: Some("http://127.0.0.1:59999".into()),
@@ -1018,7 +1012,7 @@ mod tests {
         };
         let t = SearchWebTool::new(cfg, 1);
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"query": "rust", "timeout": 1}), &cancel).unwrap();
+        let out = t.call(&json!({"query": "rust", "timeout": 1}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let tried = v["engines_tried"].as_array().unwrap();
         assert!(!tried.is_empty());
@@ -1027,8 +1021,8 @@ mod tests {
         t.record_outcome("searxng", true); // clean up shared breaker state
     }
 
-    #[test]
-    fn cancelled_search_returns_immediately() {
+    #[tokio::test]
+    async fn cancelled_search_returns_immediately() {
         let cfg = SearchConfig {
             searxng_url: Some("http://127.0.0.1:59999".into()),
             ..Default::default()
@@ -1036,7 +1030,7 @@ mod tests {
         let t = SearchWebTool::new(cfg, 8);
         let cancel = AtomicBool::new(true);
         let start = std::time::Instant::now();
-        let out = t.call(&json!({"query": "rust"}), &cancel).unwrap();
+        let out = t.call(&json!({"query": "rust"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], false);
         assert!(start.elapsed().as_secs() < 2);

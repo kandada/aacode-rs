@@ -16,7 +16,7 @@
 * Layered tool system — atomic tools, management tools, Skills three-layer architecture
 * Safety guardrails — path confinement, dangerous command rejection, network permissions
 * Cross-platform — compiles to macOS, Linux, Windows, Android, iOS from one codebase
-* No LLM SDK — hand-rolled HTTP + JSON for all LLM APIs, zero tokio
+* No LLM SDK — async HTTP streaming (tokio + reqwest) with hand-rolled SSE/JSON parsing for all LLM APIs
 
 ## Quick Start
 
@@ -208,6 +208,40 @@ run_skills("skill_name", {"param1": "value1", "param2": "value2"})
 │  Native OS shell  |  fastshell sandbox        │
 └──────────────────────────────────────────────┘
 ```
+
+## Mobile Embedding (C ABI)
+
+aacode-rs can be embedded into Android/iOS apps via a **handle-based C ABI**
+(`src/ffi.rs`), compiled as a static library (`libaacode_rs.a`). The API is
+platform-agnostic; each host provides a thin glue layer (Android: `jni_glue.c`,
+iOS: a Swift bridge).
+
+```c
+typedef void (*aacode_event_fn)(const char *line, void *userdata);
+
+void*  aacode_task_start(const char *task_json, aacode_event_fn cb, void *userdata); // non-blocking
+char*  aacode_task_wait(void *handle);   // block until done, returns terminal JSON
+void   aacode_task_cancel(void *handle); // non-blocking, per-handle
+void   aacode_task_free(void *handle);
+char*  aacode_validate_api_key(const char *config_json);
+char*  aacode_list_sessions(const char *project_path);
+char*  aacode_get_session_messages(const char *project_path, const char *session_id);
+void   aacode_free_string(char *ptr);
+```
+
+* Each task is an opaque **handle** — `start` is non-blocking, `wait` blocks for
+  the terminal result. Cancellation targets a single handle (no global state),
+  so concurrent tasks (e.g. cron + chat) are naturally isolated.
+* Events stream as JSONL through `cb(line, userdata)`; the callback context is
+  per-task (`userdata`), so hosts need no thread-local or global trampoline.
+* Early failures (bad JSON / missing task / session busy) emit an `error` event
+  and a terminal result — they are never silent.
+* The terminal event is an enriched `done`:
+  `{"type":"done","session_id":...,"status":...,"iterations":...,"final_text":...}`,
+  where `status` ∈ `completed | max_iterations | cancelled | error`.
+
+See [ANDROID_INTEGRATION.md](../ANDROID_INTEGRATION.md) and
+[IOS_INTEGRATION.md](../IOS_INTEGRATION.md) for host-specific integration.
 
 ## Core Capabilities
 

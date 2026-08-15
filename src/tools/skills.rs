@@ -205,6 +205,7 @@ pub struct RunSkillsTool {
     pub extra_builtins: Vec<String>,
 }
 
+#[async_trait::async_trait]
 impl Tool for RunSkillsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -224,7 +225,7 @@ impl Tool for RunSkillsTool {
         )
     }
 
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
         // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
         let name = args
             .get("skill_name")
@@ -246,19 +247,16 @@ impl Tool for RunSkillsTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(5);
 
-        let (tx, rx) = std::sync::mpsc::channel();
         let pp = self.project_path.clone();
         let ud = self.user_dir.clone();
         let eb = self.extra_builtins.clone();
         let vsd = self.vfs_skills_dir.clone();
-        std::thread::spawn(move || {
-            let skills = discover_skills(&pp, ud.as_deref(), &eb, vsd.as_deref());
-            let _ = tx.send(skills);
-        });
-
-        let skills = match rx.recv_timeout(Duration::from_secs(timeout)) {
-            Ok(s) => s,
-            Err(_) => return Ok("Error: skill discovery timed out".to_string()),
+        let skills = match tokio::time::timeout(
+            Duration::from_secs(timeout),
+            tokio::task::spawn_blocking(move || discover_skills(&pp, ud.as_deref(), &eb, vsd.as_deref())),
+        ).await {
+            Ok(Ok(s)) => s,
+            _ => return Ok("Error: skill discovery timed out".to_string()),
         };
 
         match name.as_deref() {
@@ -332,13 +330,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discovers_and_lists() {
+    #[tokio::test]
+    async fn discovers_and_lists() {
         let d = tmp();
         setup_skill(&d, "pandas", "## Description\nData analysis helper\n");
         let t = tool(d.clone());
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "__list__"}), &cancel).unwrap();
+        let out = t.call(&json!({"skill_name": "__list__"}), &cancel).await.unwrap();
         assert!(out.contains("pandas"));
         assert!(out.contains("Data analysis helper"));
         // Legacy mode must NOT inject builtins at all (not even skill_creator).
@@ -346,35 +344,36 @@ mod tests {
         assert!(!out.contains("agent_cron"));
     }
 
-    #[test]
-    fn info_returns_full_md() {
+    #[tokio::test]
+    async fn info_returns_full_md() {
         let d = tmp();
         setup_skill(&d, "numpy", "## Description\nNumeric\n## Usage\nrun stuff\n");
         let t = tool(d.clone());
         let cancel = AtomicBool::new(false);
         let out = t
             .call(&json!({"skill_name": "__info__", "params": {"skill_name": "numpy"}}), &cancel)
+            .await
             .unwrap();
         assert!(out.contains("## Usage"));
     }
 
-    #[test]
-    fn execute_returns_guide() {
+    #[tokio::test]
+    async fn execute_returns_guide() {
         let d = tmp();
         setup_skill(&d, "deploy", "## Description\nDeploy\nSteps: do X\n");
         let t = tool(d.clone());
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "deploy"}), &cancel).unwrap();
+        let out = t.call(&json!({"skill_name": "deploy"}), &cancel).await.unwrap();
         assert!(out.contains("document skill"));
         assert!(out.contains("Steps: do X"));
     }
 
-    #[test]
-    fn missing_skill() {
+    #[tokio::test]
+    async fn missing_skill() {
         let d = tmp();
         let t = tool(d);
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "ghost"}), &cancel).unwrap();
+        let out = t.call(&json!({"skill_name": "ghost"}), &cancel).await.unwrap();
         assert!(out.contains("not found"));
     }
 
@@ -441,8 +440,8 @@ mod tests {
         assert_eq!(creator.description, "custom override");
     }
 
-    #[test]
-    fn user_dir_mode_via_tool_and_prompt_with_agent_cron_gated() {
+    #[tokio::test]
+    async fn user_dir_mode_via_tool_and_prompt_with_agent_cron_gated() {
         let project = tmp();
         let user = tmp();
         setup_skill_at(&user, "remote_box", "## Description\nRemote sandbox\n## Remote Endpoint\nhttps://x\n## Secret\nabc\n");
@@ -454,7 +453,7 @@ mod tests {
             extra_builtins: vec!["agent_cron".into()],
         };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "__list__"}), &cancel).unwrap();
+        let out = t.call(&json!({"skill_name": "__list__"}), &cancel).await.unwrap();
         assert!(out.contains("remote_box"));
         assert!(out.contains("agent_cron"));
         // The prompt/summary list must never leak endpoint/secret details.
@@ -462,6 +461,7 @@ mod tests {
         assert!(!out.contains("abc"));
         let info = t
             .call(&json!({"skill_name": "__info__", "params": {"skill_name": "remote_box"}}), &cancel)
+            .await
             .unwrap();
         assert!(info.contains("## Remote Endpoint"));
         assert!(info.contains("abc"));

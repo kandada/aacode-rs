@@ -1,14 +1,13 @@
 // Copyright (c) 2026 xiefujin <490021684@qq.com>
 // Licensed under GPL-3.0, see LICENSE file for full license terms.
 
-//! Delegation tools — delegate_task / create_sub_agent.
+//! Delegation tool — delegate_task.
 //!
 //! `delegate_task` runs a specialized sub-agent (code/test/research) inline to
 //! completion and returns its summary. The sub-agent uses a registry WITHOUT
 //! delegation tools to prevent unbounded recursion.
 //!
-//! Ported from Python `core/main_agent.py` (delegate_task / create_sub_agent)
-//! + `core/sub_agent.py`.
+//! Ported from Python `core/main_agent.py` (delegate_task) + `core/sub_agent.py`.
 
 use super::registry::{Tool, ToolRegistry};
 use super::schema::{ParamType, ToolParameter, ToolSchema};
@@ -32,6 +31,7 @@ pub struct DelegateTaskTool {
     pub sub_registry: SubRegistryFactory,
 }
 
+#[async_trait::async_trait]
 impl Tool for DelegateTaskTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -44,7 +44,7 @@ impl Tool for DelegateTaskTool {
         )
     }
 
-    fn call(&self, args: &Value, cancel: &AtomicBool) -> Result<String> {
+    async fn call(&self, args: &Value, cancel: &AtomicBool) -> Result<String> {
         let task = args
             .get("task_description")
             .and_then(|v| v.as_str())
@@ -66,31 +66,11 @@ impl Tool for DelegateTaskTool {
             &self.project_path,
             &sink,
             cancel,
-        )?;
+        ).await?;
         Ok(json!({
             "success": true,
             "agent_type": agent_type,
             "result": summary,
-        })
-        .to_string())
-    }
-}
-
-pub struct CreateSubAgentTool;
-impl Tool for CreateSubAgentTool {
-    fn schema(&self) -> ToolSchema {
-        ToolSchema::new(
-            "create_sub_agent",
-            "Create a sub-agent descriptor (code/test/research). Use delegate_task to actually run work.",
-            vec![ToolParameter::new("agent_type", ParamType::String, false, "code|test|research", &["type"])],
-        )
-    }
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let agent_type = args.get("agent_type").and_then(|v| v.as_str()).unwrap_or("code");
-        Ok(json!({
-            "success": true,
-            "agent_type": agent_type,
-            "message": "Sub-agent ready. Call delegate_task with this agent_type to run work.",
         })
         .to_string())
     }
@@ -106,8 +86,9 @@ mod tests {
     struct OneShot {
         text: Mutex<Option<String>>,
     }
+    #[async_trait::async_trait]
     impl LlmClient for OneShot {
-        fn chat_stream(
+        async fn chat_stream(
             &self,
             _m: &[ChatMessage],
             _t: &[Value],
@@ -119,7 +100,7 @@ mod tests {
                 ..Default::default()
             })
         }
-        fn validate(&self) -> Result<()> {
+        async fn validate(&self) -> Result<()> {
             Ok(())
         }
     }
@@ -136,6 +117,8 @@ mod tests {
 
     #[test]
     fn delegate_runs_sub_agent() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
         let llm: Arc<dyn LlmClient> = Arc::new(OneShot {
             text: Mutex::new(Some("sub result".into())),
         });
@@ -149,14 +132,16 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let out = tool
             .call(&json!({"task_description": "do sub", "agent_type": "code"}), &cancel)
+            .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], true);
         assert_eq!(v["result"], "sub result");
+        });
     }
 
-    #[test]
-    fn delegate_missing_task() {
+    #[tokio::test]
+    async fn delegate_missing_task() {
         let llm: Arc<dyn LlmClient> = Arc::new(OneShot {
             text: Mutex::new(None),
         });
@@ -168,14 +153,7 @@ mod tests {
             sub_registry: factory,
         };
         let cancel = AtomicBool::new(false);
-        let out = tool.call(&json!({}), &cancel).unwrap();
+        let out = tool.call(&json!({}), &cancel).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], false);
-    }
-
-    #[test]
-    fn create_sub_agent_ack() {
-        let cancel = AtomicBool::new(false);
-        let out = CreateSubAgentTool.call(&json!({"agent_type": "test"}), &cancel).unwrap();
-        assert!(out.contains("test"));
     }
 }

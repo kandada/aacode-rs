@@ -24,21 +24,25 @@ pub const SYSTEM_PROMPT_FOR_MAIN_AGENT: &str = r#"You are a principal AI coding 
 
 Available tools:
 1. Core tools
-    - run_shell: Execute shell commands (universal Swiss Army knife) — ALL file, code, and system operations go through it.
-      * **max_output**: Pass a number (e.g. 200, 500, 2000) to limit returned output and save context. Omit for full output when you need all of it
-      * Read files: cat "file", tail -n 50 "file", sed -n '100,200p' "file"  (always quote filenames containing spaces/special chars)
-      * Write/edit: echo/cat/sed/awk, supports pipes (|), redirection (>), etc
-      * Pipe data into Python: write to a temp file first (e.g. `echo "1\n2" > in.txt; python3 calc.py < in.txt`)
-      * Search/info: grep, ls, find, wc, pytest, git, python, etc
-      * Multi-line files: heredoc (`cat > file << 'EOF' ... EOF`)
-      * max_output param: default None for full output; pass a number e.g. 200 to limit (saves tokens)
+    - run_shell: Execute shell commands for code and system operations.
+      * Search/info: grep, ls, find, wc, pytest, git, python, go, npm, etc.
+      * Read files: use grep first to locate (e.g. grep -n "pattern" file), cat "file" only when you need full content; also tail -n 50 "file", sed -n '100,200p' "file".
+      * Write/edit: echo/cat/sed/awk, supports pipes (|), redirection (>), etc.; prefer sed/awk for line/char-level edits on existing files.
+      * max_output param: pass a number e.g. 200 to limit output by default (saves tokens); omit it (None) only when you genuinely need the full output.
+      * Context-aware reading: prefer grep to extract what you need instead of reading entire files. Use head/tail to preview before opening. Don't re-read files already in context — trust what you've already seen and move on.
 2. Web tools
-    - search_web: Search the internet (SearXNG > Brave > Google CSE > Bing scraping fallback)
-    - fetch_url: Fetch web page content (also available via run_shell + curl)
-    - search_code: Search code examples
+    - search_web: Search the internet (SearXNG > Bing scraping fallback)
+    - fetch_url: Fetch web page content — PREFERRED for grabbing page text/HTML,
+      since it cleans boilerplate automatically. Use this first for "get the
+      content of this page" tasks.
+    - run_shell + curl: only when you need raw HTTP control (headers, POST
+      bodies, JSON APIs, downloads). curl here is a built-in subset: it
+      supports the common flags (-s -L -I -i -H -d --json -X -o -O -m
+      --max-time -w -k -u -A -b -e -f -G -T -F --retry --compressed) but NOT
+      FTP/SMTP, multipart file upload quirks, or --resolve/--proxy. Prefer
+      fetch_url for simple page fetches.
 3. Management tools
     - delegate_task: Delegate task to a sub-agent
-    - create_sub_agent: Create a specialized sub-agent (code/test/research)
 4. To-Do List tools
     - add_todo_item: Add a todo item, returns todo_id (e.g. "t1")
     - mark_todo_completed: Mark complete — must pass todo_id param, the one returned by add_todo_item
@@ -126,7 +130,7 @@ During each thought, naturally plan:
 pub fn sub_agent_prompt(agent_type: &str) -> String {
     let base = match agent_type {
         "code" => {
-            "You are a specialized code-writing agent. Write high-quality, maintainable code; follow best practices; add tests; keep changes minimal; prefer incremental updates. Use run_shell + shell commands (cat/echo/sed/awk) for all file operations."
+            "You are a specialized code-writing agent. Write high-quality, maintainable code; follow best practices; add tests; keep changes minimal; prefer incremental updates. Use run_shell for all operations. For files: check type with `file` first, use cat/tail/head for text, strings/pdftotext for PDFs, doctotext/epubtext for office docs."
         }
         "test" => {
             "You are a specialized testing agent. Write comprehensive test cases, cover edge cases and exceptions, and generate clear test reports."
@@ -150,7 +154,7 @@ mod tests {
         assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("{skills_list}"));
         assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("run_shell"));
         // Verify run_shell is emphasized as the exclusive file tool.
-        assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("ALL file, code, and system operations go through it"));
+        assert!(SYSTEM_PROMPT_FOR_MAIN_AGENT.contains("grep first to locate"));
     }
 
     #[test]
@@ -163,7 +167,7 @@ mod tests {
 
     #[test]
     fn sub_agents_emphasize_run_shell() {
-        assert!(sub_agent_prompt("code").contains("run_shell + shell commands"));
+        assert!(sub_agent_prompt("code").contains("run_shell for all operations"));
         assert!(sub_agent_prompt("other").contains("run_shell for all file operations"));
     }
 }

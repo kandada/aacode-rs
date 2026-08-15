@@ -4,19 +4,28 @@
 //! MCP (Model Context Protocol) client manager.
 //!
 //! Supports stdio transport (spawn a server process and speak JSON-RPC 2.0
-//! over stdin/stdout, framed with Content-Length headers) and a minimal SSE/HTTP
-//! transport. Ported from Python `utils/mcp_manager.py` + `sandbox/mcp_client.py`.
+//! over stdin/stdout, framed with Content-Length headers) and an HTTP/SSE
+//! transport via reqwest blocking client.
 //!
-//! Configuration lives in the agent config's environment or a JSON file; here
-//! we accept explicit server specs. On mobile, stdio servers require the
-//! ability to spawn processes (fastshell subprocess policy) — otherwise the
-//! manager simply reports zero servers.
+//! All I/O methods are synchronous — callers use `tokio::task::spawn_blocking`
+//! via the tool layer (`tools/mcp.rs`) to avoid blocking the async runtime.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+static HTTP_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .build()
+        .expect("reqwest blocking client for MCP")
+});
 
 /// Transport type for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,17 +40,15 @@ pub enum McpTransport {
 pub struct McpServerSpec {
     pub name: String,
     pub transport: McpTransport,
-    /// For stdio: the command to run. For sse: unused.
     #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// For sse: base URL.
     #[serde(default)]
     pub url: String,
 }
 
-/// A running stdio server connection.
+/// Per-server stdio connection.
 struct StdioConn {
     child: Child,
     next_id: i64,
@@ -58,7 +65,6 @@ impl StdioConn {
             .spawn()
             .map_err(|e| crate::error::AacodeError::Io(format!("spawn mcp server: {e}")))?;
         let mut conn = StdioConn { child, next_id: 1 };
-        // Initialize handshake.
         let _ = conn.request(
             "initialize",
             json!({
@@ -67,7 +73,6 @@ impl StdioConn {
                 "clientInfo": {"name": "aacode-rs", "version": "0.1.0"}
             }),
         );
-        // notifications/initialized (no response expected)
         let _ = conn.notify("notifications/initialized", json!({}));
         Ok(conn)
     }
@@ -91,13 +96,12 @@ impl StdioConn {
             .as_mut()
             .ok_or_else(|| crate::error::AacodeError::Io("no stdout".into()))?;
         let mut reader = BufReader::new(stdout);
-        // Read headers.
         let mut content_length = 0usize;
         loop {
             let mut line = String::new();
             let n = reader.read_line(&mut line)?;
             if n == 0 {
-                return Err(crate::error::AacodeError::Io("eof".into()));
+                return Err(crate::error::AacodeError::Io("mcp server eof".into()));
             }
             let t = line.trim_end();
             if t.is_empty() {
@@ -106,6 +110,9 @@ impl StdioConn {
             if let Some(rest) = t.to_lowercase().strip_prefix("content-length:") {
                 content_length = rest.trim().parse().unwrap_or(0);
             }
+        }
+        if content_length == 0 {
+            return Err(crate::error::AacodeError::Api("empty mcp message".into()));
         }
         let mut buf = vec![0u8; content_length];
         reader.read_exact(&mut buf)?;
@@ -118,7 +125,6 @@ impl StdioConn {
         self.next_id += 1;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         self.write_message(&msg)?;
-        // Read until we get the matching id (skip notifications).
         for _ in 0..50 {
             let resp = self.read_message()?;
             if resp.get("id").and_then(|v| v.as_i64()) == Some(id) {
@@ -144,7 +150,7 @@ impl Drop for StdioConn {
     }
 }
 
-/// The MCP manager holding server specs and lazily-opened connections.
+/// The MCP manager holding server specs and connections.
 pub struct McpManager {
     specs: Vec<McpServerSpec>,
     conns: Mutex<std::collections::HashMap<String, StdioConn>>,
@@ -168,7 +174,19 @@ impl McpManager {
         self.specs.iter().find(|s| s.name == name)
     }
 
-    /// List tools from all servers. Returns a map name -> Vec<tool json>.
+    /// Get or create a stdio connection. Returns a mutable reference.
+    fn get_or_init_conn<'a>(
+        conns: &'a mut std::collections::HashMap<String, StdioConn>,
+        spec: &McpServerSpec,
+    ) -> crate::error::Result<&'a mut StdioConn> {
+        if !conns.contains_key(&spec.name) {
+            let conn = StdioConn::spawn(spec)?;
+            conns.insert(spec.name.clone(), conn);
+        }
+        Ok(conns.get_mut(&spec.name).unwrap())
+    }
+
+    /// List tools from all servers.
     pub fn list_tools(&self) -> Value {
         let mut all = serde_json::Map::new();
         let mut count = 0usize;
@@ -180,8 +198,11 @@ impl McpManager {
                     connected.push(spec.name.clone());
                     all.insert(spec.name.clone(), tools);
                 }
-                Err(_) => {
-                    all.insert(spec.name.clone(), json!([]));
+                Err(e) => {
+                    all.insert(
+                        spec.name.clone(),
+                        json!({"error": format!("{}", e)}),
+                    );
                 }
             }
         }
@@ -196,12 +217,8 @@ impl McpManager {
     fn list_server_tools(&self, spec: &McpServerSpec) -> crate::error::Result<Value> {
         match spec.transport {
             McpTransport::Stdio => {
-                let mut conns = self.conns.lock().unwrap();
-                if !conns.contains_key(&spec.name) {
-                    let conn = StdioConn::spawn(spec)?;
-                    conns.insert(spec.name.clone(), conn);
-                }
-                let conn = conns.get_mut(&spec.name).unwrap();
+                let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = Self::get_or_init_conn(&mut conns, spec)?;
                 let res = conn.request("tools/list", json!({}))?;
                 Ok(res.get("tools").cloned().unwrap_or(json!([])))
             }
@@ -227,16 +244,11 @@ impl McpManager {
         let params = json!({"name": tool, "arguments": arguments});
         let res = match spec.transport {
             McpTransport::Stdio => {
-                let mut conns = self.conns.lock().unwrap();
-                if !conns.contains_key(&spec.name) {
-                    match StdioConn::spawn(&spec) {
-                        Ok(c) => {
-                            conns.insert(spec.name.clone(), c);
-                        }
-                        Err(e) => return json!({"success": false, "error": e.to_string()}),
-                    }
-                }
-                let conn = conns.get_mut(&spec.name).unwrap();
+                let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+                let conn = match Self::get_or_init_conn(&mut conns, &spec) {
+                    Ok(c) => c,
+                    Err(e) => return json!({"success": false, "error": e.to_string()}),
+                };
                 conn.request("tools/call", params)
             }
             McpTransport::Sse => self.sse_request(&spec, "tools/call", params),
@@ -247,7 +259,7 @@ impl McpManager {
         }
     }
 
-    /// HTTP JSON-RPC for SSE-style servers (single POST, JSON response).
+    /// HTTP JSON-RPC for SSE-style servers using reqwest blocking client.
     fn sse_request(
         &self,
         spec: &McpServerSpec,
@@ -255,26 +267,38 @@ impl McpManager {
         params: Value,
     ) -> crate::error::Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let resp = ureq::post(&spec.url)
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .set("Content-Type", "application/json")
-            .send_json(body);
-        match resp {
-            Ok(r) => {
-                let s = r.into_string().unwrap_or_default();
-                let v: Value = serde_json::from_str(&s)?;
-                if let Some(err) = v.get("error") {
-                    return Err(crate::error::AacodeError::Api(format!("mcp error: {err}")));
-                }
-                Ok(v.get("result").cloned().unwrap_or(json!({})))
-            }
-            Err(e) => Err(crate::error::AacodeError::Network(e.to_string())),
+        let timeout = if self.timeout_secs > 0 {
+            self.timeout_secs
+        } else {
+            DEFAULT_TIMEOUT_SECS
+        };
+        let resp = HTTP_CLIENT
+            .post(&spec.url)
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(timeout))
+            .json(&body)
+            .send()
+            .map_err(|e| crate::error::AacodeError::Network(format!("mcp sse request: {e}")))?;
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let msg = resp.text().unwrap_or_default();
+            return Err(crate::error::AacodeError::Api(format!(
+                "mcp HTTP {code}: {}",
+                &msg[..msg.len().min(300)]
+            )));
         }
+        let v: Value = resp
+            .json()
+            .map_err(|e| crate::error::AacodeError::Api(format!("mcp parse: {e}")))?;
+        if let Some(err) = v.get("error") {
+            return Err(crate::error::AacodeError::Api(format!("mcp error: {err}")));
+        }
+        Ok(v.get("result").cloned().unwrap_or(json!({})))
     }
 
     /// Status report.
     pub fn status(&self) -> Value {
-        let conns = self.conns.lock().unwrap();
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
         let servers: Vec<Value> = self
             .specs
             .iter()
@@ -323,7 +347,6 @@ mod tests {
 
     #[test]
     fn tool_name_parsing_via_call() {
-        // With a bogus stdio server, call fails gracefully (spawn error).
         let spec = McpServerSpec {
             name: "srv".into(),
             transport: McpTransport::Stdio,
@@ -334,5 +357,66 @@ mod tests {
         let m = McpManager::new(vec![spec], 5);
         let v = m.call_tool("srv.dothing", json!({}));
         assert_eq!(v["success"], false);
+    }
+
+    #[test]
+    fn call_tool_ambiguous_name_uses_first_server() {
+        let spec = McpServerSpec {
+            name: "primary".into(),
+            transport: McpTransport::Stdio,
+            command: "/nonexistent/bin/mcp".into(),
+            args: vec![],
+            url: String::new(),
+        };
+        let m = McpManager::new(vec![spec], 5);
+        let v = m.call_tool("dothing", json!({"k": "v"}));
+        assert_eq!(v["success"], false);
+    }
+
+    #[test]
+    fn server_names_empty() {
+        let m = McpManager::new(vec![], 10);
+        assert!(m.server_names().is_empty());
+    }
+
+    #[test]
+    fn server_names_present() {
+        let specs = vec![
+            McpServerSpec {
+                name: "a".into(),
+                transport: McpTransport::Sse,
+                command: String::new(),
+                args: vec![],
+                url: "http://localhost".into(),
+            },
+            McpServerSpec {
+                name: "b".into(),
+                transport: McpTransport::Stdio,
+                command: "/bin/echo".into(),
+                args: vec![],
+                url: String::new(),
+            },
+        ];
+        let m = McpManager::new(specs, 5);
+        let names = m.server_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"a".to_string()));
+        assert!(names.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn sse_server_in_list_tools_graceful_failure() {
+        let spec = McpServerSpec {
+            name: "sse".into(),
+            transport: McpTransport::Sse,
+            command: String::new(),
+            args: vec![],
+            url: "http://127.0.0.1:1".into(), // unreachable
+        };
+        let m = McpManager::new(vec![spec], 2);
+        let v = m.list_tools();
+        assert_eq!(v["success"], true);
+        // Unreachable SSE server should not crash, just report empty tools
+        assert!(v["tools"]["sse"].is_object());
     }
 }

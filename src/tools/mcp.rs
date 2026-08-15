@@ -2,6 +2,7 @@
 // Licensed under GPL-3.0, see LICENSE file for full license terms.
 
 //! MCP tools — list_mcp_tools / call_mcp_tool / get_mcp_status.
+//! All blocking pipe I/O is executed on a background thread via spawn_blocking.
 
 use super::registry::Tool;
 use super::schema::{ParamType, ToolParameter, ToolSchema};
@@ -14,6 +15,7 @@ use std::sync::Arc;
 pub struct ListMcpToolsTool {
     pub mgr: Arc<McpManager>,
 }
+#[async_trait::async_trait]
 impl Tool for ListMcpToolsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -22,14 +24,16 @@ impl Tool for ListMcpToolsTool {
             vec![],
         )
     }
-    fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
-        Ok(self.mgr.list_tools().to_string())
+    async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+        let mgr = self.mgr.clone();
+        tokio::task::spawn_blocking(move || Ok(mgr.list_tools().to_string())).await.map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
     }
 }
 
 pub struct CallMcpToolTool {
     pub mgr: Arc<McpManager>,
 }
+#[async_trait::async_trait]
 impl Tool for CallMcpToolTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -41,22 +45,25 @@ impl Tool for CallMcpToolTool {
             ],
         )
     }
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let name = args.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+        let name = args.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let arguments = args.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-        Ok(self.mgr.call_tool(name, arguments).to_string())
+        let mgr = self.mgr.clone();
+        tokio::task::spawn_blocking(move || Ok(mgr.call_tool(&name, arguments).to_string())).await.map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
     }
 }
 
 pub struct McpStatusTool {
     pub mgr: Arc<McpManager>,
 }
+#[async_trait::async_trait]
 impl Tool for McpStatusTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new("get_mcp_status", "Get MCP server status.", vec![])
     }
-    fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
-        Ok(self.mgr.status().to_string())
+    async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+        let mgr = self.mgr.clone();
+        tokio::task::spawn_blocking(move || Ok(mgr.status().to_string())).await.map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
     }
 }
 
@@ -65,22 +72,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn status_tool_reports_empty() {
+    #[tokio::test]
+    async fn status_tool_reports_empty() {
         let mgr = Arc::new(McpManager::new(vec![], 5));
         let t = McpStatusTool { mgr };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({}), &cancel).unwrap();
+        let out = t.call(&json!({}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_count"], 0);
     }
 
-    #[test]
-    fn list_tool_empty() {
+    #[tokio::test]
+    async fn list_tool_empty() {
         let mgr = Arc::new(McpManager::new(vec![], 5));
         let t = ListMcpToolsTool { mgr };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({}), &cancel).unwrap();
+        let out = t.call(&json!({}), &cancel).await.unwrap();
         assert!(out.contains("\"count\":0"));
     }
 }

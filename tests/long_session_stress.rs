@@ -621,9 +621,9 @@ fn live_model_from_env(gateway: Gateway) -> Option<ModelConfig> {
 }
 
 /// OpenAI: basic streaming text (sanity check).
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_streams_text_sanity() {
+async fn live_openai_streams_text_sanity() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
@@ -633,7 +633,7 @@ fn live_openai_streams_text_sanity() {
         ChatMessage::user("What is the capital of France?"),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
     eprintln!("[openai text] model={} elapsed={:?} text={:?}", model.name, start.elapsed(), resp.text);
     assert!(!resp.text.trim().is_empty(), "expected non-empty text response");
     let lines = sink.lines();
@@ -642,9 +642,9 @@ fn live_openai_streams_text_sanity() {
 }
 
 /// OpenAI: tool call request (single tool).
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_single_tool_call() {
+async fn live_openai_single_tool_call() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
@@ -666,7 +666,7 @@ fn live_openai_single_tool_call() {
         ChatMessage::user("List the files in the current directory."),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).await.expect("live call failed");
     eprintln!("[openai tool_call] model={} elapsed={:?} tool_calls={:?}",
         model.name, start.elapsed(),
         resp.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>());
@@ -678,9 +678,9 @@ fn live_openai_single_tool_call() {
 /// OpenAI: multi-turn conversation — asks model to use a tool, feeds back a
 /// simulated result, asks follow-up. Verifies the API handles multi-message
 /// history correctly across both gateways.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_multi_turn_conversation() {
+async fn live_openai_multi_turn_conversation() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let tools = vec![serde_json::json!({
@@ -706,7 +706,7 @@ fn live_openai_multi_turn_conversation() {
     // Turn 1: model calls run_shell (echo hello)
     let sink1 = CollectingSink::new(false);
     let start = Instant::now();
-    let resp1 = client.chat_stream(&msgs, &tools, &sink1, &cancel).expect("turn 1 failed");
+    let resp1 = client.chat_stream(&msgs, &tools, &sink1, &cancel).await.expect("turn 1 failed");
     eprintln!("[turn 1] elapsed={:?} tool_calls={:?}", start.elapsed(),
         resp1.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>());
     assert!(!resp1.tool_calls.is_empty(), "turn 1: expected tool call, got finish={:?} text={:?}",
@@ -722,7 +722,7 @@ fn live_openai_multi_turn_conversation() {
     msgs.push(ChatMessage::user("Summarize what happened."));
     let sink2 = CollectingSink::new(false);
     let start2 = Instant::now();
-    let resp2 = client.chat_stream(&msgs, &[], &sink2, &cancel).expect("turn 2 failed");
+    let resp2 = client.chat_stream(&msgs, &[], &sink2, &cancel).await.expect("turn 2 failed");
     eprintln!("[turn 2] elapsed={:?} text={:?}", start2.elapsed(),
         &resp2.text[..resp2.text.len().min(200)]);
     assert!(!resp2.text.trim().is_empty(), "turn 2: expected text response");
@@ -733,9 +733,9 @@ fn live_openai_multi_turn_conversation() {
 /// OpenAI: 5-iteration tool-use loop simulating a longer session. Each turn the
 /// model is asked a new question that requires a tool call, we feed the tool
 /// result, and repeat. Verifies no degradation across iterations.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_five_iteration_tool_loop() {
+async fn live_openai_five_iteration_tool_loop() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let tools = vec![serde_json::json!({
@@ -767,7 +767,7 @@ fn live_openai_five_iteration_tool_loop() {
         msgs.push(ChatMessage::user(*prompt));
         let sink = CollectingSink::new(false);
         let start = Instant::now();
-        let resp = match client.chat_stream(&msgs, &tools, &sink, &cancel) {
+        let resp = match client.chat_stream(&msgs, &tools, &sink, &cancel).await {
             Ok(r) => r,
             Err(e) => panic!("iteration {i} failed: {e}"),
         };
@@ -788,9 +788,9 @@ fn live_openai_five_iteration_tool_loop() {
 
 /// OpenAI: truncated response recovery — set max_tokens very low so the
 /// response hits "length" finish reason. The parser must set is_truncated().
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_truncation_detection() {
+async fn live_openai_truncation_detection() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let mut model = model;
     model.max_tokens = 10; // force truncation
@@ -801,7 +801,7 @@ fn live_openai_truncation_detection() {
         ChatMessage::system("You MUST output a very long response with at least 200 words about the history of computers."),
         ChatMessage::user("Tell me about computer history in detail."),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
     eprintln!("[truncation] model={} max_tokens=10 finish={:?} is_truncated={} text_len={}",
         model.name, resp.finish_reason, resp.is_truncated(), resp.text.len());
     // The model might refuse or max_tokens might not hit for a short model.
@@ -814,9 +814,9 @@ fn live_openai_truncation_detection() {
 
 /// OpenAI: cancellation mid-stream — start a call, cancel after a short delay.
 /// The parser must return AacodeError::Cancelled.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_cancellation_mid_stream() {
+async fn live_openai_cancellation_mid_stream() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
@@ -833,7 +833,7 @@ fn live_openai_cancellation_mid_stream() {
     });
 
     let start = Instant::now();
-    let r = client.chat_stream(&msgs, &[], &sink, &cancel);
+    let r = client.chat_stream(&msgs, &[], &sink, &cancel).await;
     eprintln!("[cancel test] elapsed={:?} result={:?}", start.elapsed(),
         r.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string()));
     match r {
@@ -854,9 +854,9 @@ fn live_openai_cancellation_mid_stream() {
 // ─────────── Anthropic live tests ───────────
 
 /// Anthropic: basic streaming text.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_streams_text_sanity() {
+async fn live_anthropic_streams_text_sanity() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     eprintln!("[anthropic text] using model={} base_url={:?}", model.name, model.base_url);
     let client = build_client(&model);
@@ -867,15 +867,15 @@ fn live_anthropic_streams_text_sanity() {
         ChatMessage::user("What is the capital of France?"),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
     eprintln!("[anthropic text] elapsed={:?} text={:?}", start.elapsed(), resp.text);
     assert!(!resp.text.trim().is_empty());
 }
 
 /// Anthropic: tool call request (Anthropic-format tools).
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_single_tool_call() {
+async fn live_anthropic_single_tool_call() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     eprintln!("[anthropic tool] using model={} base_url={:?}", model.name, model.base_url);
     let client = build_client(&model);
@@ -895,7 +895,7 @@ fn live_anthropic_single_tool_call() {
         ChatMessage::user("List the files."),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).await.expect("live call failed");
     eprintln!("[anthropic tool_call] elapsed={:?} tool_calls={:?} finish={:?}",
         start.elapsed(),
         resp.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>(),
@@ -908,9 +908,9 @@ fn live_anthropic_single_tool_call() {
 }
 
 /// Anthropic: multi-turn (tool call → tool result → summary).
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_multi_turn_conversation() {
+async fn live_anthropic_multi_turn_conversation() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     eprintln!("[anthropic multi-turn] using model={} base_url={:?}", model.name, model.base_url);
     let client = build_client(&model);
@@ -932,7 +932,7 @@ fn live_anthropic_multi_turn_conversation() {
 
     // Turn 1: model calls run_shell
     let sink1 = CollectingSink::new(false);
-    let resp1 = client.chat_stream(&msgs, &tools, &sink1, &cancel).expect("turn 1 failed");
+    let resp1 = client.chat_stream(&msgs, &tools, &sink1, &cancel).await.expect("turn 1 failed");
     eprintln!("[anth turn 1] tool_calls={:?} finish={:?}",
         resp1.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>(),
         resp1.finish_reason);
@@ -947,16 +947,16 @@ fn live_anthropic_multi_turn_conversation() {
     // Turn 2: summary
     msgs.push(ChatMessage::user("Summarize the output."));
     let sink2 = CollectingSink::new(false);
-    let resp2 = client.chat_stream(&msgs, &[], &sink2, &cancel).expect("turn 2 failed");
+    let resp2 = client.chat_stream(&msgs, &[], &sink2, &cancel).await.expect("turn 2 failed");
     eprintln!("[anth turn 2] text={:?}", &resp2.text[..resp2.text.len().min(200)]);
     assert!(!resp2.text.trim().is_empty());
     eprintln!("=== Anthropic multi-turn OK ===");
 }
 
 /// Anthropic: 5-iteration tool loop.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_five_iteration_tool_loop() {
+async fn live_anthropic_five_iteration_tool_loop() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     eprintln!("[anthropic 5-iter] using model={} base_url={:?}", model.name, model.base_url);
     let client = build_client(&model);
@@ -978,7 +978,7 @@ fn live_anthropic_five_iteration_tool_loop() {
         msgs.push(ChatMessage::user(format!("Run 'echo anthropic_iter_{i}'")));
         let sink = CollectingSink::new(false);
         let start = Instant::now();
-        let resp = match client.chat_stream(&msgs, &tools, &sink, &cancel) {
+        let resp = match client.chat_stream(&msgs, &tools, &sink, &cancel).await {
             Ok(r) => r,
             Err(e) => panic!("anthropic iteration {i} failed: {e}"),
         };
@@ -995,9 +995,9 @@ fn live_anthropic_five_iteration_tool_loop() {
 }
 
 /// Anthropic: max_tokens truncation detection.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_truncation_detection() {
+async fn live_anthropic_truncation_detection() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     let mut model = model;
     model.max_tokens = 10;
@@ -1009,7 +1009,7 @@ fn live_anthropic_truncation_detection() {
         ChatMessage::system("Write a very long paragraph about computer history with at least 200 words."),
         ChatMessage::user("Tell me about computers."),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
     eprintln!("[anthropic truncation] finish={:?} is_truncated={} text_len={}",
         resp.finish_reason, resp.is_truncated(), resp.text.len());
     if resp.finish_reason.as_deref() == Some("max_tokens") {
@@ -1022,9 +1022,9 @@ fn live_anthropic_truncation_detection() {
 /// Some models (DeepSeek V3, Kimi) produce a `reasoning_content` followed by
 /// `content` + `tool_calls`. Verify that reasoning is separated from the
 /// visible text and tool calls work correctly even when reasoning is present.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_reasoning_then_tool_call() {
+async fn live_openai_reasoning_then_tool_call() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
@@ -1045,7 +1045,7 @@ fn live_openai_reasoning_then_tool_call() {
         ChatMessage::system("You MUST call run_shell with command='echo thinking_works'. Think about it first."),
         ChatMessage::user("Run echo."),
     ];
-    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).await.expect("live call failed");
     eprintln!("[reasoning+tool] finish={:?} reasoning_len={} text_len={} tool_calls={}",
         resp.finish_reason,
         resp.reasoning_content.as_ref().map(|r| r.len()).unwrap_or(0),
@@ -1067,23 +1067,23 @@ fn live_openai_reasoning_then_tool_call() {
 
 /// Validate that the client's validate() method works (lightweight non-streaming
 /// ping that doesn't consume credits significantly).
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_validate_api_key() {
+async fn live_openai_validate_api_key() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
-    match client.validate() {
+    match client.validate().await {
         Ok(()) => eprintln!("[validate] OK (model={})", model.name),
         Err(e) => panic!("validate failed: {e}"),
     }
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_validate_api_key() {
+async fn live_anthropic_validate_api_key() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     let client = build_client(&model);
-    match client.validate() {
+    match client.validate().await {
         Ok(()) => eprintln!("[validate] OK (model={})", model.name),
         Err(e) => panic!("validate failed: {e}"),
     }
@@ -1091,9 +1091,9 @@ fn live_anthropic_validate_api_key() {
 
 /// Test with model that supports multimodal but we send text-only — should still
 /// work correctly.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_text_only_on_multimodal_model() {
+async fn live_openai_text_only_on_multimodal_model() {
     let model = live_model_from_env(Gateway::Openai).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
@@ -1102,15 +1102,15 @@ fn live_openai_text_only_on_multimodal_model() {
         ChatMessage::system("Answer in one sentence only."),
         ChatMessage::user("What is 2+2?"),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
     eprintln!("[multimodal text-only] text={:?}", &resp.text[..resp.text.len().min(200)]);
     assert!(resp.text.to_lowercase().contains("4"));
 }
 
 /// Anthropic validate on multimodal model (MiniMax M2.7 supports vision).
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_text_only_on_multimodal_model() {
+async fn live_anthropic_text_only_on_multimodal_model() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
@@ -1119,7 +1119,7 @@ fn live_anthropic_text_only_on_multimodal_model() {
         ChatMessage::system("Answer in one sentence only."),
         ChatMessage::user("What is 2+2?"),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).expect("live call failed");
+    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
     eprintln!("[anth multimodal text-only] text={:?}", &resp.text[..resp.text.len().min(200)]);
     assert!(resp.text.to_lowercase().contains("4"));
 }
@@ -1128,9 +1128,9 @@ fn live_anthropic_text_only_on_multimodal_model() {
 
 /// Run a full ReAct loop against a live API with the real run_shell tool.
 /// The model executes a shell command and the output flows through the sandbox.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=openai"]
-fn live_openai_full_react_loop_with_shell() {
+async fn live_openai_full_react_loop_with_shell() {
     use aacode_rs::config::{AgentConfig, Gateway};
     use aacode_rs::runtime::AgentRuntime;
     use aacode_rs::stream::CollectingSink;
@@ -1161,7 +1161,7 @@ fn live_openai_full_react_loop_with_shell() {
         None,
         &sink,
         &cancel,
-    ).expect("react loop failed");
+    ).await.expect("react loop failed");
 
     eprintln!("[live react] status={:?} iterations={}", res.status, res.iterations);
     eprintln!("[live react] final_text={:?}", &res.final_text[..res.final_text.len().min(300)]);
@@ -1181,9 +1181,9 @@ fn live_openai_full_react_loop_with_shell() {
 }
 
 /// Same as above but for Anthropic gateway.
-#[test]
+#[tokio::test]
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
-fn live_anthropic_full_react_loop_with_shell() {
+async fn live_anthropic_full_react_loop_with_shell() {
     use aacode_rs::config::{AgentConfig, Gateway};
     use aacode_rs::runtime::AgentRuntime;
     use aacode_rs::stream::CollectingSink;
@@ -1214,7 +1214,7 @@ fn live_anthropic_full_react_loop_with_shell() {
         None,
         &sink,
         &cancel,
-    ).expect("react loop failed");
+    ).await.expect("react loop failed");
 
     eprintln!("[live anth react] status={:?} iterations={}", res.status, res.iterations);
     eprintln!("[live anth react] final_text={:?}", &res.final_text[..res.final_text.len().min(300)]);

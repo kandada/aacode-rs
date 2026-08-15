@@ -16,7 +16,7 @@
 * 分层工具系统 — 原子工具、管理工具、Skills 三层架构
 * 安全护栏 — 路径限制、危险命令拒绝、网络权限控制
 * 跨平台 — 同一代码库编译到 macOS、Linux、Windows、Android、iOS
-* 零 LLM SDK — 手写 HTTP + JSON 直接调用所有 LLM API，零 tokio
+* 零 LLM SDK — 异步 HTTP 流式（tokio + reqwest）+ 手写 SSE/JSON 解析，直接调用所有 LLM API
 
 ## 快速开始
 
@@ -210,6 +210,37 @@ run_skills("skill_name", {"param1": "value1", "param2": "value2"})
 │  原生 OS shell  |  fastshell 沙箱              │
 └──────────────────────────────────────────────┘
 ```
+
+## 移动端嵌入（C ABI）
+
+aacode-rs 可通过**句柄式 C ABI**（`src/ffi.rs`）嵌入 Android/iOS 应用，编译为
+静态库 `libaacode_rs.a`。API 与平台无关；各宿主只提供一层薄胶水
+（Android：`jni_glue.c`；iOS：Swift 桥接）。
+
+```c
+typedef void (*aacode_event_fn)(const char *line, void *userdata);
+
+void*  aacode_task_start(const char *task_json, aacode_event_fn cb, void *userdata); // 非阻塞
+char*  aacode_task_wait(void *handle);   // 阻塞到结束，返回终态 JSON
+void   aacode_task_cancel(void *handle); // 非阻塞，按句柄取消
+void   aacode_task_free(void *handle);
+char*  aacode_validate_api_key(const char *config_json);
+char*  aacode_list_sessions(const char *project_path);
+char*  aacode_get_session_messages(const char *project_path, const char *session_id);
+void   aacode_free_string(char *ptr);
+```
+
+* 每个任务是**不透明句柄**——`start` 非阻塞，`wait` 阻塞取终态。取消只针对单个句柄
+  （无全局态），因此并发任务（如 cron + chat）天然隔离。
+* 事件以 JSONL 形式经 `cb(line, userdata)` 流式回调；回调上下文是每任务独立的
+  （`userdata`），宿主无需线程局部存储或全局 trampoline。
+* 早退失败（bad JSON / 缺 task / 会话忙）会发出 `error` 事件并返回终态——绝不静默。
+* 终态事件为富化的 `done`：
+  `{"type":"done","session_id":...,"status":...,"iterations":...,"final_text":...}`，
+  其中 `status` ∈ `completed | max_iterations | cancelled | error`。
+
+宿主侧集成见 [ANDROID_INTEGRATION.md](../ANDROID_INTEGRATION.md) 与
+[IOS_INTEGRATION.md](../IOS_INTEGRATION.md)。
 
 ## 核心能力
 

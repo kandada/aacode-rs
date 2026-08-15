@@ -7,7 +7,7 @@
 
 use super::registry::Tool;
 use super::schema::{ParamType, ToolParameter, ToolSchema};
-use crate::error::Result;
+use crate::error::{AacodeError, Result};
 use crate::tools::ShellBackend;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -25,6 +25,7 @@ pub struct ExecutePythonTool {
     pub default_timeout_secs: u64,
 }
 
+#[async_trait::async_trait]
 impl Tool for ExecutePythonTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -38,46 +39,47 @@ impl Tool for ExecutePythonTool {
         )
     }
 
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let code = args.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+        let code = args.get("code").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if code.is_empty() {
             return Ok(json!({"success": false, "error": "empty code"}).to_string());
         }
-        let stdin_input = args.get("stdin_input").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+        let stdin_input = args.get("stdin_input").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+        let backend = self.backend.clone();
+        let project_path = self.project_path.clone();
+        let default_timeout_secs = self.default_timeout_secs;
 
-        // Write to temp file under .aacode/tests/
-        let test_dir = self.project_path.join(".aacode").join("tests");
-        let _ = std::fs::create_dir_all(&test_dir);
-        let temp_path = test_dir.join(format!("temp_{}.py", uuid::Uuid::new_v4().simple()));
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let test_dir = project_path.join(".aacode").join("tests");
+            let _ = std::fs::create_dir_all(&test_dir);
+            let temp_path = test_dir.join(format!("temp_{}.py", uuid::Uuid::new_v4().simple()));
 
-        let wrapped = format!(
-            "import sys, os\nos.chdir({:?})\n{code}",
-            self.project_path.to_string_lossy()
-        );
-        if let Err(e) = std::fs::write(&temp_path, &wrapped) {
-            return Ok(json!({"success": false, "error": format!("write temp file: {e}")}).to_string());
-        }
+            let wrapped = format!(
+                "import sys, os\nos.chdir({:?})\n{code}",
+                project_path.to_string_lossy()
+            );
+            if let Err(e) = std::fs::write(&temp_path, &wrapped) {
+                return Ok(json!({"success": false, "error": format!("write temp file: {e}")}).to_string());
+            }
 
-        // Execute via the shell backend — works cross-platform:
-        //   Desktop (NativeShell)   → sh -c "python3 /path/to/temp.py"
-        //   Mobile  (FastshellBackend) → fastshell detects python3 → embedded CPython
-        let cmd = format!("python3 {:?}", temp_path.to_string_lossy());
-        let result = self.backend.run(&cmd, stdin_input, self.default_timeout_secs, 0, &self.project_path);
+            let cmd = format!("python3 {:?}", temp_path.to_string_lossy());
+            let result = backend.run(&cmd, stdin_input.as_deref(), default_timeout_secs, 0, &project_path);
 
-        let rel = temp_path
-            .strip_prefix(&self.project_path)
-            .unwrap_or(&temp_path)
-            .to_string_lossy()
-            .to_string();
+            let rel = temp_path
+                .strip_prefix(&project_path)
+                .unwrap_or(&temp_path)
+                .to_string_lossy()
+                .to_string();
 
-        Ok(json!({
-            "success": result.exit_code == 0,
-            "returncode": result.exit_code,
-            "file": rel,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        })
-        .to_string())
+            Ok(json!({
+                "success": result.exit_code == 0,
+                "returncode": result.exit_code,
+                "file": rel,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            })
+            .to_string())
+        }).await.map_err(|e| AacodeError::Other(format!("execute_python: {e}")))?
     }
 }
 
@@ -89,6 +91,7 @@ pub struct AnalyzeCodeTool {
     pub project_path: PathBuf,
 }
 
+#[async_trait::async_trait]
 impl Tool for AnalyzeCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -100,21 +103,26 @@ impl Tool for AnalyzeCodeTool {
         )
     }
 
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+        let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if file_path.is_empty() {
             return Ok(json!({"success": false, "error": "empty file_path"}).to_string());
         }
-        let full_path = if std::path::Path::new(file_path).is_absolute() {
-            std::path::PathBuf::from(file_path)
-        } else {
-            self.project_path.join(file_path)
-        };
-        let content = match std::fs::read_to_string(&full_path) {
+        let project_path = self.project_path.clone();
+        let fp = file_path.clone();
+        let content = tokio::task::spawn_blocking(move || {
+            let full_path = if std::path::Path::new(&fp).is_absolute() {
+                std::path::PathBuf::from(&fp)
+            } else {
+                project_path.join(&fp)
+            };
+            std::fs::read_to_string(&full_path)
+        }).await.map_err(|e| AacodeError::Other(format!("analyze_code: {e}")))?;
+        let content = match content {
             Ok(c) => c,
-            Err(e) => return Ok(json!({"success": false, "error": format!("read: {e}")}).to_string()),
+            Err(_) => return Ok(json!({"success": false, "error": "read: file not found"}).to_string()),
         };
-        let lang = lang_from_ext(&full_path.to_string_lossy());
+        let lang = lang_from_ext(&file_path);
         let lines: Vec<&str> = content.lines().collect();
 
         // Detect functions and classes (simple regex patterns per language).
@@ -191,6 +199,7 @@ pub struct RunTestsTool {
     pub project_path: PathBuf,
 }
 
+#[async_trait::async_trait]
 impl Tool for RunTestsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
@@ -203,9 +212,11 @@ impl Tool for RunTestsTool {
         )
     }
 
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let test_path = args.get("test_path").and_then(|v| v.as_str()).unwrap_or("");
-        let lang = detect_lang(&self.project_path);
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+        let test_path = args.get("test_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let project_path = self.project_path.clone();
+        let lang = tokio::task::spawn_blocking(move || detect_lang(&project_path)).await
+            .map_err(|e| AacodeError::Other(format!("run_tests: {e}")))?;
         let cmd = match lang {
             "python" => {
                 if test_path.is_empty() { "python3 -m pytest".to_string() }
@@ -233,11 +244,12 @@ pub struct DebugCodeTool {
     pub project_path: PathBuf,
 }
 
+#[async_trait::async_trait]
 impl Tool for DebugCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "debug_code",
-            "Provide debugging suggestions for the project.",
+            "Suggest debugging commands for a file or error message, based on detected language (e.g. pdb/print for Python, dbg!/--nocapture for Rust, node --inspect for JS).",
             vec![
                 ToolParameter::new("file_path", ParamType::String, false, "File to debug", &["file", "path"]),
                 ToolParameter::new("error_message", ParamType::String, false, "Error message to analyze", &["error", "message"]),
@@ -245,10 +257,16 @@ impl Tool for DebugCodeTool {
         )
     }
 
-    fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let file = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-        let err_msg = args.get("error_message").and_then(|v| v.as_str()).unwrap_or("");
-        let lang = if !file.is_empty() { lang_from_ext(file) } else { detect_lang(&self.project_path) };
+    async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
+        let file = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let err_msg = args.get("error_message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let project_path = self.project_path.clone();
+        let lang = if !file.is_empty() {
+            lang_from_ext(&file)
+        } else {
+            tokio::task::spawn_blocking(move || detect_lang(&project_path)).await
+                .map_err(|e| AacodeError::Other(format!("debug_code: {e}")))?
+        };
         let suggestions: &[&str] = match lang {
             "rust" => &["cargo check", "cargo test -- --nocapture", "dbg!(&variable)"],
             "python" => &["python3 -m pdb <file>", "print(f'{var=}')", "python3 -c 'import ast; ast.parse(open(\"FILE\").read())'"],
@@ -310,35 +328,35 @@ mod tests {
         d
     }
 
-    #[test]
-    fn execute_python_prints() {
+    #[tokio::test]
+    async fn execute_python_prints() {
         let d = tmp_py();
         let backend: Arc<dyn ShellBackend> = Arc::new(crate::tools::backend::NativeShell::new());
         let t = ExecutePythonTool { project_path: d, backend, default_timeout_secs: 10 };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"code": "print(1+2)"}), &cancel).unwrap();
+        let out = t.call(&json!({"code": "print(1+2)"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         if v["success"].as_bool().unwrap() {
             assert!(v["stdout"].as_str().unwrap().contains("3"));
         }
     }
 
-    #[test]
-    fn execute_python_empty_code() {
+    #[tokio::test]
+    async fn execute_python_empty_code() {
         let backend: Arc<dyn ShellBackend> = Arc::new(crate::tools::backend::NativeShell::new());
         let t = ExecutePythonTool { project_path: std::env::temp_dir(), backend, default_timeout_secs: 10 };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"code": ""}), &cancel).unwrap();
+        let out = t.call(&json!({"code": ""}), &cancel).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], false);
     }
 
-    #[test]
-    fn analyze_code_python() {
+    #[tokio::test]
+    async fn analyze_code_python() {
         let d = tmp_py();
         std::fs::write(d.join("app.py"), "import os\n\nclass Hello:\n    def greet(self):\n        print('hi')\n").unwrap();
         let t = AnalyzeCodeTool { project_path: d };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"file_path": "app.py"}), &cancel).unwrap();
+        let out = t.call(&json!({"file_path": "app.py"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], true);
         assert_eq!(v["language"], "python");
@@ -346,34 +364,34 @@ mod tests {
         assert!(v["imports"].as_array().unwrap().iter().any(|i| i.as_str().unwrap().contains("os")));
     }
 
-    #[test]
-    fn analyze_code_rust() {
+    #[tokio::test]
+    async fn analyze_code_rust() {
         let d = tmp_py();
         std::fs::write(d.join("main.rs"), "use std::io;\n\nfn main() {\n    println!(\"hi\");\n}\n").unwrap();
         let t = AnalyzeCodeTool { project_path: d };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"file_path": "main.rs"}), &cancel).unwrap();
+        let out = t.call(&json!({"file_path": "main.rs"}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["language"], "rust");
         assert!(v["functions"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().contains("main")));
     }
 
-    #[test]
-    fn analyze_code_missing_file() {
+    #[tokio::test]
+    async fn analyze_code_missing_file() {
         let d = tmp_py();
         let t = AnalyzeCodeTool { project_path: d };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"file_path": "nope.py"}), &cancel).unwrap();
+        let out = t.call(&json!({"file_path": "nope.py"}), &cancel).await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], false);
     }
 
-    #[test]
-    fn debug_code_for_unknown_lang() {
+    #[tokio::test]
+    async fn debug_code_for_unknown_lang() {
         let d = std::env::temp_dir().join(format!("cd_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         let t = DebugCodeTool { project_path: d };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"file_path": "app.py", "error_message": "SyntaxError"}), &cancel).unwrap();
+        let out = t.call(&json!({"file_path": "app.py", "error_message": "SyntaxError"}), &cancel).await.unwrap();
         assert!(out.contains("\"success\":true"));
     }
 }
