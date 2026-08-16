@@ -10,10 +10,10 @@
 use crate::agent::compact::{build_compact_view_cached, estimate_messages_tokens, CompactCache};
 use crate::config::AgentConfig;
 use crate::error::{AacodeError, Result};
-use crate::llm::types::{ChatMessage, ToolCall};
+use crate::llm::types::{ChatMessage, LlmResponse, ToolCall};
 use crate::llm::LlmClient;
-use crate::session::{SessionManager, SessionMessage};
-use crate::stream::{CollectingSink, EventSink};
+use crate::session::{now_iso_ms, MessageSegment, SessionManager, SessionMessage};
+use crate::stream::{observation_display, CollectingSink, EventSink};
 use crate::tools::ToolRegistry;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -171,7 +171,8 @@ impl<'a> ReactLoop<'a> {
                         reasoning_content: resp.reasoning_content.clone(),
                     };
                     messages.push(assistant.clone());
-                    let _ = session.add_message(SessionMessage::from_chat(&assistant));
+                    let segs = segments_from_response(&resp);
+                    let _ = session.add_message(SessionMessage::from_chat_with_segments(&assistant, segs));
                     let cont = ChatMessage::user("continue");
                     messages.push(cont.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&cont));
@@ -186,7 +187,12 @@ impl<'a> ReactLoop<'a> {
                     reasoning_content: resp.reasoning_content.clone(),
                 };
                 messages.push(assistant.clone());
-                let _ = session.add_message(SessionMessage::from_chat(&assistant));
+                let segs = segments_from_response(&resp);
+                let _ = session.add_message(SessionMessage::from_chat_with_segments(&assistant, segs));
+                // Flush before the terminal event so a host re-reading the
+                // session right after `done` sees the final assistant message
+                // and its segments (previously `done` preceded the flush).
+                let _ = session.flush();
                 emitter.done_result(&session_id, "completed", iteration + 1, &last_text);
                 return Ok(RunResult {
                     status: RunStatus::Completed,
@@ -208,7 +214,8 @@ impl<'a> ReactLoop<'a> {
             let mut assistant_msg = assistant.clone();
             assistant_msg.reasoning_content = resp.reasoning_content.clone();
             messages.push(assistant_msg.clone());
-            let _ = session.add_message(SessionMessage::from_chat(&assistant_msg));
+            let segs = segments_from_response(&resp);
+            let _ = session.add_message(SessionMessage::from_chat_with_segments(&assistant_msg, segs));
 
             // Execute tool calls.
             let tool_count = resp.tool_calls.len();
@@ -232,6 +239,7 @@ impl<'a> ReactLoop<'a> {
 
                 let results = join_all(futures).await;
 
+                let mut observation_segments = Vec::new();
                 for (tc_id, tc_name, observation) in results {
                     if cancel.load(Ordering::SeqCst) {
                         emitter.error("cancelled");
@@ -251,12 +259,20 @@ impl<'a> ReactLoop<'a> {
                         stale.record_fetch(&url, &observation);
                     }
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
+                    observation_segments.push(MessageSegment {
+                        kind: "observation".into(),
+                        content: observation_display(&observation, self.config.limits.display_preview_chars),
+                        name: None,
+                        created_at: Some(now_iso_ms()),
+                    });
                     let tool_msg = ChatMessage::tool_result(tc_id, observation);
                     messages.push(tool_msg.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
                 }
+                session.append_last_assistant_segments(observation_segments);
             } else {
                 // Single tool: sequential path
+                let mut observation_segments = Vec::new();
                 for tc in &resp.tool_calls {
                     if cancel.load(Ordering::SeqCst) {
                         emitter.error("cancelled");
@@ -276,16 +292,24 @@ impl<'a> ReactLoop<'a> {
                         stale.record_fetch(&url, &observation);
                     }
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
+                    observation_segments.push(MessageSegment {
+                        kind: "observation".into(),
+                        content: observation_display(&observation, self.config.limits.display_preview_chars),
+                        name: None,
+                        created_at: Some(now_iso_ms()),
+                    });
                     let tool_msg = ChatMessage::tool_result(tc.id.clone(), observation);
                     messages.push(tool_msg.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
                 }
+                session.append_last_assistant_segments(observation_segments);
             }
 
             // Context growth check (informational; compact view is built each iter).
             let _ = estimate_messages_tokens(&messages);
         }
 
+        let _ = session.flush();
         emitter.done_result(&session_id, "max_iterations", self.config.max_iterations, &last_text);
         Ok(RunResult {
             status: RunStatus::MaxIterations,
@@ -412,6 +436,41 @@ impl<'a> ReactLoop<'a> {
         }
         last
     }
+}
+
+/// Build the persisted render segments for one assistant turn, mirroring the
+/// live `seg_content` stream order: `thinking` (reasoning), `thought` (text),
+/// `action` (tool calls, with `name`). The `observation` segment is backfilled
+/// after tool execution via `SessionManager::append_last_assistant_segments`.
+fn segments_from_response(resp: &LlmResponse) -> Vec<MessageSegment> {
+    let mut segs = Vec::new();
+    if let Some(rc) = &resp.reasoning_content {
+        if !rc.is_empty() {
+            segs.push(MessageSegment {
+                kind: "thinking".into(),
+                content: rc.clone(),
+                name: None,
+                created_at: Some(now_iso_ms()),
+            });
+        }
+    }
+    if !resp.text.is_empty() {
+        segs.push(MessageSegment {
+            kind: "thought".into(),
+            content: resp.text.clone(),
+            name: None,
+            created_at: Some(now_iso_ms()),
+        });
+    }
+    for tc in &resp.tool_calls {
+        segs.push(MessageSegment {
+            kind: "action".into(),
+            content: tc.arguments.clone(),
+            name: Some(tc.name.clone()),
+            created_at: Some(now_iso_ms()),
+        });
+    }
+    segs
 }
 
 /// Classify an LLM/API error into a friendly, actionable message.
@@ -619,6 +678,99 @@ mod tests {
         // session persisted assistant(tool_calls) + tool + final assistant
         assert!(sm.messages.iter().any(|m| m.tool_calls.is_some()));
         assert!(sm.messages.iter().any(|m| m.role == "tool"));
+    }
+
+    #[test]
+    fn segments_from_response_orders_like_live_stream() {
+        let resp = LlmResponse {
+            text: "text".into(),
+            tool_calls: vec![tc("run_shell", "{}")],
+            reasoning_content: Some("reason".into()),
+            finish_reason: None,
+        };
+        let segs = segments_from_response(&resp);
+        let kinds: Vec<&str> = segs.iter().map(|s| s.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["thinking", "thought", "action"]);
+
+        // Reasoning-only (no text / tools) → thinking only.
+        let reasoning_only = LlmResponse {
+            reasoning_content: Some("r".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            segments_from_response(&reasoning_only)
+                .iter()
+                .map(|s| s.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thinking"]
+        );
+
+        // Empty response → no segments.
+        assert!(segments_from_response(&LlmResponse::default()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn persists_segments_for_tool_and_completion() {
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    text: "let me echo".into(),
+                    tool_calls: vec![tc("echo", "{\"text\":\"hey\"}")],
+                    reasoning_content: Some("I need to echo".into()),
+                    ..Default::default()
+                },
+                LlmResponse {
+                    text: "all done".into(),
+                    reasoning_content: Some("summarize".into()),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(EchoTool));
+        let cfg = AgentConfig::default();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+
+        let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("echo hey")];
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
+        assert_eq!(res.status, RunStatus::Completed);
+
+        // Tool turn assistant: thinking → thought → action → observation.
+        let tool_asst = sm
+            .messages
+            .iter()
+            .find(|m| m.tool_calls.is_some())
+            .expect("assistant with tool_calls present");
+        let segs = tool_asst.segments.as_ref().expect("tool turn must carry segments");
+        assert_eq!(segs.len(), 4, "thinking + thought + action + observation");
+        assert_eq!(segs[0].kind, "thinking");
+        assert_eq!(segs[0].content, "I need to echo");
+        assert_eq!(segs[1].kind, "thought");
+        assert_eq!(segs[1].content, "let me echo");
+        assert_eq!(segs[2].kind, "action");
+        assert_eq!(segs[2].name.as_deref(), Some("echo"));
+        assert_eq!(segs[3].kind, "observation");
+        assert!(segs[3].content.contains("echoed: hey"));
+
+        // Final assistant: thinking → thought (no action/observation).
+        let final_asst = sm
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .expect("final assistant present");
+        let final_segs = final_asst.segments.as_ref().expect("final turn must carry segments");
+        assert_eq!(final_segs.len(), 2, "thinking + thought");
+        assert_eq!(final_segs[0].kind, "thinking");
+        assert_eq!(final_segs[0].content, "summarize");
+        assert_eq!(final_segs[1].kind, "thought");
+        assert_eq!(final_segs[1].content, "all done");
     }
 
     #[tokio::test]

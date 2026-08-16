@@ -91,6 +91,22 @@ where
 
 // ── Async OpenAI client ────────────────────────────────────────────────────
 
+/// Per-request HTTP timeout for LLM calls. Overridable via the
+/// `AACODE_LLM_READ_TIMEOUT` env var (seconds) so tests and mobile hosts can
+/// bound a stalled connection (the "TCP accepted but never responds" hang
+/// that otherwise blocks until the generous default). Falls back to a long
+/// default that tolerates slow reasoning models.
+fn request_timeout() -> Duration {
+    if let Ok(v) = std::env::var("AACODE_LLM_READ_TIMEOUT") {
+        if let Ok(secs) = v.parse::<u64>() {
+            if secs > 0 {
+                return Duration::from_secs(secs);
+            }
+        }
+    }
+    Duration::from_secs(1200)
+}
+
 pub struct OpenAiAsyncClient {
     model: ModelConfig,
     client: reqwest::Client,
@@ -101,7 +117,7 @@ impl OpenAiAsyncClient {
         OpenAiAsyncClient {
             model,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(1200))
+                .timeout(request_timeout())
                 .connect_timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
@@ -225,7 +241,7 @@ impl AnthropicAsyncClient {
         AnthropicAsyncClient {
             model,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(1200))
+                .timeout(request_timeout())
                 .connect_timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),

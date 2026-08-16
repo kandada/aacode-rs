@@ -37,6 +37,23 @@ use serde_json::json;
 use std::io::Write;
 use std::sync::Mutex;
 
+/// Compute the display string for an observation, capped at `max_chars` with a
+/// truncation notice. Shared by the live `seg_observation` event and the
+/// persisted `observation` render segment so that history re-render matches the
+/// live display exactly (and avoids duplicating the full tool output on disk).
+pub fn observation_display(content: &str, max_chars: usize) -> String {
+    let total = content.chars().count();
+    let truncated = total > max_chars;
+    if truncated {
+        let head: String = content.chars().take(max_chars).collect();
+        format!(
+            "{head}...\n\n(Display truncated, {total} chars total. Agent received full content.)"
+        )
+    } else {
+        content.to_string()
+    }
+}
+
 /// Raw event emitter — always produces JSONL lines (one per event).
 /// Used as the base layer; `CliSink` wraps it for TTY formatting.
 pub trait EventSink: Send + Sync {
@@ -145,14 +162,7 @@ pub trait EventSink: Send + Sync {
     fn seg_observation(&self, content: &str, max_chars: usize) {
         let total = content.chars().count();
         let truncated = total > max_chars;
-        let display: String = if truncated {
-            let head: String = content.chars().take(max_chars).collect();
-            format!(
-                "{head}...\n\n(Display truncated, {total} chars total. Agent received full content.)"
-            )
-        } else {
-            content.to_string()
-        };
+        let display = observation_display(content, max_chars);
         self.emit_line(
             &json!({
                 "type": "seg_content",
@@ -702,6 +712,25 @@ mod tests {
         assert_eq!(v["truncated"], false);
         assert_eq!(v["total_chars"], 8);
         assert_eq!(v["content"], "short ok");
+    }
+
+    #[test]
+    fn observation_display_matches_seg_observation() {
+        // Small content → unchanged.
+        assert_eq!(observation_display("short ok", 3000), "short ok");
+
+        // Large content → truncated with notice.
+        let big = "z".repeat(5000);
+        let display = observation_display(&big, 3000);
+        assert!(display.len() < 5000, "display must be capped");
+        assert!(display.contains("Display truncated"), "truncation notice present");
+        assert!(display.contains("5000 chars total"), "total chars reported");
+
+        // The live event must carry the same string.
+        let s = CollectingSink::new(false);
+        s.seg_observation(&big, 3000);
+        let v: serde_json::Value = serde_json::from_str(&s.lines()[0]).unwrap();
+        assert_eq!(v["content"].as_str().unwrap(), display);
     }
 
     #[test]

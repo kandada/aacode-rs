@@ -439,6 +439,10 @@ async fn resumed_session_with_dangling_tool_calls_is_repaired() {
             ],
         );
         let _ = sm.add_message(SessionMessage::from_chat(&assistant));
+        // Persist the assistant(tool_calls) before "interrupting" — add_message
+        // batches writes, so without this flush the poisoned messages would be
+        // dropped on `sm` destruction and never reach disk.
+        let _ = sm.flush();
         sid // interrupted here — no tool results persisted
     };
 

@@ -449,6 +449,7 @@ pub extern "C" fn aacode_get_session_messages(
                 "tool_calls": m.tool_calls,
                 "tool_call_id": m.tool_call_id,
                 "reasoning_content": m.reasoning_content,
+                "segments": m.segments,
             })
         })
         .collect();
@@ -472,6 +473,7 @@ fn message_to_json(m: &SessionMessage) -> serde_json::Value {
         "tool_calls": m.tool_calls,
         "tool_call_id": m.tool_call_id,
         "reasoning_content": m.reasoning_content,
+        "segments": m.segments,
     })
 }
 
@@ -1016,6 +1018,7 @@ mod tests {
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
+                        segments: None,
                     }],
                 )
                 .unwrap();
@@ -1068,6 +1071,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    segments: None,
                 }],
             )
             .unwrap();
@@ -1093,6 +1097,77 @@ mod tests {
         assert!(r.contains("\"success\":true"), "append unicode: {r}");
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 50));
         assert!(r.contains("你好，世界"), "unicode content preserved: {r}");
+    }
+
+    #[test]
+    fn session_append_and_read_segments() {
+        let proj = mkdirs(&tmp_root("sess_segs"));
+        let pp = CString::new(proj).unwrap();
+        let sid = CString::new("s1").unwrap();
+        let msgs = r#"[
+            {"role":"assistant","content":"ok","timestamp":"1700000001",
+             "segments":[
+               {"type":"thinking","content":"think","created_at":"1700000001.001"},
+               {"type":"action","name":"run_shell","content":"{}","created_at":"1700000001.002"}
+             ]}
+        ]"#;
+        let mj = CString::new(msgs).unwrap();
+        let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), mj.as_ptr()));
+        assert!(r.contains("\"success\":true"), "append segments: {r}");
+
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 50));
+        assert!(r.contains("\"type\":\"thinking\""), "thinking segment round-trips: {r}");
+        assert!(r.contains("\"name\":\"run_shell\""), "action name round-trips: {r}");
+        assert!(r.contains("\"created_at\":\"1700000001.001\""), "created_at round-trips: {r}");
+    }
+
+    #[test]
+    fn session_append_without_segments_still_works() {
+        let proj = mkdirs(&tmp_root("sess_noseg"));
+        let pp = CString::new(proj).unwrap();
+        let sid = CString::new("s1").unwrap();
+        let msgs = r#"[{"role":"user","content":"hi","timestamp":"1700000001"}]"#;
+        let mj = CString::new(msgs).unwrap();
+        let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), mj.as_ptr()));
+        assert!(r.contains("\"success\":true"), "append without segments: {r}");
+        let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 50));
+        assert!(r.contains("\"hi\""), "message without segments still read: {r}");
+        // Optional field rendered as null in the wire (consistent with tool_calls).
+        assert!(r.contains("\"segments\":null"), "absent segments serialize as null: {r}");
+    }
+
+    #[test]
+    fn legacy_get_session_messages_carries_segments() {
+        let proj = mkdirs(&tmp_root("sess_legacy_seg"));
+        let pp = CString::new(proj.clone()).unwrap();
+        let sid = CString::new("s1").unwrap();
+        {
+            let mut sm = SessionManager::new(std::path::Path::new(&proj));
+            sm.ensure_session("s1", "").unwrap();
+            sm.append_session_messages(
+                "s1",
+                vec![SessionMessage {
+                    role: "assistant".to_string(),
+                    content: "ok".to_string(),
+                    timestamp: "1700000001".to_string(),
+                    tokens: 1,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    segments: Some(vec![crate::session::MessageSegment {
+                        kind: "thought".into(),
+                        content: "ok".into(),
+                        name: None,
+                        created_at: Some("1700000001.001".into()),
+                    }]),
+                }],
+            )
+            .unwrap();
+        }
+        let r = call_str(|| aacode_get_session_messages(pp.as_ptr(), sid.as_ptr()));
+        assert!(r.contains("\"success\":true"), "legacy read: {r}");
+        assert!(r.contains("\"type\":\"thought\""), "legacy carries segments: {r}");
+        assert!(r.contains("\"created_at\":\"1700000001.001\""), "legacy segment created_at: {r}");
     }
 
     #[test]

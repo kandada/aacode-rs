@@ -13,6 +13,27 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// One structured render segment within a persisted message. Mirrors the
+/// `seg_content` event `seg` values (`thinking` / `thought` / `action` /
+/// `observation`) so hosts can reconstruct the same collapse affordance from
+/// persisted history (not just the live event stream). Additive/optional: old
+/// files without `segments` still parse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageSegment {
+    /// `thinking` | `thought` | `action` | `observation` | `meta`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub content: String,
+    /// Tool name, only for `action` segments (matches `seg_content` `name`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+    /// Epoch seconds as a string (may carry fractional precision, e.g.
+    /// `"1700000000.123"`). Optional for hosts that append segments by hand.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created_at: Option<String>,
+}
+
 /// A persisted message (superset of ChatMessage with a timestamp + tokens).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessage {
@@ -29,6 +50,9 @@ pub struct SessionMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reasoning_content: Option<String>,
+    /// Structured render segments (additive; omitted when absent).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub segments: Option<Vec<MessageSegment>>,
 }
 
 impl SessionMessage {
@@ -45,7 +69,20 @@ impl SessionMessage {
             tool_calls: m.tool_calls.clone(),
             tool_call_id: m.tool_call_id.clone(),
             reasoning_content: m.reasoning_content.clone(),
+            segments: None,
         }
+    }
+
+    /// Like `from_chat`, but carries structured render segments (used by the
+    /// agent to persist thinking/action/observation/thought for host UI).
+    pub fn from_chat_with_segments(m: &ChatMessage, segments: Vec<MessageSegment>) -> Self {
+        let mut sm = SessionMessage::from_chat(m);
+        sm.segments = if segments.is_empty() {
+            None
+        } else {
+            Some(segments)
+        };
+        sm
     }
 
     pub fn to_chat(&self) -> ChatMessage {
@@ -127,6 +164,17 @@ pub fn now_iso() -> String {
         .unwrap_or(0);
     // Store epoch seconds as string; readable enough and monotonic for sorting.
     secs.to_string()
+}
+
+/// Current time as an epoch-seconds string with millisecond precision
+/// (e.g. `"1700000000.123"`). Used for per-segment `created_at` so segments
+/// within the same message stay stably ordered and hosts can derive stable ids.
+pub fn now_iso_ms() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:03}", d.as_secs(), d.subsec_millis())
 }
 
 /// Atomic write: write to a temp file then rename over the target.
@@ -223,6 +271,7 @@ impl SessionManager {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                segments: None,
             });
         }
         let mut index = self.load_index();
@@ -541,6 +590,23 @@ impl SessionManager {
             .last()
             .map(|m| m.role == "tool")
             .unwrap_or(false)
+    }
+
+    /// Append render segments to the last assistant message (in-memory). Used
+    /// by the agent to backfill `observation` segments that only become
+    /// available after tool execution, when the assistant message carrying
+    /// `tool_calls` has already been persisted. Marks the session dirty so the
+    /// next flush writes the update.
+    pub fn append_last_assistant_segments(&mut self, segments: Vec<MessageSegment>) {
+        if segments.is_empty() {
+            return;
+        }
+        if let Some(last) = self.messages.iter_mut().rev().find(|m| m.role == "assistant") {
+            last.segments
+                .get_or_insert_with(Vec::new)
+                .extend(segments);
+            self.dirty_count += 1;
+        }
     }
 }
 
@@ -866,6 +932,214 @@ mod tests {
         );
     }
 
+    /// The `session_v2.json` fixture demonstrates the additive `segments` field
+    /// (same `schema_version: 1` — the field is optional and non-breaking).
+    #[test]
+    fn schema_conformance_segments_fixture_roundtrips() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/session_v2.json");
+        let file: SessionFile = serde_json::from_str(FIXTURE).expect("segments fixture must parse");
+
+        assert_eq!(file.schema_version, 1, "segments are additive; schema stays at 1");
+        assert_eq!(file.messages.len(), 3);
+
+        let segs = file.messages[1]
+            .segments
+            .as_ref()
+            .expect("assistant must carry segments");
+        assert_eq!(segs.len(), 4);
+        assert_eq!(segs[0].kind, "thinking");
+        assert_eq!(segs[0].content, "I should run a shell command");
+        assert_eq!(segs[0].created_at.as_deref(), Some("1700000002.001"));
+        assert_eq!(segs[1].kind, "thought");
+        assert_eq!(segs[1].content, "I'll create it.");
+        assert_eq!(segs[2].kind, "action");
+        assert_eq!(segs[2].name.as_deref(), Some("run_shell"));
+        assert_eq!(segs[2].content, r#"{"command":"echo hello"}"#);
+        assert_eq!(segs[3].kind, "observation");
+        assert_eq!(segs[3].content, "hello");
+
+        // user / tool messages must NOT carry segments (absent, not null).
+        assert!(file.messages[0].segments.is_none());
+        assert!(file.messages[2].segments.is_none());
+
+        // Round-trip stability.
+        let reserialized = serde_json::to_string(&file).unwrap();
+        let reparsed: SessionFile = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(
+            reparsed.messages[1].segments.as_ref().unwrap().len(),
+            4
+        );
+        assert_eq!(
+            reparsed.messages[1].segments.as_ref().unwrap()[2].name.as_deref(),
+            Some("run_shell")
+        );
+    }
+
+    #[test]
+    fn segments_absent_when_not_set() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        let id = sm.create_session("t", None).unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("hi")))
+            .unwrap();
+        sm.flush().unwrap();
+
+        let raw = std::fs::read_to_string(sm.session_path(&id)).unwrap();
+        assert!(!raw.contains("segments"), "no segments field when None: {raw}");
+
+        let msgs = sm.read_session_messages(&id);
+        assert!(msgs[1].segments.is_none());
+    }
+
+    #[test]
+    fn append_last_assistant_segments_backfills() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+
+        let asst = SessionMessage::from_chat_with_segments(
+            &ChatMessage::assistant("planning"),
+            vec![MessageSegment {
+                kind: "thinking".into(),
+                content: "think".into(),
+                name: None,
+                created_at: Some("1.001".into()),
+            }],
+        );
+        sm.add_message(asst).unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::tool_result("c1", "out")))
+            .unwrap();
+
+        sm.append_last_assistant_segments(vec![MessageSegment {
+            kind: "observation".into(),
+            content: "out".into(),
+            name: None,
+            created_at: Some("1.002".into()),
+        }]);
+
+        let segs = sm.messages[1].segments.as_ref().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].kind, "thinking");
+        assert_eq!(segs[1].kind, "observation");
+
+        // Flush persists the backfilled segments.
+        sm.flush().unwrap();
+        let read = sm.read_session_messages(&sm.current_session_id.clone().unwrap());
+        let read_segs = read[1].segments.as_ref().unwrap();
+        assert_eq!(read_segs.len(), 2);
+        assert_eq!(read_segs[1].content, "out");
+    }
+
+    #[test]
+    fn from_chat_with_segments_empty_is_none() {
+        let m = SessionMessage::from_chat_with_segments(&ChatMessage::assistant("hi"), vec![]);
+        assert!(m.segments.is_none(), "empty segment list collapses to None");
+    }
+
+    #[test]
+    fn append_last_assistant_segments_noop_when_no_assistant() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap(); // only a user message
+        // Must not panic and must not mutate anything.
+        sm.append_last_assistant_segments(vec![MessageSegment {
+            kind: "observation".into(),
+            content: "x".into(),
+            name: None,
+            created_at: None,
+        }]);
+        assert!(sm.messages.iter().all(|m| m.segments.is_none()));
+    }
+
+    #[test]
+    fn append_last_assistant_segments_targets_last_assistant() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("first")))
+            .unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::user("again")))
+            .unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("second")))
+            .unwrap();
+
+        sm.append_last_assistant_segments(vec![MessageSegment {
+            kind: "observation".into(),
+            content: "only-second".into(),
+            name: None,
+            created_at: None,
+        }]);
+
+        // "first" assistant (index 1) stays empty; "second" (index 3) gets it.
+        assert!(sm.messages[1].segments.is_none());
+        let segs = sm.messages[3].segments.as_ref().unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].content, "only-second");
+    }
+
+    #[test]
+    fn segments_do_not_leak_into_llm_history() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let msg = SessionMessage::from_chat_with_segments(
+            &ChatMessage::assistant("hi"),
+            vec![MessageSegment {
+                kind: "thought".into(),
+                content: "hi".into(),
+                name: None,
+                created_at: None,
+            }],
+        );
+        sm.add_message(msg).unwrap();
+
+        // `history_chat` maps through `to_chat`, which must drop `segments`
+        // (they are UI-only and must not pollute the LLM context).
+        let hist = sm.history_chat();
+        let asst = hist.iter().find(|m| m.role == "assistant").unwrap();
+        assert_eq!(asst.content, "hi");
+    }
+
+    #[test]
+    fn now_iso_ms_has_millisecond_precision() {
+        let s = now_iso_ms();
+        let (secs, ms) = s.split_once('.').expect("must contain fractional part");
+        assert!(secs.parse::<u64>().is_ok(), "integer seconds part: {s}");
+        assert_eq!(ms.len(), 3, "millisecond part must be 3 digits: {s}");
+        assert!(ms.parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn segment_roundtrip_through_disk_omits_name_when_none() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        sm.add_message(SessionMessage::from_chat_with_segments(
+            &ChatMessage::assistant("hi"),
+            vec![MessageSegment {
+                kind: "thought".into(),
+                content: "hi".into(),
+                name: None,
+                created_at: None,
+            }],
+        ))
+        .unwrap();
+        sm.flush().unwrap();
+
+        let id = sm.current_session_id.clone().unwrap();
+        let raw = std::fs::read_to_string(sm.session_path(&id)).unwrap();
+        // Optional fields must be omitted, not serialized as null.
+        assert!(raw.contains(r#""type":"thought""#), "segment type present: {raw}");
+        assert!(!raw.contains(r#""name":null"#), "name must be omitted when None: {raw}");
+        assert!(!raw.contains(r#""created_at":null"#), "created_at must be omitted when None: {raw}");
+
+        let read = sm.read_session_messages(&id);
+        let seg = &read[1].segments.as_ref().unwrap()[0];
+        assert_eq!(seg.kind, "thought");
+        assert_eq!(seg.name, None);
+        assert_eq!(seg.created_at, None);
+    }
+
     // ── SESSION_FFI 存储方法 ──────────────────────────────────────────
 
     #[test]
@@ -957,7 +1231,7 @@ mod tests {
     #[test]
     fn old_file_without_schema_version_reads_fine() {
         let proj = tmp_project();
-        let mut sm = SessionManager::new(&proj);
+        let sm = SessionManager::new(&proj);
         let path = sm.session_path("s_old");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Old-format file: no `schema_version` field.

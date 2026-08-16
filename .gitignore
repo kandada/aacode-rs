@@ -7,6 +7,12 @@ LLM_CLIENT.md
 DEPS.md
 /.backup
 USAGE.md
+/.idea/.gitignore
+/.idea/aacode-rs.iml
 /design_diff_hook.md
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/inspectionProfiles/profiles_settings.xml
+/tests/fixtures/session_v2.json
+/.idea/vcs.xml
 /SESSION_FFI.md
-/.idea/
