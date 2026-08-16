@@ -3,6 +3,7 @@
 # aacode-rs — CLI 编程 Agent
 
 [![Rust](https://img.shields.io/badge/Rust-1.80+-orange.svg)](https://www.rust-lang.org/)
+[![Crates.io](https://img.shields.io/crates/v/aacode-rs.svg)](https://crates.io/crates/aacode-rs)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](LICENSE)
 
 > **纯 Rust 实现的 AI 编程 CLI Agent** — 轻量化 ReAct 架构，100% Rust，无 Python 依赖。
@@ -17,6 +18,13 @@
 * 安全护栏 — 路径限制、危险命令拒绝、网络权限控制
 * 跨平台 — 同一代码库编译到 macOS、Linux、Windows、Android、iOS
 * 零 LLM SDK — 异步 HTTP 流式（tokio + reqwest）+ 手写 SSE/JSON 解析，直接调用所有 LLM API
+
+## 安装
+
+```toml
+[dependencies]
+aacode-rs = "1.8.7"
+```
 
 ## 快速开始
 

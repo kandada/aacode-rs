@@ -3,6 +3,7 @@
 # aacode-rs — CLI Programming Agent
 
 [![Rust](https://img.shields.io/badge/Rust-1.80+-orange.svg)](https://www.rust-lang.org/)
+[![Crates.io](https://img.shields.io/crates/v/aacode-rs.svg)](https://crates.io/crates/aacode-rs)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](LICENSE)
 
 > **AI Programming CLI Agent in pure Rust** — a lightweight ReAct architecture, 100% Rust, no Python dependency.
@@ -17,6 +18,13 @@
 * Safety guardrails — path confinement, dangerous command rejection, network permissions
 * Cross-platform — compiles to macOS, Linux, Windows, Android, iOS from one codebase
 * No LLM SDK — async HTTP streaming (tokio + reqwest) with hand-rolled SSE/JSON parsing for all LLM APIs
+
+## Installation
+
+```toml
+[dependencies]
+aacode-rs = "1.8.7"
+```
 
 ## Quick Start
 
