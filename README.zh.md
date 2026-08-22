@@ -19,13 +19,6 @@
 * 跨平台 — 同一代码库编译到 macOS、Linux、Windows、Android、iOS
 * 零 LLM SDK — 异步 HTTP 流式（tokio + reqwest）+ 手写 SSE/JSON 解析，直接调用所有 LLM API
 
-## 安装
-
-```toml
-[dependencies]
-aacode-rs = "1.8.7"
-```
-
 ## 快速开始
 
 ### 操作系统

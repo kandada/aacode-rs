@@ -1,28 +1,19 @@
 // Copyright (c) 2026 xiefujin <490021684@qq.com>
 // Licensed under GPL-3.0, see LICENSE file for full license terms.
 
-//! OpenAI-compatible SSE stream parser.
+//! OpenAI-compatible SSE stream parser (sync I/O wrapper).
 //!
-//! Parses `delta.content` / `delta.reasoning_content` / `delta.tool_calls`,
-//! emitting segments to the sink and accumulating fragmented tool_calls by index.
+//! Owns the I/O loop around `SseReader` and delegates wire-format
+//! parsing to `super::parse::parse_openai_chunk` + `finalize_openai`,
+//! so this binary client and the async client in `async_llm.rs`
+//! share one implementation.
 
+use super::parse::{self, OpenAiParseState};
 use super::sse::SseReader;
-use super::types::{LlmResponse, ToolCall};
-use crate::error::{AacodeError, Result};
+use super::types::LlmResponse;
+use crate::error::Result;
 use crate::stream::EventSink;
-use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Accumulator for one streamed tool_call (fragments arrive by index).
-#[derive(Default, Clone)]
-struct ToolAcc {
-    id: String,
-    name: String,
-    arguments: String,
-    name_announced: bool,
-    last_report: usize,
-}
 
 /// Parse an OpenAI-style SSE chat stream from any reader.
 pub fn parse_openai_stream<R: std::io::Read>(
@@ -31,143 +22,24 @@ pub fn parse_openai_stream<R: std::io::Read>(
     cancel: &AtomicBool,
 ) -> Result<LlmResponse> {
     let mut sse = SseReader::new(reader);
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut tool_accs: BTreeMap<i64, ToolAcc> = BTreeMap::new();
-    let mut finish_reason: Option<String> = None;
-    let mut valid_chunks: usize = 0;
-    let mut total_payloads: usize = 0;
+    let mut state = OpenAiParseState::default();
 
     while let Some(payload) = match sse.next_data() {
         Ok(Some(p)) => Some(p),
         Ok(None) => None,
-        Err(e) => return Err(AacodeError::Network(format!("SSE read error: {e}"))),
+        Err(e) => {
+            return Err(crate::error::AacodeError::Network(format!(
+                "SSE read error: {e}"
+            )))
+        }
     } {
         if cancel.load(Ordering::SeqCst) {
-            return Err(AacodeError::Cancelled);
+            return Err(crate::error::AacodeError::Cancelled);
         }
-        total_payloads += 1;
-        let chunk: Value = match serde_json::from_str(&payload) {
-            Ok(v) => {
-                valid_chunks += 1;
-                v
-            }
-            Err(_) => continue,
-        };
-        if let Some(err) = chunk.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| err.to_string());
-            return Err(AacodeError::Api(format!("stream error: {msg}")));
-        }
-        let choice = match chunk.get("choices").and_then(|c| c.get(0)) {
-            Some(c) => c,
-            None => continue,
-        };
-        if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-            finish_reason = Some(fr.to_string());
-        }
-        let delta = match choice.get("delta") {
-            Some(d) => d,
-            None => continue,
-        };
-
-        let rc_opt = delta
-            .get("reasoning_content")
-            .and_then(|v| v.as_str())
-            .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()));
-        if let Some(rc) = rc_opt {
-            if !rc.is_empty() {
-                reasoning.push_str(rc);
-                emitter.delta("thinking", rc);
-            }
-        }
-        if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
-            if !c.is_empty() {
-                text.push_str(c);
-                emitter.delta("thought", c);
-            }
-        }
-        if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            for tc in tcs {
-                let idx = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                let acc = tool_accs.entry(idx).or_default();
-                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                    if !id.is_empty() {
-                        acc.id = id.to_string();
-                    }
-                }
-                if let Some(func) = tc.get("function") {
-                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                        if !name.is_empty() {
-                            acc.name.push_str(name);
-                            if !acc.name_announced {
-                                acc.name_announced = true;
-                                emitter.tool_progress("building", &acc.name, 0);
-                            }
-                        }
-                    }
-                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                        acc.arguments.push_str(args);
-                        let cur = acc.arguments.len();
-                        if cur - acc.last_report >= 500 {
-                            acc.last_report = cur - (cur % 500);
-                            emitter.tool_progress("building", &acc.name, cur);
-                        }
-                    }
-                }
-            }
-        }
+        parse::parse_openai_chunk(&payload, &mut state, emitter)?;
     }
 
-    if total_payloads > 0 && valid_chunks == 0 {
-        return Err(AacodeError::Api(
-            "stream returned no parseable data (all chunks malformed)".into(),
-        ));
-    }
-
-    if !reasoning.is_empty() {
-        emitter.seg_large("thinking", &reasoning, 512);
-    }
-    emitter.seg_large("thought", &text, 512);
-
-    let mut tool_calls = Vec::new();
-    for (i, (_, acc)) in tool_accs.into_iter().enumerate() {
-        if acc.name.is_empty() {
-            continue;
-        }
-        let id = if acc.id.is_empty() {
-            format!("call_{i}")
-        } else {
-            acc.id
-        };
-        emitter.tool_progress("done", &acc.name, acc.arguments.len());
-        emitter.action(&acc.name, &acc.arguments);
-        tool_calls.push(ToolCall {
-            id,
-            name: acc.name,
-            arguments: acc.arguments,
-        });
-    }
-
-    if matches!(finish_reason.as_deref(), Some("length")) {
-        text.push_str(
-            "\n\n[⚠️ WARNING: API response truncated (max_tokens). Reduce content or raise max_tokens.]",
-        );
-    }
-
-    Ok(LlmResponse {
-        text,
-        tool_calls,
-        reasoning_content: if reasoning.is_empty() {
-            None
-        } else {
-            Some(reasoning)
-        },
-        finish_reason,
-    })
+    parse::finalize_openai(state, emitter)
 }
 
 #[cfg(test)]
@@ -509,5 +381,42 @@ mod tests {
             })
             .count();
         assert_eq!(thought_seg_count, 1);
+    }
+
+    // ── thinking extraction: end-to-end via SSE I/O loop ────────────────
+
+    /// `thinking` field works end-to-end through the sync SSE reader.
+    #[test]
+    fn sync_stream_thinking_field() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"thinking\":\"plan X\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"do it\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.reasoning_content.as_deref(), Some("plan X"));
+        assert_eq!(resp.text, "do it");
+    }
+
+    /// `<think>` tag works end-to-end and survives chunk boundaries.
+    #[test]
+    fn sync_stream_think_tag_split_across_chunks() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>I am thi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"nking</think>done\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        assert_eq!(resp.reasoning_content.as_deref(), Some("I am thinking"));
+        assert_eq!(resp.text, "done");
+        let lines = sink.lines();
+        assert!(lines.iter().any(|l| l.contains(r#""seg":"thinking""#)));
+        assert!(lines.iter().any(|l| l.contains(r#""seg":"thought""#)));
     }
 }

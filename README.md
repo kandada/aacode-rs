@@ -19,13 +19,6 @@
 * Cross-platform — compiles to macOS, Linux, Windows, Android, iOS from one codebase
 * No LLM SDK — async HTTP streaming (tokio + reqwest) with hand-rolled SSE/JSON parsing for all LLM APIs
 
-## Installation
-
-```toml
-[dependencies]
-aacode-rs = "1.8.7"
-```
-
 ## Quick Start
 
 ### Operating System

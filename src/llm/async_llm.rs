@@ -15,6 +15,9 @@ use serde_json::{json, Value};
 
 use crate::config::{Gateway, ModelConfig};
 use crate::error::{AacodeError, Result};
+use crate::llm::thinking::{
+    cache_mode, get_cached_mode, is_thinking_mode_rejected, next_mode, thinking_kw_for_mode,
+};
 use crate::llm::types::{ChatMessage, LlmResponse};
 use crate::llm::{parse, LlmClient};
 use crate::stream::EventSink;
@@ -282,7 +285,7 @@ impl AnthropicAsyncClient {
         (system, out)
     }
 
-    fn build_body(&self, messages: &[ChatMessage], tools: &[Value], stream: bool) -> Value {
+    fn build_body(&self, messages: &[ChatMessage], tools: &[Value], stream: bool, mode: &'static str) -> Value {
         let (system, msgs) = Self::build_messages(messages);
         let mut body = json!({
             "model": self.model.name, "max_tokens": self.model.max_tokens,
@@ -290,6 +293,10 @@ impl AnthropicAsyncClient {
         });
         if !system.is_empty() { body["system"] = Value::String(system); }
         if !tools.is_empty() { body["tools"] = Value::Array(tools.to_vec()); }
+        // thinking 模式状态机注入（仅当 mode != none 时）
+        if let Some(tk) = thinking_kw_for_mode(mode) {
+            body["thinking"] = tk;
+        }
         body
     }
 
@@ -322,16 +329,62 @@ impl LlmClient for AnthropicAsyncClient {
         emitter: &dyn EventSink,
         cancel: &AtomicBool,
     ) -> Result<LlmResponse> {
-        let body = self.build_body(messages, tools, true);
-        let stream = self.post_stream(&body).await?;
-        let mut sse = AsyncSseStream::new(stream);
-        let mut state = parse::AnthropicParseState::default();
+        // ── thinking 模式状态机 ──
+        // 乐观尝试 adaptive（无 budget_tokens），失败则降级到 enabled（带 budget_tokens），
+        // 再失败则不带 thinking。命中后该模型会话内不再尝试更高优先级模式。
+        let mut mode: &'static str = get_cached_mode(&self.model.name);
+        loop {
+            let body = self.build_body(messages, tools, true, mode);
+            match self.post_stream(&body).await {
+                Ok(stream) => {
+                    let mut sse = AsyncSseStream::new(stream);
+                    let mut state = parse::AnthropicParseState::default();
+                    let stream_result: Result<()> = async {
+                        while let Some(payload) = sse.next_data().await? {
+                            if cancel.load(Ordering::SeqCst) {
+                                return Err(AacodeError::Cancelled);
+                            }
+                            parse::parse_anthropic_chunk(&payload, &mut state, emitter)?;
+                        }
+                        Ok(())
+                    }
+                    .await;
 
-        while let Some(payload) = sse.next_data().await? {
-            if cancel.load(Ordering::SeqCst) { return Err(AacodeError::Cancelled); }
-            parse::parse_anthropic_chunk(&payload, &mut state, emitter)?;
+                    match stream_result {
+                        Ok(()) => {
+                            // 成功：缓存当前模式
+                            cache_mode(&self.model.name, mode);
+                            return parse::finalize_anthropic(state, emitter);
+                        }
+                        Err(e) => {
+                            // 流解析错误：原样返回（不是 thinking 相关错误）
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // HTTP 错误：判断是否为 thinking 模式被拒
+                    let err_msg = format!("{}", e);
+                    if !is_thinking_mode_rejected(&err_msg, mode) {
+                        // 非 thinking 错误：原样返回
+                        return Err(e);
+                    }
+                    // thinking 被拒：尝试下一档模式
+                    match next_mode(mode) {
+                        Some(nxt) => {
+                            mode = nxt;
+                            // 写缓存以避免该 session 反复重试失败的模式
+                            cache_mode(&self.model.name, mode);
+                            // 继续 loop 重试
+                        }
+                        None => {
+                            // 已到终态（none）也被拒：放弃 streaming
+                            return Err(e);
+                        }
+                    }
+                }
+            }
         }
-        parse::finalize_anthropic(state, emitter)
     }
 
     async fn validate(&self) -> Result<()> {

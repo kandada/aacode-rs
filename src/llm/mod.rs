@@ -6,6 +6,7 @@ pub mod async_llm;
 pub mod openai;
 pub mod parse;
 pub mod sse;
+pub mod thinking;
 pub mod types;
 
 pub use types::{ChatMessage, LlmResponse, ToolCall};
