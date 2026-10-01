@@ -13,28 +13,17 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// One structured render segment within a persisted message. Mirrors the
-/// `seg_content` event `seg` values (`thinking` / `thought` / `action` /
-/// `observation`) so hosts can reconstruct the same collapse affordance from
-/// persisted history (not just the live event stream). Additive/optional: old
-/// files without `segments` still parse.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MessageSegment {
-    /// `thinking` | `thought` | `action` | `observation` | `meta`.
-    #[serde(rename = "type")]
-    pub kind: String,
-    #[serde(default)]
-    pub content: String,
-    /// Tool name, only for `action` segments (matches `seg_content` `name`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub name: Option<String>,
-    /// Epoch seconds as a string (may carry fractional precision, e.g.
-    /// `"1700000000.123"`). Optional for hosts that append segments by hand.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub created_at: Option<String>,
-}
-
 /// A persisted message (superset of ChatMessage with a timestamp + tokens).
+///
+/// NOTE: render segments (`thinking`/`thought`/`action`/`observation`) are **not**
+/// persisted. They are fully derivable from the message itself plus the
+/// immediately-following `role:"tool"` messages (`tool_calls` → action, tool
+/// message → observation), so storing them duplicated content and diverged from
+/// the Python `SessionMessage`. Hosts rebuild the collapse UI from the message
+/// array order (and the live `seg_content` event stream).
+///
+/// Legacy session files that still contain a `segments` field keep parsing —
+/// serde ignores unknown fields — but the field is never written again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMessage {
     pub role: String,
@@ -50,16 +39,26 @@ pub struct SessionMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reasoning_content: Option<String>,
-    /// Structured render segments (additive; omitted when absent).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub segments: Option<Vec<MessageSegment>>,
 }
 
 impl SessionMessage {
     pub fn from_chat(m: &ChatMessage) -> Self {
+        // Token estimate must match the runtime estimator
+        // (`agent::compact::estimate_messages_tokens`) and the Python
+        // `message_utils.estimate_tokens`: count content, reasoning_content,
+        // tool_calls (serialized) AND the tool_call_id. Omitting tool_calls
+        // made tool-call-only assistant messages report `tokens = 0`.
         let mut tokens = estimate_tokens(&m.content);
         if let Some(rc) = &m.reasoning_content {
             tokens += estimate_tokens(rc);
+        }
+        if let Some(tcs) = &m.tool_calls {
+            if let Ok(json) = serde_json::to_string(tcs) {
+                tokens += estimate_tokens(&json);
+            }
+        }
+        if let Some(id) = &m.tool_call_id {
+            tokens += estimate_tokens(id);
         }
         SessionMessage {
             role: m.role.clone(),
@@ -69,20 +68,7 @@ impl SessionMessage {
             tool_calls: m.tool_calls.clone(),
             tool_call_id: m.tool_call_id.clone(),
             reasoning_content: m.reasoning_content.clone(),
-            segments: None,
         }
-    }
-
-    /// Like `from_chat`, but carries structured render segments (used by the
-    /// agent to persist thinking/action/observation/thought for host UI).
-    pub fn from_chat_with_segments(m: &ChatMessage, segments: Vec<MessageSegment>) -> Self {
-        let mut sm = SessionMessage::from_chat(m);
-        sm.segments = if segments.is_empty() {
-            None
-        } else {
-            Some(segments)
-        };
-        sm
     }
 
     pub fn to_chat(&self) -> ChatMessage {
@@ -179,7 +165,9 @@ pub fn now_iso_ms() -> String {
 
 /// Atomic write: write to a temp file then rename over the target.
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| AacodeError::Io("no parent".into()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AacodeError::Io("no parent".into()))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".tmp_{}", uuid::Uuid::new_v4().simple()));
     std::fs::write(&tmp, contents)?;
@@ -246,7 +234,11 @@ impl SessionManager {
 
     /// Create a new session and make it current. Returns the session id.
     pub fn create_session(&mut self, task: &str, title: Option<&str>) -> Result<String> {
-        let id = format!("session_{}_{}", now_iso(), &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let id = format!(
+            "session_{}_{}",
+            now_iso(),
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
         let title = title
             .map(|t| t.to_string())
             .unwrap_or_else(|| truncate_title(task));
@@ -271,7 +263,6 @@ impl SessionManager {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
-                segments: None,
             });
         }
         let mut index = self.load_index();
@@ -397,13 +388,17 @@ impl SessionManager {
                     }
                     if let Ok(s) = std::fs::read_to_string(&path) {
                         if let Ok(file) = serde_json::from_str::<SessionFile>(&s) {
-                            let title = file.messages.first()
+                            let title = file
+                                .messages
+                                .first()
                                 .map(|m| truncate_title(&m.content))
                                 .unwrap_or_default();
                             let summary = SessionSummary {
                                 session_id: file.session_id.clone(),
                                 created_at: file.created_at.clone(),
-                                last_activity: file.messages.last()
+                                last_activity: file
+                                    .messages
+                                    .last()
                                     .map(|m| m.timestamp.clone())
                                     .unwrap_or_default(),
                                 total_messages: file.messages.len(),
@@ -512,11 +507,7 @@ impl SessionManager {
 
     /// Append messages to a session file (creating the session if missing),
     /// then refresh the index entry (counts + last_activity + title fallback).
-    pub fn append_session_messages(
-        &mut self,
-        sid: &str,
-        msgs: Vec<SessionMessage>,
-    ) -> Result<()> {
+    pub fn append_session_messages(&mut self, sid: &str, msgs: Vec<SessionMessage>) -> Result<()> {
         let path = self.session_path(sid);
         let mut existing: Vec<SessionMessage> = if path.exists() {
             std::fs::read_to_string(&path)
@@ -591,23 +582,6 @@ impl SessionManager {
             .map(|m| m.role == "tool")
             .unwrap_or(false)
     }
-
-    /// Append render segments to the last assistant message (in-memory). Used
-    /// by the agent to backfill `observation` segments that only become
-    /// available after tool execution, when the assistant message carrying
-    /// `tool_calls` has already been persisted. Marks the session dirty so the
-    /// next flush writes the update.
-    pub fn append_last_assistant_segments(&mut self, segments: Vec<MessageSegment>) {
-        if segments.is_empty() {
-            return;
-        }
-        if let Some(last) = self.messages.iter_mut().rev().find(|m| m.role == "assistant") {
-            last.segments
-                .get_or_insert_with(Vec::new)
-                .extend(segments);
-            self.dirty_count += 1;
-        }
-    }
 }
 
 fn truncate_title(task: &str) -> String {
@@ -674,8 +648,10 @@ mod tests {
             }],
         );
         sm.add_message(SessionMessage::from_chat(&msg)).unwrap();
-        sm.add_message(SessionMessage::from_chat(&ChatMessage::tool_result("c1", "ok")))
-            .unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::tool_result(
+            "c1", "ok",
+        )))
+        .unwrap();
         assert!(sm.ended_mid_tool());
         let hist = sm.history_chat();
         assert!(hist.iter().any(|m| m.tool_calls.is_some()));
@@ -773,7 +749,8 @@ mod tests {
         let sm = SessionMessage::from_chat(&msg);
         // Should count both content and reasoning_content tokens.
         let content_only = estimate_tokens("hello world");
-        let with_reasoning = estimate_tokens("hello world") + estimate_tokens("I need to think about this carefully");
+        let with_reasoning = estimate_tokens("hello world")
+            + estimate_tokens("I need to think about this carefully");
         assert!(sm.tokens > content_only);
         assert_eq!(sm.tokens, with_reasoning);
     }
@@ -792,9 +769,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_message_tokens_ignore_reasoning() {
-        // Tool messages don't have reasoning_content normally, but even if set,
-        // we verify the field is preserved.
+    fn tool_message_tokens_include_content_and_tool_call_id() {
+        // Tool messages have no reasoning_content; the estimate counts the
+        // content AND the tool_call_id (parity with the Python estimator).
         let msg = ChatMessage {
             role: "tool".into(),
             content: "result data".into(),
@@ -803,7 +780,10 @@ mod tests {
             reasoning_content: None,
         };
         let sm = SessionMessage::from_chat(&msg);
-        assert_eq!(sm.tokens, estimate_tokens("result data"));
+        assert_eq!(
+            sm.tokens,
+            estimate_tokens("result data") + estimate_tokens("call_1")
+        );
     }
 
     #[test]
@@ -811,8 +791,10 @@ mod tests {
         let proj = tmp_project();
         let mut sm = SessionManager::new(&proj);
         sm.create_session("compact test", None).unwrap();
-        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("{\"key\": \"value\"}")))
-            .unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant(
+            "{\"key\": \"value\"}",
+        )))
+        .unwrap();
         sm.flush().unwrap();
 
         let id = sm.current_session_id.unwrap();
@@ -823,7 +805,10 @@ mod tests {
 
         let path = sm2.session_path(&id);
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("\n  "), "compact JSON should not have indentation");
+        assert!(
+            !raw.contains("\n  "),
+            "compact JSON should not have indentation"
+        );
         let file: SessionFile = serde_json::from_str(&raw).unwrap();
         assert_eq!(file.messages.len(), 2);
     }
@@ -834,19 +819,25 @@ mod tests {
         let mut sm = SessionManager::new(&proj);
         sm.create_session("task", None).unwrap();
 
-        let analysis = SessionMessage::from_chat(&ChatMessage::system("## Project Analysis\n2 .rs files, 1 .py file"));
+        let analysis = SessionMessage::from_chat(&ChatMessage::system(
+            "## Project Analysis\n2 .rs files, 1 .py file",
+        ));
         sm.add_message(analysis).unwrap();
         sm.flush().unwrap();
 
         let history = sm.history_chat();
-        assert!(history.iter().any(|m| m.role == "system" && m.content.contains("Project Analysis")));
+        assert!(history
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("Project Analysis")));
 
         // Reload from disk and verify system message is still in history.
         let id = sm.current_session_id.unwrap();
         let mut sm2 = SessionManager::new(&proj);
         sm2.switch_session(&id).unwrap();
         let history2 = sm2.history_chat();
-        assert!(history2.iter().any(|m| m.role == "system" && m.content.contains("Project Analysis")));
+        assert!(history2
+            .iter()
+            .any(|m| m.role == "system" && m.content.contains("Project Analysis")));
     }
 
     #[test]
@@ -857,8 +848,10 @@ mod tests {
 
         // Add messages below the batch threshold — should not write to disk.
         for i in 0..5 {
-            sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant(&format!("msg{}", i))))
-                .unwrap();
+            sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant(
+                &format!("msg{}", i),
+            )))
+            .unwrap();
         }
 
         // Force a flush and verify all messages are persisted.
@@ -932,172 +925,51 @@ mod tests {
         );
     }
 
-    /// The `session_v2.json` fixture demonstrates the additive `segments` field
-    /// (same `schema_version: 1` — the field is optional and non-breaking).
+    /// Legacy `session_v2.json` still carries a `segments` field from the old
+    /// schema; it must keep parsing (serde ignores unknown fields) and the field
+    /// must never be re-serialized.
     #[test]
-    fn schema_conformance_segments_fixture_roundtrips() {
+    fn legacy_segments_fixture_still_parses_and_is_dropped_on_write() {
         const FIXTURE: &str = include_str!("../../tests/fixtures/session_v2.json");
-        let file: SessionFile = serde_json::from_str(FIXTURE).expect("segments fixture must parse");
-
-        assert_eq!(file.schema_version, 1, "segments are additive; schema stays at 1");
+        let file: SessionFile = serde_json::from_str(FIXTURE).expect("legacy fixture must parse");
+        assert_eq!(file.schema_version, 1);
         assert_eq!(file.messages.len(), 3);
-
-        let segs = file.messages[1]
-            .segments
-            .as_ref()
-            .expect("assistant must carry segments");
-        assert_eq!(segs.len(), 4);
-        assert_eq!(segs[0].kind, "thinking");
-        assert_eq!(segs[0].content, "I should run a shell command");
-        assert_eq!(segs[0].created_at.as_deref(), Some("1700000002.001"));
-        assert_eq!(segs[1].kind, "thought");
-        assert_eq!(segs[1].content, "I'll create it.");
-        assert_eq!(segs[2].kind, "action");
-        assert_eq!(segs[2].name.as_deref(), Some("run_shell"));
-        assert_eq!(segs[2].content, r#"{"command":"echo hello"}"#);
-        assert_eq!(segs[3].kind, "observation");
-        assert_eq!(segs[3].content, "hello");
-
-        // user / tool messages must NOT carry segments (absent, not null).
-        assert!(file.messages[0].segments.is_none());
-        assert!(file.messages[2].segments.is_none());
-
-        // Round-trip stability.
-        let reserialized = serde_json::to_string(&file).unwrap();
-        let reparsed: SessionFile = serde_json::from_str(&reserialized).unwrap();
         assert_eq!(
-            reparsed.messages[1].segments.as_ref().unwrap().len(),
-            4
+            file.messages[1].tool_calls.as_ref().unwrap()[0].name,
+            "run_shell"
         );
-        assert_eq!(
-            reparsed.messages[1].segments.as_ref().unwrap()[2].name.as_deref(),
-            Some("run_shell")
+        // `segments` is no longer a field → dropped on re-serialization.
+        let raw = serde_json::to_string(&file).unwrap();
+        assert!(
+            !raw.contains("segments"),
+            "segments must not be re-persisted: {raw}"
         );
     }
 
     #[test]
-    fn segments_absent_when_not_set() {
+    fn persisted_messages_never_contain_segments() {
         let proj = tmp_project();
         let mut sm = SessionManager::new(&proj);
         let id = sm.create_session("t", None).unwrap();
-        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("hi")))
-            .unwrap();
+        sm.add_message(SessionMessage::from_chat(
+            &ChatMessage::assistant_with_tools(
+                "hi",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "run_shell".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+        ))
+        .unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::tool_result(
+            "c1", "out",
+        )))
+        .unwrap();
         sm.flush().unwrap();
 
         let raw = std::fs::read_to_string(sm.session_path(&id)).unwrap();
-        assert!(!raw.contains("segments"), "no segments field when None: {raw}");
-
-        let msgs = sm.read_session_messages(&id);
-        assert!(msgs[1].segments.is_none());
-    }
-
-    #[test]
-    fn append_last_assistant_segments_backfills() {
-        let proj = tmp_project();
-        let mut sm = SessionManager::new(&proj);
-        sm.create_session("t", None).unwrap();
-
-        let asst = SessionMessage::from_chat_with_segments(
-            &ChatMessage::assistant("planning"),
-            vec![MessageSegment {
-                kind: "thinking".into(),
-                content: "think".into(),
-                name: None,
-                created_at: Some("1.001".into()),
-            }],
-        );
-        sm.add_message(asst).unwrap();
-        sm.add_message(SessionMessage::from_chat(&ChatMessage::tool_result("c1", "out")))
-            .unwrap();
-
-        sm.append_last_assistant_segments(vec![MessageSegment {
-            kind: "observation".into(),
-            content: "out".into(),
-            name: None,
-            created_at: Some("1.002".into()),
-        }]);
-
-        let segs = sm.messages[1].segments.as_ref().unwrap();
-        assert_eq!(segs.len(), 2);
-        assert_eq!(segs[0].kind, "thinking");
-        assert_eq!(segs[1].kind, "observation");
-
-        // Flush persists the backfilled segments.
-        sm.flush().unwrap();
-        let read = sm.read_session_messages(&sm.current_session_id.clone().unwrap());
-        let read_segs = read[1].segments.as_ref().unwrap();
-        assert_eq!(read_segs.len(), 2);
-        assert_eq!(read_segs[1].content, "out");
-    }
-
-    #[test]
-    fn from_chat_with_segments_empty_is_none() {
-        let m = SessionMessage::from_chat_with_segments(&ChatMessage::assistant("hi"), vec![]);
-        assert!(m.segments.is_none(), "empty segment list collapses to None");
-    }
-
-    #[test]
-    fn append_last_assistant_segments_noop_when_no_assistant() {
-        let proj = tmp_project();
-        let mut sm = SessionManager::new(&proj);
-        sm.create_session("t", None).unwrap(); // only a user message
-        // Must not panic and must not mutate anything.
-        sm.append_last_assistant_segments(vec![MessageSegment {
-            kind: "observation".into(),
-            content: "x".into(),
-            name: None,
-            created_at: None,
-        }]);
-        assert!(sm.messages.iter().all(|m| m.segments.is_none()));
-    }
-
-    #[test]
-    fn append_last_assistant_segments_targets_last_assistant() {
-        let proj = tmp_project();
-        let mut sm = SessionManager::new(&proj);
-        sm.create_session("t", None).unwrap();
-        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("first")))
-            .unwrap();
-        sm.add_message(SessionMessage::from_chat(&ChatMessage::user("again")))
-            .unwrap();
-        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("second")))
-            .unwrap();
-
-        sm.append_last_assistant_segments(vec![MessageSegment {
-            kind: "observation".into(),
-            content: "only-second".into(),
-            name: None,
-            created_at: None,
-        }]);
-
-        // "first" assistant (index 1) stays empty; "second" (index 3) gets it.
-        assert!(sm.messages[1].segments.is_none());
-        let segs = sm.messages[3].segments.as_ref().unwrap();
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].content, "only-second");
-    }
-
-    #[test]
-    fn segments_do_not_leak_into_llm_history() {
-        let proj = tmp_project();
-        let mut sm = SessionManager::new(&proj);
-        sm.create_session("t", None).unwrap();
-        let msg = SessionMessage::from_chat_with_segments(
-            &ChatMessage::assistant("hi"),
-            vec![MessageSegment {
-                kind: "thought".into(),
-                content: "hi".into(),
-                name: None,
-                created_at: None,
-            }],
-        );
-        sm.add_message(msg).unwrap();
-
-        // `history_chat` maps through `to_chat`, which must drop `segments`
-        // (they are UI-only and must not pollute the LLM context).
-        let hist = sm.history_chat();
-        let asst = hist.iter().find(|m| m.role == "assistant").unwrap();
-        assert_eq!(asst.content, "hi");
+        assert!(!raw.contains("segments"), "no segments on disk: {raw}");
     }
 
     #[test]
@@ -1109,35 +981,67 @@ mod tests {
         assert!(ms.parse::<u32>().is_ok());
     }
 
+    // ── from_chat token estimate parity (mirrors Python
+    //    `tests/test_context_compaction.py::TestEstimateTokensIntegration`) ──
+
     #[test]
-    fn segment_roundtrip_through_disk_omits_name_when_none() {
-        let proj = tmp_project();
-        let mut sm = SessionManager::new(&proj);
-        sm.create_session("t", None).unwrap();
-        sm.add_message(SessionMessage::from_chat_with_segments(
-            &ChatMessage::assistant("hi"),
-            vec![MessageSegment {
-                kind: "thought".into(),
-                content: "hi".into(),
-                name: None,
-                created_at: None,
+    fn from_chat_tokens_include_tool_calls() {
+        let plain = SessionMessage::from_chat(&ChatMessage::assistant("hello"));
+        let with_calls = SessionMessage::from_chat(&ChatMessage::assistant_with_tools(
+            "hello",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "run_shell".into(),
+                arguments: format!("{{\"path\":\"{}\"}}", "a".repeat(200)),
             }],
-        ))
-        .unwrap();
-        sm.flush().unwrap();
+        ));
+        assert!(
+            with_calls.tokens > plain.tokens,
+            "tool_calls tokens ({}) must exceed plain ({})",
+            with_calls.tokens,
+            plain.tokens
+        );
+    }
 
-        let id = sm.current_session_id.clone().unwrap();
-        let raw = std::fs::read_to_string(sm.session_path(&id)).unwrap();
-        // Optional fields must be omitted, not serialized as null.
-        assert!(raw.contains(r#""type":"thought""#), "segment type present: {raw}");
-        assert!(!raw.contains(r#""name":null"#), "name must be omitted when None: {raw}");
-        assert!(!raw.contains(r#""created_at":null"#), "created_at must be omitted when None: {raw}");
+    #[test]
+    fn from_chat_tokens_include_tool_call_id() {
+        let mut no_id = ChatMessage::tool_result("", "result".to_string());
+        no_id.tool_call_id = None;
+        let with_id = ChatMessage::tool_result("call_some_id_here", "result".to_string());
+        assert!(
+            SessionMessage::from_chat(&with_id).tokens > SessionMessage::from_chat(&no_id).tokens,
+            "tool_call_id must add tokens"
+        );
+    }
 
-        let read = sm.read_session_messages(&id);
-        let seg = &read[1].segments.as_ref().unwrap()[0];
-        assert_eq!(seg.kind, "thought");
-        assert_eq!(seg.name, None);
-        assert_eq!(seg.created_at, None);
+    #[test]
+    fn from_chat_tokens_include_reasoning_content() {
+        let mut base = ChatMessage::assistant("ok");
+        let plain = SessionMessage::from_chat(&base);
+        base.reasoning_content = Some("Let me think".repeat(50));
+        let with_reasoning = SessionMessage::from_chat(&base);
+        assert!(
+            with_reasoning.tokens > plain.tokens,
+            "reasoning_content must add tokens"
+        );
+    }
+
+    #[test]
+    fn tool_call_only_assistant_has_nonzero_tokens() {
+        // Regression: the estimate used to ignore tool_calls, so an assistant
+        // message carrying only tool calls reported `tokens = 0`.
+        let m = SessionMessage::from_chat(&ChatMessage::assistant_with_tools(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "navigate".into(),
+                arguments: "{\"url\":\"https://example.com\"}".into(),
+            }],
+        ));
+        assert!(
+            m.tokens > 0,
+            "tool-call-only assistant must not be 0 tokens"
+        );
     }
 
     // ── SESSION_FFI 存储方法 ──────────────────────────────────────────
@@ -1147,7 +1051,10 @@ mod tests {
         let proj = tmp_project();
         let mut sm = SessionManager::new(&proj);
         sm.ensure_session("s1", "My Session").unwrap();
-        assert!(sm.session_path("s1").exists(), "session file must be created");
+        assert!(
+            sm.session_path("s1").exists(),
+            "session file must be created"
+        );
         assert_eq!(sm.load_index()["s1"].title, "My Session");
 
         // Idempotent re-ensure: bump last_activity, keep title on empty.
@@ -1155,8 +1062,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         sm.ensure_session("s1", "").unwrap();
         let index2 = sm.load_index();
-        assert!(index2["s1"].last_activity >= first, "last_activity must bump");
-        assert_eq!(index2["s1"].title, "My Session", "empty title must not clobber");
+        assert!(
+            index2["s1"].last_activity >= first,
+            "last_activity must bump"
+        );
+        assert_eq!(
+            index2["s1"].title, "My Session",
+            "empty title must not clobber"
+        );
     }
 
     #[test]
@@ -1199,7 +1112,10 @@ mod tests {
         assert_eq!(msgs[0].content, "hello");
         let index = sm.load_index();
         assert_eq!(index["s1"].total_messages, 2);
-        assert_eq!(index["s1"].title, "hello", "title falls back to first user msg");
+        assert_eq!(
+            index["s1"].title, "hello",
+            "title falls back to first user msg"
+        );
     }
 
     #[test]

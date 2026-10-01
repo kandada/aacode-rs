@@ -21,6 +21,10 @@ pub struct TodoStore {
     next_id: std::sync::atomic::AtomicUsize,
     /// Returns the current session id, or None if no session active.
     get_session_id: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// Serializes read-modify-write cycles. Parallel tool calls (the model can
+    /// issue several `add_todo_item` in one turn) otherwise clobber each other's
+    /// writes and silently lose items.
+    lock: std::sync::Mutex<()>,
 }
 
 impl TodoStore {
@@ -56,6 +60,7 @@ impl TodoStore {
             dir,
             next_id: std::sync::atomic::AtomicUsize::new(max + 1),
             get_session_id: resolver,
+            lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -83,7 +88,12 @@ impl TodoStore {
     }
 
     fn add(&self, description: &str, priority: &str, category: &str) -> String {
-        let id = format!("t{}", self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let id = format!(
+            "t{}",
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
         let mut content = self.read();
         content.push_str(&format!(
             "- [ ] [#{id}] ({priority}/{category}): {description}\n"
@@ -93,6 +103,7 @@ impl TodoStore {
     }
 
     fn mark_done(&self, todo_id: Option<&str>, pattern: Option<&str>) -> bool {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let content = self.read();
         let (new_content, changed) = mark_in_content(&content, todo_id, pattern);
         if changed {
@@ -102,6 +113,7 @@ impl TodoStore {
     }
 
     fn update(&self, old_pattern: &str, new_desc: &str) -> bool {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let content = self.read();
         let mut out = String::new();
         let mut changed = false;
@@ -154,10 +166,7 @@ impl TodoStore {
                 if let Some(caps) = re.captures(t) {
                     pending.push((caps[1].to_string(), caps[2].to_string()));
                 } else {
-                    let desc = t
-                        .replacen("- [ ]", "", 1)
-                        .trim()
-                        .to_string();
+                    let desc = t.replacen("- [ ]", "", 1).trim().to_string();
                     let short: String = desc.chars().take(80).collect();
                     pending.push((String::new(), short));
                 }
@@ -242,7 +251,7 @@ impl Tool for AddTodoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "add_todo_item",
-            "Add a todo item. Returns a todo_id (e.g. t1) for later mark_todo_completed(todo_id=...).",
+            "Add a todo item (for multi-step work you want to track across turns). Returns a todo_id (e.g. t1) for later mark_todo_completed(todo_id=...). Don't add a todo just to complete it immediately in the same step.",
             vec![
                 ToolParameter::new("description", ParamType::String, true, "Todo description", &["item", "task", "todo", "title"]),
                 ToolParameter::new("priority", ParamType::String, false, "low|medium|high", &[]),
@@ -251,19 +260,30 @@ impl Tool for AddTodoTool {
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let desc = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let desc = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if desc.is_empty() {
             return Ok(json!({"success": false, "error": "missing description"}).to_string());
         }
-        let priority = args.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
-        let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("Task");
+        let priority = args
+            .get("priority")
+            .and_then(|v| v.as_str())
+            .unwrap_or("medium");
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Task");
         let store = self.store.clone();
         let desc_owned = desc.to_string();
         let priority_owned = priority.to_string();
         let category_owned = category.to_string();
-        let id = tokio::task::spawn_blocking(move || store.add(&desc_owned, &priority_owned, &category_owned))
-            .await
-            .unwrap();
+        let id = tokio::task::spawn_blocking(move || {
+            store.add(&desc_owned, &priority_owned, &category_owned)
+        })
+        .await
+        .unwrap();
         Ok(json!({
             "success": true,
             "todo_id": id,
@@ -301,7 +321,10 @@ impl Tool for MarkTodoTool {
             } else {
                 format!("provide todo_id or item_pattern\n\n{hint}")
             };
-            return Ok(json!({"success": false, "error": err, "todo_id": id, "item_pattern": pat}).to_string());
+            return Ok(
+                json!({"success": false, "error": err, "todo_id": id, "item_pattern": pat})
+                    .to_string(),
+            );
         }
         let store = self.store.clone();
         let id_owned = id.map(|s| s.to_string());
@@ -331,7 +354,10 @@ impl Tool for UpdateTodoTool {
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let old = args.get("old_pattern").and_then(|v| v.as_str()).unwrap_or("");
+        let old = args
+            .get("old_pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let new = args.get("new_item").and_then(|v| v.as_str()).unwrap_or("");
         let store = self.store.clone();
         let old = old.to_string();
@@ -349,14 +375,22 @@ pub struct TodoSummaryTool {
 #[async_trait::async_trait]
 impl Tool for TodoSummaryTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema::new("get_todo_summary", "Get a summary of the todo list.", vec![])
+        ToolSchema::new(
+            "get_todo_summary",
+            "Get a summary of the todo list.",
+            vec![],
+        )
     }
     async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
         let store = self.store.clone();
         let (total, done, pending) = tokio::task::spawn_blocking(move || store.summary())
             .await
             .unwrap();
-        let rate = if total > 0 { (done as f64 / total as f64) * 100.0 } else { 0.0 };
+        let rate = if total > 0 {
+            (done as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
         Ok(json!({
             "success": true,
             "total_todos": total,
@@ -405,14 +439,20 @@ mod tests {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
         let add = AddTodoTool { store: s.clone() };
-        let out = add.call(&json!({"description": "write tests"}), &cancel).await.unwrap();
+        let out = add
+            .call(&json!({"description": "write tests"}), &cancel)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let id = v["todo_id"].as_str().unwrap().to_string();
         assert_eq!(id, "t1");
 
         let mark = MarkTodoTool { store: s.clone() };
         let out = mark.call(&json!({"todo_id": id}), &cancel).await.unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["success"],
+            true
+        );
 
         let sum = TodoSummaryTool { store: s.clone() };
         let out = sum.call(&json!({}), &cancel).await.unwrap();
@@ -421,11 +461,35 @@ mod tests {
         assert_eq!(v["completed_todos"], 1);
     }
 
+    #[test]
+    fn concurrent_adds_do_not_lose_items() {
+        let (s, _) = store();
+        let mut handles = Vec::new();
+        for i in 0..12 {
+            let s = s.clone();
+            handles.push(std::thread::spawn(move || {
+                s.add(&format!("item {i}"), "medium", "test")
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let content = std::fs::read_to_string(s.file_path()).unwrap();
+        let n = content
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- [ ]"))
+            .count();
+        assert_eq!(n, 12, "all concurrent adds must persist:\n{content}");
+    }
+
     #[tokio::test]
     async fn mark_by_pattern() {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: s.clone() }.call(&json!({"description": "implement login"}), &cancel).await.unwrap();
+        AddTodoTool { store: s.clone() }
+            .call(&json!({"description": "implement login"}), &cancel)
+            .await
+            .unwrap();
         assert!(s.mark_done(None, Some("login")));
     }
 
@@ -433,7 +497,10 @@ mod tests {
     async fn missing_id_gives_hint() {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: s.clone() }.call(&json!({"description": "test"}), &cancel).await.unwrap();
+        AddTodoTool { store: s.clone() }
+            .call(&json!({"description": "test"}), &cancel)
+            .await
+            .unwrap();
         let mark = MarkTodoTool { store: s.clone() };
         let out = mark.call(&json!({}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -444,11 +511,15 @@ mod tests {
 
     #[tokio::test]
     async fn session_isolation() {
-        let d = std::env::temp_dir().join(format!("aacode_sess_todo_{}", uuid::Uuid::new_v4().simple()));
+        let d = std::env::temp_dir().join(format!(
+            "aacode_sess_todo_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&d).unwrap();
 
         // Simulate session switching via resolver.
-        let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(Some("sess_a".to_string())));
+        let session_id: Arc<Mutex<Option<String>>> =
+            Arc::new(Mutex::new(Some("sess_a".to_string())));
         let rid = session_id.clone();
         let store = Arc::new(TodoStore::with_session_resolver(
             &d,
@@ -456,18 +527,30 @@ mod tests {
         ));
 
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: store.clone() }.call(&json!({"description": "task a"}), &cancel).await.unwrap();
+        AddTodoTool {
+            store: store.clone(),
+        }
+        .call(&json!({"description": "task a"}), &cancel)
+        .await
+        .unwrap();
 
         // Switch session.
         *session_id.lock().unwrap() = Some("sess_b".to_string());
 
-        let out = AddTodoTool { store: store.clone() }.call(&json!({"description": "task b"}), &cancel).await.unwrap();
+        let out = AddTodoTool {
+            store: store.clone(),
+        }
+        .call(&json!({"description": "task b"}), &cancel)
+        .await
+        .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["todo_id"], "t2"); // next_id is global (cross-session)
 
         // Back to sess_a, should see the t1 from earlier.
         *session_id.lock().unwrap() = Some("sess_a".to_string());
-        let sum = TodoSummaryTool { store: store.clone() };
+        let sum = TodoSummaryTool {
+            store: store.clone(),
+        };
         let out = sum.call(&json!({}), &cancel).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total_todos"], 1);
@@ -477,11 +560,22 @@ mod tests {
     async fn update_item() {
         let (s, _) = store();
         let cancel = AtomicBool::new(false);
-        AddTodoTool { store: s.clone() }.call(&json!({"description": "old desc"}), &cancel).await.unwrap();
+        AddTodoTool { store: s.clone() }
+            .call(&json!({"description": "old desc"}), &cancel)
+            .await
+            .unwrap();
         let upd = UpdateTodoTool { store: s.clone() };
         assert!(serde_json::from_str::<Value>(
-            &upd.call(&json!({"old_pattern": "old desc", "new_item": "new desc"}), &cancel).await.unwrap()
-        ).unwrap()["success"].as_bool().unwrap());
+            &upd.call(
+                &json!({"old_pattern": "old desc", "new_item": "new desc"}),
+                &cancel
+            )
+            .await
+            .unwrap()
+        )
+        .unwrap()["success"]
+            .as_bool()
+            .unwrap());
         assert!(s.read().contains("new desc"));
     }
 }

@@ -52,7 +52,9 @@ pub async fn run_sub_agent(
     sub_cfg.max_iterations = config.max_iterations.min(15);
 
     let loop_ = ReactLoop::new(llm, registry, &sub_cfg, native);
-    let result = loop_.run(messages, &mut sub_session, emitter, cancel).await?;
+    let result = loop_
+        .run(messages, &mut sub_session, emitter, cancel)
+        .await?;
 
     match result.status {
         RunStatus::Completed => Ok(result.final_text),
@@ -111,8 +113,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
-        let out =
-            run_sub_agent("code", "do x", &llm, &reg, &cfg, &dir, &sink, &cancel).await.unwrap();
+        let out = run_sub_agent("code", "do x", &llm, &reg, &cfg, &dir, &sink, &cancel)
+            .await
+            .unwrap();
         assert_eq!(out, "sub done");
     }
 }

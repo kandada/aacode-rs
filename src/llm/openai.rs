@@ -161,8 +161,7 @@ mod tests {
                     ))
                 } else {
                     self.sent = true;
-                    let data =
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
+                    let data = b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n";
                     let n = data.len().min(buf.len());
                     buf[..n].copy_from_slice(&data[..n]);
                     Ok(n)
@@ -188,10 +187,7 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let r = parse_openai_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel);
-        assert!(
-            r.is_err(),
-            "all-malformed chunks must produce an error"
-        );
+        assert!(r.is_err(), "all-malformed chunks must produce an error");
         let msg = format!("{}", r.err().unwrap());
         assert!(msg.contains("malformed") || msg.contains("parseable"));
     }
@@ -225,9 +221,7 @@ mod tests {
             .expect("thinking seg missing");
         let thought_seg_pos = lines
             .iter()
-            .position(|l| {
-                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#)
-            })
+            .position(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#))
             .expect("thought seg missing");
 
         assert!(
@@ -290,7 +284,8 @@ mod tests {
                         "mid-stream disconnect",
                     ));
                 }
-                let data = b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial\"}}]}\n\n";
+                let data =
+                    b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial\"}}]}\n\n";
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
                 Ok(n)
@@ -328,9 +323,7 @@ mod tests {
         let lines = sink.lines();
         let thinking_seg_line = lines
             .iter()
-            .find(|l| {
-                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#)
-            })
+            .find(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#))
             .expect("thinking seg missing");
         let seg_json: serde_json::Value =
             serde_json::from_str(thinking_seg_line).expect("invalid JSON");
@@ -338,9 +331,7 @@ mod tests {
 
         let accumulated_deltas: String = lines
             .iter()
-            .filter(|l| {
-                l.contains(r#""type":"delta""#) && l.contains(r#""seg":"thinking""#)
-            })
+            .filter(|l| l.contains(r#""type":"delta""#) && l.contains(r#""seg":"thinking""#))
             .map(|l| {
                 let v: serde_json::Value = serde_json::from_str(l).unwrap();
                 v["content"].as_str().unwrap().to_string()
@@ -369,16 +360,12 @@ mod tests {
         let lines = sink.lines();
         let thinking_seg_count = lines
             .iter()
-            .filter(|l| {
-                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#)
-            })
+            .filter(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thinking""#))
             .count();
         assert_eq!(thinking_seg_count, 1);
         let thought_seg_count = lines
             .iter()
-            .filter(|l| {
-                l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#)
-            })
+            .filter(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#))
             .count();
         assert_eq!(thought_seg_count, 1);
     }

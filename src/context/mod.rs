@@ -81,7 +81,14 @@ impl ContextManager {
         use std::collections::BTreeMap;
         let mut ext_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut top_entries: Vec<String> = Vec::new();
-        let exclude = [".git", ".aacode", "node_modules", "target", "__pycache__", ".venv"];
+        let exclude = [
+            ".git",
+            ".aacode",
+            "node_modules",
+            "target",
+            "__pycache__",
+            ".venv",
+        ];
 
         if let Ok(rd) = std::fs::read_dir(&self.project_path) {
             for e in rd.flatten() {
@@ -144,7 +151,13 @@ impl ContextManager {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -183,7 +196,9 @@ mod tests {
     fn large_output_archived() {
         let d = tmp();
         let cm = ContextManager::new(&d);
-        let path = cm.save_large_output("big content", "run_shell_output").unwrap();
+        let path = cm
+            .save_large_output("big content", "run_shell_output")
+            .unwrap();
         assert!(std::path::Path::new(&path).exists());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "big content");
     }
@@ -198,5 +213,35 @@ mod tests {
         let s = cm.analyze_project_structure();
         assert!(s.contains("main.rs"));
         assert!(s.contains(".rs:") || s.contains("rs:"));
+    }
+
+    #[test]
+    fn large_output_sanitizes_path_hint() {
+        let d = tmp();
+        let cm = ContextManager::new(&d);
+        let path = cm.save_large_output("payload", "../../etc/passwd").unwrap();
+        let p = std::path::Path::new(&path);
+        // Must stay inside `.aacode/context` (no traversal).
+        assert!(p.starts_with(cm.context_dir()));
+        let fname = p.file_name().unwrap().to_string_lossy();
+        assert!(!fname.contains('/') && !fname.contains(".."));
+        assert!(fname.starts_with("______etc_passwd_"));
+    }
+
+    #[test]
+    fn structure_excludes_heavy_dirs() {
+        let d = tmp();
+        std::fs::create_dir_all(d.join("node_modules")).unwrap();
+        std::fs::write(d.join("node_modules/evil.js"), "x").unwrap();
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::write(d.join(".git/config"), "x").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("main.rs"), "fn main(){}").unwrap();
+        let cm = ContextManager::new(&d);
+        let s = cm.analyze_project_structure();
+        assert!(s.contains("main.rs"));
+        assert!(s.contains("src/"));
+        assert!(!s.contains("node_modules"));
+        assert!(!s.contains(".git"));
     }
 }

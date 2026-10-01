@@ -54,7 +54,9 @@ impl MockLlm {
             for mut request in server.incoming_requests() {
                 let mut buf = String::new();
                 let _ = request.as_reader().read_to_string(&mut buf);
-                let body = queue.next().unwrap_or_else(|| "data: [DONE]\n\n".to_string());
+                let body = queue
+                    .next()
+                    .unwrap_or_else(|| "data: [DONE]\n\n".to_string());
                 let header =
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
                         .unwrap();
@@ -105,7 +107,10 @@ async fn execute_produces_user_and_assistant_only() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task("analyze the project", None, &sink, &cancel).await.unwrap();
+    let res = rt
+        .run_task("analyze the project", None, &sink, &cancel)
+        .await
+        .unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
 
     let sid = extract_session_id(&sink);
@@ -115,14 +120,17 @@ async fn execute_produces_user_and_assistant_only() {
 
     // Session contains only user + assistant (no extra system messages).
     // init.md is now in messages[0] (not persisted), project analysis is removed.
-    assert!(
-        msgs.iter().any(|m| m.role == "user" && m.content.contains("analyze the project"))
-    );
+    assert!(msgs
+        .iter()
+        .any(|m| m.role == "user" && m.content.contains("analyze the project")));
     assert!(msgs.iter().any(|m| m.role == "assistant"));
 
     // No dynamic system messages should be persisted.
     let system_count = msgs.iter().filter(|m| m.role == "system").count();
-    assert_eq!(system_count, 0, "no system messages should be persisted (found {system_count})");
+    assert_eq!(
+        system_count, 0,
+        "no system messages should be persisted (found {system_count})"
+    );
 }
 
 #[tokio::test]
@@ -138,13 +146,19 @@ async fn consecutive_tasks_preserve_history() {
 
     // Task 1
     let sink1 = CollectingSink::new(false);
-    let res1 = rt.run_task("task one", None, &sink1, &cancel).await.unwrap();
+    let res1 = rt
+        .run_task("task one", None, &sink1, &cancel)
+        .await
+        .unwrap();
     assert_eq!(format!("{:?}", res1.status), "Completed");
     let sid = extract_session_id(&sink1);
 
     // Task 2 — continues the same session
     let sink2 = CollectingSink::new(false);
-    let res2 = rt.run_task("task two", Some(&sid), &sink2, &cancel).await.unwrap();
+    let res2 = rt
+        .run_task("task two", Some(&sid), &sink2, &cancel)
+        .await
+        .unwrap();
     assert_eq!(format!("{:?}", res2.status), "Completed");
 
     // Read final session state.
@@ -153,15 +167,24 @@ async fn consecutive_tasks_preserve_history() {
 
     // Session should have messages from both tasks.
     let user_count = msgs.iter().filter(|m| m.role == "user").count();
-    assert!(user_count >= 2, "session should have >=2 user messages, got {user_count}");
+    assert!(
+        user_count >= 2,
+        "session should have >=2 user messages, got {user_count}"
+    );
 
     // Each task should produce an assistant response.
     let assistant_count = msgs.iter().filter(|m| m.role == "assistant").count();
-    assert!(assistant_count >= 2, "session should have >=2 assistant messages, got {assistant_count}");
+    assert!(
+        assistant_count >= 2,
+        "session should have >=2 assistant messages, got {assistant_count}"
+    );
 
     // No dynamic system messages should be injected into the session.
     let system_count = msgs.iter().filter(|m| m.role == "system").count();
-    assert_eq!(system_count, 0, "no system messages should be persisted (found {system_count})");
+    assert_eq!(
+        system_count, 0,
+        "no system messages should be persisted (found {system_count})"
+    );
 
     // Task 1 messages must appear before task 2's user message.
     let last_task1_user = msgs
@@ -259,8 +282,8 @@ fn compact_view_prefix_stable_within_call() {
 #[test]
 fn system_prompt_includes_init_md_not_analysis() {
     use aacode_rs::agent::MainAgent;
-    use aacode_rs::tools::ShellBackend;
     use aacode_rs::tools::backend::NativeShell;
+    use aacode_rs::tools::ShellBackend;
     use std::sync::Arc;
 
     let proj = tmp_project();
@@ -280,7 +303,10 @@ fn system_prompt_includes_init_md_not_analysis() {
     // Project analysis still exists as a method but is no longer called
     // by execute().
     let analysis = ctx.analyze_project_structure();
-    assert!(!analysis.is_empty(), "analyze_project_structure should still work");
+    assert!(
+        !analysis.is_empty(),
+        "analyze_project_structure should still work"
+    );
 
     // Verified by main_agent.rs unit test:
     //   system_prompt_has_static_content — init IS in build_system_prompt()

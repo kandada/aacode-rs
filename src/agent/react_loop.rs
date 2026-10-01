@@ -10,10 +10,10 @@
 use crate::agent::compact::{build_compact_view_cached, estimate_messages_tokens, CompactCache};
 use crate::config::AgentConfig;
 use crate::error::{AacodeError, Result};
-use crate::llm::types::{ChatMessage, LlmResponse, ToolCall};
+use crate::llm::types::{ChatMessage, ToolCall};
 use crate::llm::LlmClient;
-use crate::session::{now_iso_ms, MessageSegment, SessionManager, SessionMessage};
-use crate::stream::{observation_display, CollectingSink, EventSink};
+use crate::session::{SessionManager, SessionMessage};
+use crate::stream::{CollectingSink, EventSink};
 use crate::tools::ToolRegistry;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -134,7 +134,10 @@ impl<'a> ReactLoop<'a> {
                 crate::agent::sanitize::sanitize_history(view.to_mut());
             }
 
-            let resp = match self.chat_with_retry(&view, emitter, cancel, &cancel_notify).await {
+            let resp = match self
+                .chat_with_retry(&view, emitter, cancel, &cancel_notify)
+                .await
+            {
                 Ok(r) => r,
                 Err(AacodeError::Cancelled) => {
                     emitter.error("cancelled");
@@ -171,8 +174,7 @@ impl<'a> ReactLoop<'a> {
                         reasoning_content: resp.reasoning_content.clone(),
                     };
                     messages.push(assistant.clone());
-                    let segs = segments_from_response(&resp);
-                    let _ = session.add_message(SessionMessage::from_chat_with_segments(&assistant, segs));
+                    let _ = session.add_message(SessionMessage::from_chat(&assistant));
                     let cont = ChatMessage::user("continue");
                     messages.push(cont.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&cont));
@@ -187,11 +189,9 @@ impl<'a> ReactLoop<'a> {
                     reasoning_content: resp.reasoning_content.clone(),
                 };
                 messages.push(assistant.clone());
-                let segs = segments_from_response(&resp);
-                let _ = session.add_message(SessionMessage::from_chat_with_segments(&assistant, segs));
+                let _ = session.add_message(SessionMessage::from_chat(&assistant));
                 // Flush before the terminal event so a host re-reading the
-                // session right after `done` sees the final assistant message
-                // and its segments (previously `done` preceded the flush).
+                // session right after `done` sees the final assistant message.
                 let _ = session.flush();
                 emitter.done_result(&session_id, "completed", iteration + 1, &last_text);
                 return Ok(RunResult {
@@ -210,12 +210,12 @@ impl<'a> ReactLoop<'a> {
             }
 
             // Append the assistant message carrying tool_calls.
-            let assistant = ChatMessage::assistant_with_tools(resp.text.clone(), resp.tool_calls.clone());
+            let assistant =
+                ChatMessage::assistant_with_tools(resp.text.clone(), resp.tool_calls.clone());
             let mut assistant_msg = assistant.clone();
             assistant_msg.reasoning_content = resp.reasoning_content.clone();
             messages.push(assistant_msg.clone());
-            let segs = segments_from_response(&resp);
-            let _ = session.add_message(SessionMessage::from_chat_with_segments(&assistant_msg, segs));
+            let _ = session.add_message(SessionMessage::from_chat(&assistant_msg));
 
             // Execute tool calls.
             let tool_count = resp.tool_calls.len();
@@ -224,22 +224,27 @@ impl<'a> ReactLoop<'a> {
                 let cancel_arc = Arc::new(AtomicBool::new(false));
                 let cancel_ref = cancel as &AtomicBool; // reference from outer scope
 
-                let futures: Vec<_> = resp.tool_calls.iter().map(|tc| {
-                    let name = tc.name.clone();
-                    let args = tc.parsed_args();
-                    let cancel = cancel_arc.clone();
-                    async move {
-                        if cancel_ref.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
-                            return (tc.id.clone(), tc.name.clone(), "cancelled".to_string());
+                let futures: Vec<_> = resp
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let name = tc.name.clone();
+                        let args = tc.parsed_args();
+                        let cancel = cancel_arc.clone();
+                        async move {
+                            if cancel_ref.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
+                                return (tc.id.clone(), tc.name.clone(), "cancelled".to_string());
+                            }
+                            let obs = self
+                                .execute_with_retry(&name, args, emitter, cancel.as_ref())
+                                .await;
+                            (tc.id.clone(), tc.name.clone(), obs)
                         }
-                        let obs = self.execute_with_retry(&name, args, emitter, cancel.as_ref()).await;
-                        (tc.id.clone(), tc.name.clone(), obs)
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 let results = join_all(futures).await;
 
-                let mut observation_segments = Vec::new();
                 for (tc_id, tc_name, observation) in results {
                     if cancel.load(Ordering::SeqCst) {
                         emitter.error("cancelled");
@@ -250,29 +255,26 @@ impl<'a> ReactLoop<'a> {
                         });
                     }
                     if tc_name == "fetch_url" {
-                        let url = resp.tool_calls.iter()
+                        let url = resp
+                            .tool_calls
+                            .iter()
                             .find(|tc| tc.id == tc_id)
-                            .and_then(|tc| tc.parsed_args().get("url")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string()))
+                            .and_then(|tc| {
+                                tc.parsed_args()
+                                    .get("url")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            })
                             .unwrap_or_default();
                         stale.record_fetch(&url, &observation);
                     }
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
-                    observation_segments.push(MessageSegment {
-                        kind: "observation".into(),
-                        content: observation_display(&observation, self.config.limits.display_preview_chars),
-                        name: None,
-                        created_at: Some(now_iso_ms()),
-                    });
                     let tool_msg = ChatMessage::tool_result(tc_id, observation);
                     messages.push(tool_msg.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
                 }
-                session.append_last_assistant_segments(observation_segments);
             } else {
                 // Single tool: sequential path
-                let mut observation_segments = Vec::new();
                 for tc in &resp.tool_calls {
                     if cancel.load(Ordering::SeqCst) {
                         emitter.error("cancelled");
@@ -283,26 +285,23 @@ impl<'a> ReactLoop<'a> {
                         });
                     }
                     let args = tc.parsed_args();
-                    let observation = self.execute_with_retry(&tc.name, args, emitter, cancel).await;
+                    let observation = self
+                        .execute_with_retry(&tc.name, args, emitter, cancel)
+                        .await;
                     if tc.name == "fetch_url" {
-                        let url = tc.parsed_args().get("url")
+                        let url = tc
+                            .parsed_args()
+                            .get("url")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
                         stale.record_fetch(&url, &observation);
                     }
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
-                    observation_segments.push(MessageSegment {
-                        kind: "observation".into(),
-                        content: observation_display(&observation, self.config.limits.display_preview_chars),
-                        name: None,
-                        created_at: Some(now_iso_ms()),
-                    });
                     let tool_msg = ChatMessage::tool_result(tc.id.clone(), observation);
                     messages.push(tool_msg.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
                 }
-                session.append_last_assistant_segments(observation_segments);
             }
 
             // Context growth check (informational; compact view is built each iter).
@@ -310,7 +309,12 @@ impl<'a> ReactLoop<'a> {
         }
 
         let _ = session.flush();
-        emitter.done_result(&session_id, "max_iterations", self.config.max_iterations, &last_text);
+        emitter.done_result(
+            &session_id,
+            "max_iterations",
+            self.config.max_iterations,
+            &last_text,
+        );
         Ok(RunResult {
             status: RunStatus::MaxIterations,
             iterations: self.config.max_iterations,
@@ -351,7 +355,9 @@ impl<'a> ReactLoop<'a> {
                 };
                 (r, Some(b))
             } else {
-                let fut = self.llm.chat_stream(view, &self.native_tools, emitter, cancel);
+                let fut = self
+                    .llm
+                    .chat_stream(view, &self.native_tools, emitter, cancel);
                 let r = tokio::select! {
                     r = fut => r,
                     _ = cancel_checker(cancel, cancel_notify) => Err(AacodeError::Cancelled),
@@ -422,7 +428,16 @@ impl<'a> ReactLoop<'a> {
             if cancel.load(Ordering::SeqCst) {
                 return "cancelled".to_string();
             }
-            let obs = self.tools.execute(name, args.clone(), cancel).await;
+            // Race the tool against cancellation so a long/blocking tool (e.g.
+            // a 60s `run_shell`) does not delay a cancel. The tool future is
+            // dropped on cancel; a `spawn_blocking` command may finish in the
+            // background but the agent stops promptly (and releases the session
+            // guard). The local Notify is never notified → 1s polling fallback.
+            let notify = Notify::new();
+            let obs = tokio::select! {
+                obs = self.tools.execute(name, args.clone(), cancel) => obs,
+                _ = cancel_checker(cancel, &notify) => return "cancelled".to_string(),
+            };
             let lower = obs.to_lowercase();
             let retryable = lower.contains("timeout")
                 || lower.contains("timed out")
@@ -436,41 +451,6 @@ impl<'a> ReactLoop<'a> {
         }
         last
     }
-}
-
-/// Build the persisted render segments for one assistant turn, mirroring the
-/// live `seg_content` stream order: `thinking` (reasoning), `thought` (text),
-/// `action` (tool calls, with `name`). The `observation` segment is backfilled
-/// after tool execution via `SessionManager::append_last_assistant_segments`.
-fn segments_from_response(resp: &LlmResponse) -> Vec<MessageSegment> {
-    let mut segs = Vec::new();
-    if let Some(rc) = &resp.reasoning_content {
-        if !rc.is_empty() {
-            segs.push(MessageSegment {
-                kind: "thinking".into(),
-                content: rc.clone(),
-                name: None,
-                created_at: Some(now_iso_ms()),
-            });
-        }
-    }
-    if !resp.text.is_empty() {
-        segs.push(MessageSegment {
-            kind: "thought".into(),
-            content: resp.text.clone(),
-            name: None,
-            created_at: Some(now_iso_ms()),
-        });
-    }
-    for tc in &resp.tool_calls {
-        segs.push(MessageSegment {
-            kind: "action".into(),
-            content: tc.arguments.clone(),
-            name: Some(tc.name.clone()),
-            created_at: Some(now_iso_ms()),
-        });
-    }
-    segs
 }
 
 /// Classify an LLM/API error into a friendly, actionable message.
@@ -528,7 +508,10 @@ impl StaleTracker {
     fn record_fetch(&mut self, url: &str, observation: &str) {
         let domain = domain_of(url);
         // strip tags, check readable length
-        let text: String = observation.chars().filter(|c| *c != '<' && *c != '>').collect();
+        let text: String = observation
+            .chars()
+            .filter(|c| *c != '<' && *c != '>')
+            .collect();
         let has_content = text.trim().len() >= 200;
         let e = self.by_domain.entry(domain).or_default();
         e.push(has_content);
@@ -585,6 +568,34 @@ mod tests {
         }
     }
 
+    // Scripted LLM that also records every request's messages.
+    struct RecordingLlm {
+        responses: Mutex<Vec<LlmResponse>>,
+        seen: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for RecordingLlm {
+        async fn chat_stream(
+            &self,
+            m: &[ChatMessage],
+            _t: &[Value],
+            emitter: &dyn EventSink,
+            _c: &AtomicBool,
+        ) -> Result<LlmResponse> {
+            self.seen.lock().unwrap().push(m.to_vec());
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                return Err(AacodeError::Api("no more scripted responses".into()));
+            }
+            let r = q.remove(0);
+            emitter.seg("thought", &r.text);
+            Ok(r)
+        }
+        async fn validate(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     struct EchoTool;
     #[async_trait::async_trait]
     impl Tool for EchoTool {
@@ -592,7 +603,13 @@ mod tests {
             ToolSchema::new(
                 "echo",
                 "echo",
-                vec![ToolParameter::new("text", ParamType::String, true, "t", &[])],
+                vec![ToolParameter::new(
+                    "text",
+                    ParamType::String,
+                    true,
+                    "t",
+                    &[],
+                )],
             )
         }
         async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
@@ -680,37 +697,8 @@ mod tests {
         assert!(sm.messages.iter().any(|m| m.role == "tool"));
     }
 
-    #[test]
-    fn segments_from_response_orders_like_live_stream() {
-        let resp = LlmResponse {
-            text: "text".into(),
-            tool_calls: vec![tc("run_shell", "{}")],
-            reasoning_content: Some("reason".into()),
-            finish_reason: None,
-        };
-        let segs = segments_from_response(&resp);
-        let kinds: Vec<&str> = segs.iter().map(|s| s.kind.as_str()).collect();
-        assert_eq!(kinds, vec!["thinking", "thought", "action"]);
-
-        // Reasoning-only (no text / tools) → thinking only.
-        let reasoning_only = LlmResponse {
-            reasoning_content: Some("r".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            segments_from_response(&reasoning_only)
-                .iter()
-                .map(|s| s.kind.as_str())
-                .collect::<Vec<_>>(),
-            vec!["thinking"]
-        );
-
-        // Empty response → no segments.
-        assert!(segments_from_response(&LlmResponse::default()).is_empty());
-    }
-
     #[tokio::test]
-    async fn persists_segments_for_tool_and_completion() {
+    async fn persists_turn_messages_without_segment_duplication() {
         let llm = ScriptedLlm {
             responses: Mutex::new(vec![
                 LlmResponse {
@@ -741,36 +729,103 @@ mod tests {
         let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
         assert_eq!(res.status, RunStatus::Completed);
 
-        // Tool turn assistant: thinking → thought → action → observation.
+        // The turn is persisted as plain messages only: assistant(tool_calls)
+        // carries reasoning + content (~ thinking/thought/action), the tool
+        // message carries the observation — no duplicated render segments.
         let tool_asst = sm
             .messages
             .iter()
             .find(|m| m.tool_calls.is_some())
             .expect("assistant with tool_calls present");
-        let segs = tool_asst.segments.as_ref().expect("tool turn must carry segments");
-        assert_eq!(segs.len(), 4, "thinking + thought + action + observation");
-        assert_eq!(segs[0].kind, "thinking");
-        assert_eq!(segs[0].content, "I need to echo");
-        assert_eq!(segs[1].kind, "thought");
-        assert_eq!(segs[1].content, "let me echo");
-        assert_eq!(segs[2].kind, "action");
-        assert_eq!(segs[2].name.as_deref(), Some("echo"));
-        assert_eq!(segs[3].kind, "observation");
-        assert!(segs[3].content.contains("echoed: hey"));
+        assert_eq!(
+            tool_asst.reasoning_content.as_deref(),
+            Some("I need to echo")
+        );
+        assert_eq!(tool_asst.content, "let me echo");
+        assert_eq!(tool_asst.tool_calls.as_ref().unwrap()[0].name, "echo");
 
-        // Final assistant: thinking → thought (no action/observation).
+        let tool_msg = sm
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool result present");
+        assert!(tool_msg.content.contains("echoed: hey"));
+
         let final_asst = sm
             .messages
             .iter()
             .rev()
             .find(|m| m.role == "assistant")
             .expect("final assistant present");
-        let final_segs = final_asst.segments.as_ref().expect("final turn must carry segments");
-        assert_eq!(final_segs.len(), 2, "thinking + thought");
-        assert_eq!(final_segs[0].kind, "thinking");
-        assert_eq!(final_segs[0].content, "summarize");
-        assert_eq!(final_segs[1].kind, "thought");
-        assert_eq!(final_segs[1].content, "all done");
+        assert_eq!(final_asst.reasoning_content.as_deref(), Some("summarize"));
+        assert_eq!(final_asst.content, "all done");
+    }
+
+    /// The exact messages handed to the model must contain each tool call and
+    /// each tool result exactly once (no duplication), adjacent, with no missing
+    /// result and no stray duplicated system/user rows.
+    #[tokio::test]
+    async fn llm_request_has_exactly_one_copy_of_each_tool_message() {
+        let llm = RecordingLlm {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    text: "let me echo".into(),
+                    tool_calls: vec![tc("echo", "{\"text\":\"hey\"}")],
+                    reasoning_content: Some("I need to echo".into()),
+                    ..Default::default()
+                },
+                LlmResponse {
+                    text: "all done".into(),
+                    reasoning_content: Some("summarize".into()),
+                    ..Default::default()
+                },
+            ]),
+            seen: Mutex::new(vec![]),
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(EchoTool));
+        let cfg = AgentConfig::default();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("echo hey")];
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
+        assert_eq!(res.status, RunStatus::Completed);
+
+        let seen = llm.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one request per model turn");
+        let second = &seen[1];
+
+        let with_calls: Vec<&ChatMessage> =
+            second.iter().filter(|m| m.tool_calls.is_some()).collect();
+        assert_eq!(with_calls.len(), 1, "exactly one assistant tool_calls msg");
+        let tool_msgs: Vec<&ChatMessage> = second.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(
+            tool_msgs.len(),
+            1,
+            "exactly one tool result (no duplication)"
+        );
+        assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(tool_msgs[0].content, "echoed: hey");
+
+        assert_eq!(with_calls[0].content, "let me echo");
+        assert_eq!(
+            with_calls[0].reasoning_content.as_deref(),
+            Some("I need to echo")
+        );
+        let ai = second.iter().position(|m| m.tool_calls.is_some()).unwrap();
+        assert_eq!(second[ai + 1].role, "tool", "result adjacent to its call");
+
+        // No duplicated user/system rows slipped in.
+        assert_eq!(second.iter().filter(|m| m.role == "user").count(), 1);
+        assert_eq!(second.iter().filter(|m| m.role == "system").count(), 1);
+
+        // Persisted history maps 1:1 (no duplicate rows on disk either).
+        assert_eq!(sm.history_chat().len(), sm.messages.len());
     }
 
     #[tokio::test]
@@ -787,7 +842,8 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(true);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Cancelled);
     }
@@ -816,7 +872,8 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::MaxIterations);
         assert_eq!(res.iterations, 3);
@@ -830,7 +887,9 @@ mod tests {
 
     #[tokio::test]
     async fn classify_errors() {
-        assert!(classify_api_error(&AacodeError::Api("HTTP 401 no".into())).contains("authentication"));
+        assert!(
+            classify_api_error(&AacodeError::Api("HTTP 401 no".into())).contains("authentication")
+        );
         assert!(classify_api_error(&AacodeError::Api("rate limit".into())).contains("quota"));
         assert!(classify_api_error(&AacodeError::Network("reset".into())).contains("Network"));
         assert!(classify_api_error(&AacodeError::Config("no key".into())).contains("Configuration"));
@@ -880,7 +939,8 @@ mod tests {
         let mut sm = SessionManager::new(&proj);
         sm.create_session("t", None).unwrap();
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         assert_eq!(res.final_text, "recovered");
@@ -899,7 +959,9 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(responses),
+        };
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(EchoTool));
         let mut cfg = AgentConfig::default();
@@ -911,12 +973,16 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         // Truncated response with no tool calls should NOT complete — it
         // should loop until max_iterations and then return MaxIterations.
-        assert_eq!(res.status, RunStatus::MaxIterations,
-            "truncated response must not be treated as completed");
+        assert_eq!(
+            res.status,
+            RunStatus::MaxIterations,
+            "truncated response must not be treated as completed"
+        );
     }
 
     #[tokio::test]
@@ -928,7 +994,9 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(responses),
+        };
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(EchoTool));
         let mut cfg = AgentConfig::default();
@@ -940,10 +1008,14 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::MaxIterations);
-        assert!(!res.final_text.is_empty(), "max_iterations must return last response text");
+        assert!(
+            !res.final_text.is_empty(),
+            "max_iterations must return last response text"
+        );
     }
 
     // ── LLMs for retry / buffering tests ──────────────────────────────
@@ -1060,7 +1132,14 @@ mod tests {
     impl CountingTool {
         fn new(name: &'static str, response: String) -> (Self, std::sync::Arc<Mutex<u32>>) {
             let count = std::sync::Arc::new(Mutex::new(0u32));
-            (CountingTool { count: count.clone(), tool_name: name, response }, count)
+            (
+                CountingTool {
+                    count: count.clone(),
+                    tool_name: name,
+                    response,
+                },
+                count,
+            )
         }
     }
     #[async_trait::async_trait]
@@ -1087,19 +1166,29 @@ mod tests {
         cfg.max_iterations = 1;
         let responses = vec![LlmResponse {
             text: "try".into(),
-            tool_calls: vec![tc("understand_image", r#"{"image_path":"a.jpg","prompt":"desc"}"#)],
+            tool_calls: vec![tc(
+                "understand_image",
+                r#"{"image_path":"a.jpg","prompt":"desc"}"#,
+            )],
             ..Default::default()
         }];
-        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(responses),
+        };
         let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
         let proj = tmp_proj();
         let mut sm = SessionManager::new(&proj);
         sm.create_session("t", None).unwrap();
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
-        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
+        let _ = loop_
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await;
         let invocations = *counter.lock().unwrap();
-        assert!(invocations >= 2, "network error must trigger retry, got {invocations} invocations");
+        assert!(
+            invocations >= 2,
+            "network error must trigger retry, got {invocations} invocations"
+        );
     }
 
     #[tokio::test]
@@ -1107,7 +1196,8 @@ mod tests {
         let mut reg = ToolRegistry::new();
         let (tool, counter) = CountingTool::new(
             "understand_image",
-            r#"{"success":false,"error":"config error: no multimodal model configured"}"#.to_string(),
+            r#"{"success":false,"error":"config error: no multimodal model configured"}"#
+                .to_string(),
         );
         reg.register(Box::new(tool));
         let mut cfg = AgentConfig::default();
@@ -1115,27 +1205,36 @@ mod tests {
         cfg.max_iterations = 1;
         let responses = vec![LlmResponse {
             text: "try".into(),
-            tool_calls: vec![tc("understand_image", r#"{"image_path":"a.jpg","prompt":"desc"}"#)],
+            tool_calls: vec![tc(
+                "understand_image",
+                r#"{"image_path":"a.jpg","prompt":"desc"}"#,
+            )],
             ..Default::default()
         }];
-        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(responses),
+        };
         let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
         let proj = tmp_proj();
         let mut sm = SessionManager::new(&proj);
         sm.create_session("t", None).unwrap();
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
-        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
-        assert_eq!(*counter.lock().unwrap(), 1, "config error must not trigger retry");
+        let _ = loop_
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await;
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "config error must not trigger retry"
+        );
     }
 
     #[tokio::test]
     async fn execute_with_retry_timeout_retried() {
         let mut reg = ToolRegistry::new();
-        let (tool, counter) = CountingTool::new(
-            "timeout_cmd",
-            "command timed out after 10s".to_string(),
-        );
+        let (tool, counter) =
+            CountingTool::new("timeout_cmd", "command timed out after 10s".to_string());
         reg.register(Box::new(tool));
         let mut cfg = AgentConfig::default();
         cfg.limits.max_retries = 3;
@@ -1145,24 +1244,25 @@ mod tests {
             tool_calls: vec![tc("timeout_cmd", r#"{"x":"1"}"#)],
             ..Default::default()
         }];
-        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(responses),
+        };
         let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
         let proj = tmp_proj();
         let mut sm = SessionManager::new(&proj);
         sm.create_session("t", None).unwrap();
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
-        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
+        let _ = loop_
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await;
         assert!(*counter.lock().unwrap() >= 2, "timeout must trigger retry");
     }
 
     #[tokio::test]
     async fn execute_with_retry_connection_retried() {
         let mut reg = ToolRegistry::new();
-        let (tool, counter) = CountingTool::new(
-            "fetch_url",
-            "connection reset".to_string(),
-        );
+        let (tool, counter) = CountingTool::new("fetch_url", "connection reset".to_string());
         reg.register(Box::new(tool));
         let mut cfg = AgentConfig::default();
         cfg.limits.max_retries = 3;
@@ -1172,15 +1272,22 @@ mod tests {
             tool_calls: vec![tc("fetch_url", r#"{"url":"http://x"}"#)],
             ..Default::default()
         }];
-        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(responses),
+        };
         let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
         let proj = tmp_proj();
         let mut sm = SessionManager::new(&proj);
         sm.create_session("t", None).unwrap();
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(false);
-        let _ = loop_.run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await;
-        assert!(*counter.lock().unwrap() >= 2, "connection must trigger retry");
+        let _ = loop_
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await;
+        assert!(
+            *counter.lock().unwrap() >= 2,
+            "connection must trigger retry"
+        );
     }
 
     #[tokio::test]
@@ -1190,7 +1297,9 @@ mod tests {
             tool_calls: vec![tc("timeout_cmd", "{\"x\":\"1\"}")],
             ..Default::default()
         }];
-        let llm = ScriptedLlm { responses: Mutex::new(responses) };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(responses),
+        };
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(TimeoutTool));
         let mut cfg = AgentConfig::default();
@@ -1203,7 +1312,8 @@ mod tests {
         let sink = CollectingSink::new(false);
         let cancel = AtomicBool::new(true); // pre-set cancel
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         // Must not retry forever — cancel check in first iteration returns
         // Cancelled before tool execution even starts.
@@ -1236,7 +1346,10 @@ mod tests {
             ChatMessage::user("do something"),
         ];
         let res = loop_.run(msgs, &mut sm, &sink, &cancel).await;
-        assert!(res.is_err(), "context over max must error, not silently proceed");
+        assert!(
+            res.is_err(),
+            "context over max must error, not silently proceed"
+        );
         let msg = format!("{}", res.err().unwrap());
         assert!(
             msg.contains("context too large") || msg.contains("exceeds limit"),
@@ -1267,7 +1380,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         assert_eq!(res.final_text, "complete response");
@@ -1275,11 +1389,15 @@ mod tests {
         let lines = sink.lines();
         // The retry emitted delta + seg events. Verify they are replayed.
         assert!(
-            lines.iter().any(|l| l.contains(r#""type":"delta""#) && l.contains("streaming")),
+            lines
+                .iter()
+                .any(|l| l.contains(r#""type":"delta""#) && l.contains("streaming")),
             "delta event must be replayed to real sink"
         );
         assert!(
-            lines.iter().any(|l| l.contains(r#""type":"seg_content""#) && l.contains("complete response")),
+            lines
+                .iter()
+                .any(|l| l.contains(r#""type":"seg_content""#) && l.contains("complete response")),
             "seg_content event must be replayed to real sink"
         );
     }
@@ -1303,7 +1421,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
 
@@ -1338,7 +1457,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
 
@@ -1378,7 +1498,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
         assert_eq!(res.final_text, "final complete text");
@@ -1417,14 +1538,17 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Completed);
 
         let lines = sink.lines();
         // Delta event replayed.
         assert!(
-            lines.iter().any(|l| l.contains(r#""type":"delta""#) && l.contains("streaming")),
+            lines
+                .iter()
+                .any(|l| l.contains(r#""type":"delta""#) && l.contains("streaming")),
             "delta missing: {lines:?}"
         );
         // Thinking seg_content replayed.
@@ -1434,7 +1558,9 @@ mod tests {
         );
         // Thought seg_content replayed.
         assert!(
-            lines.iter().any(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#)),
+            lines
+                .iter()
+                .any(|l| l.contains(r#""type":"seg_content""#) && l.contains(r#""seg":"thought""#)),
             "thought seg missing: {lines:?}"
         );
         // done event from the react_loop (emitted after chat_with_retry
@@ -1464,7 +1590,8 @@ mod tests {
         let cancel = AtomicBool::new(true);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert_eq!(res.status, RunStatus::Cancelled);
     }
@@ -1500,7 +1627,8 @@ mod tests {
                 &sink,
                 cancel.as_ref(),
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(
             res.status,
             RunStatus::Cancelled,
@@ -1508,7 +1636,7 @@ mod tests {
         );
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn exhausted_retries_buffers_discarded_no_events() {
         // When all retries fail, no buffered content should reach the
         // real emitter (each buffer was discarded on failure).
@@ -1525,7 +1653,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let res = loop_
-            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel).await
+            .run(vec![ChatMessage::user("x")], &mut sm, &sink, &cancel)
+            .await
             .unwrap();
         assert!(matches!(res.status, RunStatus::Error(_)));
         // The react_loop emits an error event on the real emitter.
@@ -1535,18 +1664,78 @@ mod tests {
             "error event must be emitted: {lines:?}"
         );
         // But there should be no delta/seg_content from retries.
-        let deltas = lines.iter().filter(|l| l.contains(r#""type":"delta""#)).count();
+        let deltas = lines
+            .iter()
+            .filter(|l| l.contains(r#""type":"delta""#))
+            .count();
         let segs = lines
             .iter()
             .filter(|l| l.contains(r#""type":"seg_content""#))
             .count();
-        assert_eq!(
-            deltas, 0,
-            "no delta events from failed retries: {lines:?}"
-        );
+        assert_eq!(deltas, 0, "no delta events from failed retries: {lines:?}");
         assert_eq!(
             segs, 0,
             "no seg_content events from failed retries: {lines:?}"
+        );
+    }
+
+    /// A tool that never returns (like a long blocking `run_shell`).
+    struct BlockingTool;
+    #[async_trait::async_trait]
+    impl Tool for BlockingTool {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new("blocking_tool", "never returns", vec![])
+        }
+        async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+            futures::future::pending::<()>().await;
+            Ok(String::new())
+        }
+    }
+
+    /// Cancel must interrupt a blocking tool promptly (the loop must not wait
+    /// for it), which also lets the session guard be released.
+    #[tokio::test]
+    async fn cancel_interrupts_a_blocking_tool() {
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![LlmResponse {
+                text: "work".into(),
+                tool_calls: vec![tc("blocking_tool", "{}")],
+                ..Default::default()
+            }]),
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(BlockingTool));
+        let cfg = AgentConfig::default();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            c2.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        let res = loop_
+            .run(
+                vec![ChatMessage::user("x")],
+                &mut sm,
+                &sink,
+                cancel.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(res.status, RunStatus::Cancelled),
+            "expected Cancelled, got {:?}",
+            res.status
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "cancel should be prompt, took {:?}",
+            start.elapsed()
         );
     }
 }
@@ -1576,4 +1765,3 @@ fn brief(e: &crate::error::AacodeError) -> String {
     }
     out
 }
-

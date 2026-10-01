@@ -206,7 +206,11 @@ pub struct Limits {
     pub max_retries: u32,
 }
 fn d_tool_output() -> usize {
-    24000
+    // 0 = unlimited. `run_shell` truncation is the caller's choice via its
+    // `max_output` param; the observation layer does NOT truncate plain text
+    // (only binary/base64 is externalized). Set a number here to impose a hard
+    // accident ceiling.
+    0
 }
 fn d_display_preview() -> usize {
     3000
@@ -492,7 +496,10 @@ mod tests {
         let cfg: super::AgentConfig = serde_json::from_value(v).unwrap();
         assert_eq!(cfg.context.compact_trigger_tokens, 123456);
         // Default aligned with the Python aacode config (256000).
-        assert_eq!(super::ContextConfig::default().compact_trigger_tokens, 256000);
+        assert_eq!(
+            super::ContextConfig::default().compact_trigger_tokens,
+            256000
+        );
     }
 
     #[test]
@@ -519,7 +526,10 @@ mod tests {
         let mut cfg = super::AgentConfig::default();
         cfg.apply_env();
         std::env::remove_var("AACODE_SKILLS_DIR");
-        assert_eq!(cfg.skills.user_dir.as_deref(), Some("/tmp/aacode_env_skills"));
+        assert_eq!(
+            cfg.skills.user_dir.as_deref(),
+            Some("/tmp/aacode_env_skills")
+        );
     }
 
     use super::*;
@@ -577,8 +587,7 @@ mod tests {
     fn validate_requires_key() {
         let cfg = AgentConfig::default();
         assert!(!cfg.validate().is_empty());
-        let cfg2: AgentConfig =
-            serde_json::from_str(r#"{"model":{"api_key":"sk-x"}}"#).unwrap();
+        let cfg2: AgentConfig = serde_json::from_str(r#"{"model":{"api_key":"sk-x"}}"#).unwrap();
         assert!(cfg2.validate().is_empty());
     }
 }

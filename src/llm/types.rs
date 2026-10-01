@@ -91,7 +91,9 @@ pub struct LlmResponse {
 
 impl LlmResponse {
     pub fn is_truncated(&self) -> bool {
-        matches!(self.finish_reason.as_deref(),
-            Some("length") | Some("max_tokens") | Some("connection_closed"))
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("length") | Some("max_tokens") | Some("connection_closed")
+        )
     }
 }

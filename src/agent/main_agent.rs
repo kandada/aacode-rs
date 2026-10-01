@@ -93,11 +93,27 @@ impl MainAgent {
             {
                 prompt.push_str(" Python: embedded RustPython (only pure-Python packages work, no C extensions). Test with `python3 -m unittest`; syntax-check: `python3 -c \"import ast; ast.parse(open('f.py').read())\"`. Install missing pure-Python packages with `pip-install <name>`.");
                 prompt.push_str(" Built-in extras: `sqlite3` (embedded DB, no install), `node`/`js` (WebView JavaScript), `render` (HTML→screenshot), `jscheck` (JS/TS syntax check); full command list at https://github.com/kandada/fastshell.");
+                prompt.push_str(" The sandbox runs in-process: `bash`/`sh` and Python `subprocess` are unavailable — use built-in commands or `execute_python` instead.");
             }
         }
         // Project init instructions (static config, rarely changes).
         let init = self.context.load_init_instructions();
         prompt.push_str(&format!("\n\n## Project Init Instructions\n\n{init}"));
+        // Browser capability (only when a backend is actually available).
+        #[cfg(feature = "browser")]
+        if crate::tools::browser::is_available() {
+            prompt.push_str(
+                "\n\n## Browser\nA full browser-automation engine (`fastbrowser`) is available. It can open pages and drive a real \
+browser: click / type / fill forms, scroll, run JavaScript, read cookies & localStorage, extract \
+text / links / tables, manage tabs, wait for elements, and block or intercept requests — including \
+JS-heavy and anti-bot pages. To read cluttered or JS-heavy pages, use the accessibility tree \
+(`get_accessibility_tree`: role / name / state), which also lets you target elements by `role=` / `name=`.\n\
+`browser_tools` lists the available \
+browser tools (names by default; `mode:\"help\", name:\"<tool>\"` gives one tool's full schema). \
+Call any of them with `browser_call(name, args)`; pass `compact:true` for cleaned \
+output (large results archived under `.aacode/extracts/`).",
+            );
+        }
         // Planning guidance (static).
         prompt.push_str(PLANNING_IN_THOUGHT);
         // Plan-first mode: instruct the model to produce a plan before acting.
@@ -299,14 +315,21 @@ mod tests {
             _idle_timeout_secs: u64,
             _cwd: &std::path::Path,
         ) -> CmdOutput {
-            CmdOutput { stdout: String::new(), stderr: String::new(), exit_code: 0 }
+            CmdOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            }
         }
-        fn kind(&self) -> &'static str { "fastshell" }
+        fn kind(&self) -> &'static str {
+            "fastshell"
+        }
     }
 
     #[test]
     fn fastshell_backend_adds_sandbox_hint() {
-        let dir = std::env::temp_dir().join(format!("aacode_shint_{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("aacode_shint_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let backend: Arc<dyn ShellBackend> = Arc::new(MockFastshellBackend);
         let mut acfg = AgentConfig::default();
@@ -314,7 +337,10 @@ mod tests {
         let agent = MainAgent::new(acfg, dir, backend);
         let reg = agent.build_registry();
         let p = agent.build_system_prompt(&reg, "(no skills installed)");
-        assert!(p.contains("sandbox root"), "fastshell prompt must contain sandbox hint");
+        assert!(
+            p.contains("sandbox root"),
+            "fastshell prompt must contain sandbox hint"
+        );
         assert!(p.contains("avoid /tmp/"));
     }
 
@@ -323,7 +349,10 @@ mod tests {
         let (agent, _) = make_agent();
         let reg = agent.build_registry();
         let p = agent.build_system_prompt(&reg, "(no skills installed)");
-        assert!(!p.contains("sandbox root"), "native prompt must not contain sandbox hint");
+        assert!(
+            !p.contains("sandbox root"),
+            "native prompt must not contain sandbox hint"
+        );
         assert!(!p.contains("avoid /tmp/"));
     }
 
@@ -413,7 +442,11 @@ mod tests {
         }
 
         // Last is "task one" ≠ "different task" — should NOT be skipped.
-        assert_eq!(messages.len(), 3, "should keep all history when last msg != task");
+        assert_eq!(
+            messages.len(),
+            3,
+            "should keep all history when last msg != task"
+        );
         assert_eq!(messages[1].content, "task one");
         assert_eq!(messages[2].content, "ok");
     }
@@ -429,9 +462,13 @@ mod tests {
         let mut session = SessionManager::new(&dir);
         session.create_session("task", None).unwrap();
         session
-            .add_message(SessionMessage::from_chat(&ChatMessage::system("## Analysis\n2 files")))
+            .add_message(SessionMessage::from_chat(&ChatMessage::system(
+                "## Analysis\n2 files",
+            )))
             .unwrap();
-        session.add_message(SessionMessage::from_chat(&ChatMessage::assistant("done"))).unwrap();
+        session
+            .add_message(SessionMessage::from_chat(&ChatMessage::assistant("done")))
+            .unwrap();
         session.flush().unwrap();
 
         let mut messages: Vec<ChatMessage> = vec![ChatMessage::system("sys")];
@@ -445,7 +482,11 @@ mod tests {
         }
 
         let sys_msgs: Vec<_> = messages.iter().filter(|m| m.role == "system").collect();
-        assert_eq!(sys_msgs.len(), 2, "should preserve both system messages in history");
+        assert_eq!(
+            sys_msgs.len(),
+            2,
+            "should preserve both system messages in history"
+        );
         assert!(sys_msgs.iter().any(|m| m.content.contains("Analysis")));
     }
 

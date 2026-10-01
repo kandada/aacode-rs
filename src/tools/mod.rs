@@ -17,6 +17,9 @@ pub mod skills;
 pub mod todo;
 pub mod web;
 
+#[cfg(feature = "browser")]
+pub mod browser;
+
 pub use backend::{BackendKind, ShellBackend};
 pub use registry::{Tool, ToolRegistry};
 pub use schema::{ParamType, ToolParameter, ToolSchema};
@@ -38,8 +41,18 @@ pub fn build_sub_registry(
 ) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+    reg.enable_sanitizer(&project_path, sanitize_limits_from(config));
     let _ = register_core_tools(&mut reg, backend, &project_path, config);
     reg
+}
+
+/// Map the agent's output limits onto the observation sanitiser.
+fn sanitize_limits_from(config: &AgentConfig) -> crate::observation::SanitizeLimits {
+    crate::observation::SanitizeLimits {
+        // 0 = no text truncation (see `d_tool_output`).
+        max_observation_chars: config.limits.tool_output_chars,
+        ..Default::default()
+    }
 }
 
 /// Build the full default registry with every tool wired up.
@@ -60,13 +73,18 @@ pub fn build_default_registry_with_holder(
     config: &AgentConfig,
 ) -> (ToolRegistry, Arc<Mutex<Option<String>>>) {
     let mut reg = ToolRegistry::new();
+    reg.enable_sanitizer(&project_path, sanitize_limits_from(config));
     let holder = register_core_tools(&mut reg, backend.clone(), &project_path, config);
 
     // MCP tools.
     let mcp_specs: Vec<McpServerSpec> = Vec::new(); // configured externally in future
     let mcp_mgr = Arc::new(McpManager::new(mcp_specs, config.timeouts.web_request));
-    reg.register(Box::new(mcp::ListMcpToolsTool { mgr: mcp_mgr.clone() }));
-    reg.register(Box::new(mcp::CallMcpToolTool { mgr: mcp_mgr.clone() }));
+    reg.register(Box::new(mcp::ListMcpToolsTool {
+        mgr: mcp_mgr.clone(),
+    }));
+    reg.register(Box::new(mcp::CallMcpToolTool {
+        mgr: mcp_mgr.clone(),
+    }));
     reg.register(Box::new(mcp::McpStatusTool { mgr: mcp_mgr }));
 
     // Delegation tools (sub-agent uses a delegation-free registry).
@@ -74,9 +92,8 @@ pub fn build_default_registry_with_holder(
     let sub_backend = backend.clone();
     let sub_pp = project_path.clone();
     let sub_cfg = config.clone();
-    let factory: delegate::SubRegistryFactory = Arc::new(move || {
-        build_sub_registry(sub_backend.clone(), sub_pp.clone(), &sub_cfg)
-    });
+    let factory: delegate::SubRegistryFactory =
+        Arc::new(move || build_sub_registry(sub_backend.clone(), sub_pp.clone(), &sub_cfg));
     reg.register(Box::new(delegate::DelegateTaskTool {
         llm,
         config: config.clone(),
@@ -115,14 +132,25 @@ fn register_core_tools(
         project_path,
         Arc::new(move || sid.lock().unwrap().clone()),
     ));
-    reg.register(Box::new(todo::AddTodoTool { store: todo_store.clone() }));
-    reg.register(Box::new(todo::MarkTodoTool { store: todo_store.clone() }));
-    reg.register(Box::new(todo::UpdateTodoTool { store: todo_store.clone() }));
-    reg.register(Box::new(todo::TodoSummaryTool { store: todo_store.clone() }));
+    reg.register(Box::new(todo::AddTodoTool {
+        store: todo_store.clone(),
+    }));
+    reg.register(Box::new(todo::MarkTodoTool {
+        store: todo_store.clone(),
+    }));
+    reg.register(Box::new(todo::UpdateTodoTool {
+        store: todo_store.clone(),
+    }));
+    reg.register(Box::new(todo::TodoSummaryTool {
+        store: todo_store.clone(),
+    }));
     reg.register(Box::new(todo::ListTodoFilesTool { store: todo_store }));
 
     // Web tools
-    reg.register(Box::new(web::SearchWebTool::new(config.search.clone(), config.timeouts.web_request)));
+    reg.register(Box::new(web::SearchWebTool::new(
+        config.search.clone(),
+        config.timeouts.web_request,
+    )));
     reg.register(Box::new(web::FetchUrlTool {
         project_path: project_path.clone(),
         timeout_secs: config.timeouts.web_request,
@@ -131,6 +159,11 @@ fn register_core_tools(
         cfg: config.search.clone(),
         timeout_secs: config.timeouts.web_request,
     }));
+
+    // Browser tools (fastbrowser, offscreen host WebView). Registered only when
+    // a browser backend is available (feature `browser` + host registered ops).
+    #[cfg(feature = "browser")]
+    browser::register(reg, project_path.clone());
 
     // Skills
     reg.register(Box::new(skills::RunSkillsTool {
@@ -141,22 +174,45 @@ fn register_core_tools(
     }));
 
     // Session tools
-    reg.register(Box::new(session_tools::ListSessionsTool { project_path: project_path.clone() }));
+    reg.register(Box::new(session_tools::ListSessionsTool {
+        project_path: project_path.clone(),
+        active_session_id: session_id_holder.clone(),
+    }));
     reg.register(Box::new(session_tools::GetConversationHistoryTool {
         project_path: project_path.clone(),
         active_session_id: session_id_holder.clone(),
     }));
-    reg.register(Box::new(session_tools::GetSessionStatsTool { project_path: project_path.clone() }));
-    reg.register(Box::new(session_tools::DeleteSessionTool { project_path: project_path.clone() }));
-    reg.register(Box::new(session_tools::SwitchSessionTool { project_path: project_path.clone() }));
-    reg.register(Box::new(session_tools::NewSessionTool { project_path: project_path.clone() }));
-    reg.register(Box::new(session_tools::ContinueSessionTool { project_path: project_path.clone() }));
+    reg.register(Box::new(session_tools::GetSessionStatsTool {
+        project_path: project_path.clone(),
+    }));
+    reg.register(Box::new(session_tools::DeleteSessionTool {
+        project_path: project_path.clone(),
+    }));
+    reg.register(Box::new(session_tools::SwitchSessionTool {
+        project_path: project_path.clone(),
+    }));
+    reg.register(Box::new(session_tools::NewSessionTool {
+        project_path: project_path.clone(),
+    }));
+    reg.register(Box::new(session_tools::ContinueSessionTool {
+        project_path: project_path.clone(),
+    }));
 
     // Code tools (execute_python, run_tests, debug_code, analyze_code)
-    reg.register(Box::new(code_tools::ExecutePythonTool { project_path: project_path.clone(), backend: backend_for_python, default_timeout_secs: config.timeouts.shell_command }));
-    reg.register(Box::new(code_tools::RunTestsTool { project_path: project_path.clone() }));
-    reg.register(Box::new(code_tools::DebugCodeTool { project_path: project_path.clone() }));
-    reg.register(Box::new(code_tools::AnalyzeCodeTool { project_path: project_path.clone() }));
+    reg.register(Box::new(code_tools::ExecutePythonTool {
+        project_path: project_path.clone(),
+        backend: backend_for_python,
+        default_timeout_secs: config.timeouts.shell_command,
+    }));
+    reg.register(Box::new(code_tools::RunTestsTool {
+        project_path: project_path.clone(),
+    }));
+    reg.register(Box::new(code_tools::DebugCodeTool {
+        project_path: project_path.clone(),
+    }));
+    reg.register(Box::new(code_tools::AnalyzeCodeTool {
+        project_path: project_path.clone(),
+    }));
 
     // Multimodal tools
     let mm_ctx = multimodal::MultimodalCtx::new(
@@ -164,9 +220,15 @@ fn register_core_tools(
         project_path.clone(),
         config.timeouts.web_request,
     );
-    reg.register(Box::new(multimodal::UnderstandImageTool { ctx: mm_ctx.clone() }));
-    reg.register(Box::new(multimodal::UnderstandVideoTool { ctx: mm_ctx.clone() }));
-    reg.register(Box::new(multimodal::UnderstandUiDesignTool { ctx: mm_ctx.clone() }));
+    reg.register(Box::new(multimodal::UnderstandImageTool {
+        ctx: mm_ctx.clone(),
+    }));
+    reg.register(Box::new(multimodal::UnderstandVideoTool {
+        ctx: mm_ctx.clone(),
+    }));
+    reg.register(Box::new(multimodal::UnderstandUiDesignTool {
+        ctx: mm_ctx.clone(),
+    }));
     reg.register(Box::new(multimodal::ImageConsistencyTool { ctx: mm_ctx }));
 
     session_id_holder
@@ -222,6 +284,20 @@ mod tests {
         ] {
             assert!(reg.contains(name), "missing tool: {name}");
         }
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn browser_tools_absent_without_host_webview() {
+        // No host WebView is registered in tests → the default registry must not
+        // advertise browser tools (agent behaves exactly as before).
+        let (backend, dir) = make_backend();
+        let mut cfg = AgentConfig::default();
+        cfg.model.api_key = Some("x".into());
+        let reg = build_default_registry(backend, dir, &cfg);
+        assert!(!reg.contains("fetch_rendered"));
+        assert!(!reg.contains("browser_tools"));
+        assert!(!reg.contains("browser_call"));
     }
 
     #[test]

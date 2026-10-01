@@ -3,7 +3,7 @@
 
 [package]
 name = "aacode-rs"
-version = "1.8.8"
+version = "1.8.11"
 edition = "2021"
 description = "Rust port of the AACode ReAct coding agent, built on fastshell for mobile AI agents"
 license = "GPL-3.0-only"
@@ -23,21 +23,38 @@ crate-type = ["lib", "staticlib", "cdylib"]
 name = "aacode"
 path = "src/bin/aacode.rs"
 
+[features]
+default = []
+# Browser tools backed by the fastbrowser kernel (engine = "webview").
+# The host app must register an offscreen native WebView via
+# `aacode_browser_register_webview_ops` (see src/tools/browser.rs).
+browser = ["dep:fastbrowser"]
+
 [dependencies]
-fastshell = { path = "../fastshell", version = "0.3.3", features = ["git", "python-rustpython", "js-oxc"] }
+fastshell = { path = "../fastshell", version = "0.3.4", features = ["git", "python-rustpython", "js-oxc"] }
+fastbrowser = { version = "0.1.6", path = "../../fastbrowser_local/fastbrowser", features = ["engine-webview"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
 tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
-reqwest = { version = "0.12", features = ["json", "stream", "blocking", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking", "rustls-tls", "cookies"], default-features = false }
 futures = "0.3"
 bytes = "1"
+encoding_rs = "0.8"
 async-trait = "0.1"
 
 [dev-dependencies]
 tiny_http = "0.12"
 tokio = { version = "1", features = ["full"] }
+
+# Android 原生无障碍「桌面表面」：仅 Android 目标启用 fastbrowser 的
+# `surface-android`（真实能力由 App 的 AccessibilityService 经 C ABI 注入）。
+# 注意：同名依赖在 target 段会覆盖基础特性，故这里重复 engine-webview。
+# 必须放在所有普通依赖之后，否则会把它上面的依赖划成仅该目标。
+[target.'cfg(target_os = "android")'.dependencies]
+fastbrowser = { version = "0.1.5", path = "../../fastbrowser_local/fastbrowser", features = ["engine-webview", "surface-android"], optional = true }

@@ -134,7 +134,9 @@ impl StdioConn {
                 return Ok(resp.get("result").cloned().unwrap_or(json!({})));
             }
         }
-        Err(crate::error::AacodeError::Api("no matching mcp response".into()))
+        Err(crate::error::AacodeError::Api(
+            "no matching mcp response".into(),
+        ))
     }
 
     fn notify(&mut self, method: &str, params: Value) -> crate::error::Result<()> {
@@ -199,10 +201,7 @@ impl McpManager {
                     all.insert(spec.name.clone(), tools);
                 }
                 Err(e) => {
-                    all.insert(
-                        spec.name.clone(),
-                        json!({"error": format!("{}", e)}),
-                    );
+                    all.insert(spec.name.clone(), json!({"error": format!("{}", e)}));
                 }
             }
         }
@@ -222,7 +221,8 @@ impl McpManager {
                 let res = conn.request("tools/list", json!({}))?;
                 Ok(res.get("tools").cloned().unwrap_or(json!([])))
             }
-            McpTransport::Sse => self.sse_request(spec, "tools/list", json!({}))
+            McpTransport::Sse => self
+                .sse_request(spec, "tools/list", json!({}))
                 .map(|r| r.get("tools").cloned().unwrap_or(json!([]))),
         }
     }

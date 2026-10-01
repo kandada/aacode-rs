@@ -50,9 +50,15 @@ fn oai_all_chunks_malformed_produces_empty_response() {
         "data: [DONE]\n\n"
     );
     let r = run_openai(raw);
-    assert!(r.is_err(), "all-malformed chunks must produce an error, not an empty Ok response");
+    assert!(
+        r.is_err(),
+        "all-malformed chunks must produce an error, not an empty Ok response"
+    );
     let msg = format!("{}", r.err().unwrap());
-    assert!(msg.contains("malformed") || msg.contains("parseable"), "got: {msg}");
+    assert!(
+        msg.contains("malformed") || msg.contains("parseable"),
+        "got: {msg}"
+    );
 }
 
 /// Tool call chunks arrive but the `function` object is entirely missing from
@@ -75,7 +81,10 @@ fn oai_tool_calls_without_function_object() {
     };
     assert_eq!(resp.text, "pre text");
     // A tool_call with no function → no name accumulated → excluded from final list.
-    assert!(resp.tool_calls.is_empty(), "tool_call without function must be excluded, not partially included");
+    assert!(
+        resp.tool_calls.is_empty(),
+        "tool_call without function must be excluded, not partially included"
+    );
 }
 
 /// A tool_call with function but empty/invalid arguments should still be
@@ -201,7 +210,10 @@ fn oai_in_stream_error_then_valid_chunks_still_errors() {
         "data: [DONE]\n\n"
     );
     let r = run_openai(raw);
-    assert!(r.is_err(), "stream error must still error even if valid chunks follow");
+    assert!(
+        r.is_err(),
+        "stream error must still error even if valid chunks follow"
+    );
     assert!(
         format!("{}", r.err().unwrap()).contains("provider overloaded"),
         "error message must be surfaced"
@@ -268,7 +280,10 @@ fn anth_tool_use_without_name() {
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n"
     );
     let resp = run_anthropic(raw).unwrap();
-    assert!(resp.tool_calls.is_empty(), "tool_use without name must be excluded");
+    assert!(
+        resp.tool_calls.is_empty(),
+        "tool_use without name must be excluded"
+    );
 }
 
 /// Multiple text blocks + tool_use blocks — text aggregation must separate
@@ -424,7 +439,11 @@ use aacode_rs::agent::sanitize::sanitize_history;
 use aacode_rs::llm::types::{ChatMessage, ToolCall};
 
 fn tc(id: &str, name: &str) -> ToolCall {
-    ToolCall { id: id.into(), name: name.into(), arguments: "{}".into() }
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: "{}".into(),
+    }
 }
 
 /// Many rounds of tool_calls/tool pairs — sanitize must handle large history.
@@ -435,7 +454,10 @@ fn sanitize_many_tool_call_rounds() {
         msgs.push(ChatMessage::user(format!("task {i}")));
         msgs.push(ChatMessage::assistant_with_tools(
             String::new(),
-            vec![tc(&format!("call_{i}_0"), "run_shell"), tc(&format!("call_{i}_1"), "get_todo_summary")],
+            vec![
+                tc(&format!("call_{i}_0"), "run_shell"),
+                tc(&format!("call_{i}_1"), "get_todo_summary"),
+            ],
         ));
         msgs.push(ChatMessage::tool_result(format!("call_{i}_0"), "ok"));
         msgs.push(ChatMessage::tool_result(format!("call_{i}_1"), "ok"));
@@ -474,7 +496,7 @@ fn sanitize_dangling_at_end_of_long_history() {
     // No tool results — session killed here.
     let repairs = sanitize_history(&mut msgs);
     assert_eq!(repairs, 3); // 3 synthetic results injected
-    // Verify the last 3 tool results are synthetic for the interrupted round.
+                            // Verify the last 3 tool results are synthetic for the interrupted round.
     let tools: Vec<_> = msgs.iter().filter(|m| m.role == "tool").collect();
     let last3 = &tools[tools.len() - 3..];
     for t in last3 {
@@ -508,7 +530,11 @@ fn compact_view_many_rounds_tool_pairs_intact() {
         msgs.push(ChatMessage::user(format!("task {i} {}", "x".repeat(200))));
         msgs.push(ChatMessage::assistant_with_tools(
             String::new(),
-            vec![ToolCall { id: format!("c{i}"), name: "run_shell".into(), arguments: "{}".into() }],
+            vec![ToolCall {
+                id: format!("c{i}"),
+                name: "run_shell".into(),
+                arguments: "{}".into(),
+            }],
         ));
         msgs.push(ChatMessage::tool_result(format!("c{i}"), "y".repeat(200)));
     }
@@ -603,11 +629,9 @@ fn live_model_from_env(gateway: Gateway) -> Option<ModelConfig> {
         return None;
     }
     let mut model = ModelConfig {
-        name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| {
-            match gateway {
-                Gateway::Openai => "deepseek-chat".into(),
-                Gateway::Anthropic => "MiniMax-M2.7".into(),
-            }
+        name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| match gateway {
+            Gateway::Openai => "deepseek-chat".into(),
+            Gateway::Anthropic => "MiniMax-M2.7".into(),
         }),
         api_key: Some(api_key),
         base_url: std::env::var("LLM_API_URL").ok(),
@@ -633,9 +657,20 @@ async fn live_openai_streams_text_sanity() {
         ChatMessage::user("What is the capital of France?"),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
-    eprintln!("[openai text] model={} elapsed={:?} text={:?}", model.name, start.elapsed(), resp.text);
-    assert!(!resp.text.trim().is_empty(), "expected non-empty text response");
+    let resp = client
+        .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[openai text] model={} elapsed={:?} text={:?}",
+        model.name,
+        start.elapsed(),
+        resp.text
+    );
+    assert!(
+        !resp.text.trim().is_empty(),
+        "expected non-empty text response"
+    );
     let lines = sink.lines();
     assert!(lines.iter().any(|l| l.contains(r#""seg":"thought""#)));
     assert!(!lines.is_empty());
@@ -662,15 +697,30 @@ async fn live_openai_single_tool_call() {
         }
     })];
     let msgs = vec![
-        ChatMessage::system("You MUST use the run_shell tool exactly once. Call it with command='ls' then stop."),
+        ChatMessage::system(
+            "You MUST use the run_shell tool exactly once. Call it with command='ls' then stop.",
+        ),
         ChatMessage::user("List the files in the current directory."),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).await.expect("live call failed");
-    eprintln!("[openai tool_call] model={} elapsed={:?} tool_calls={:?}",
-        model.name, start.elapsed(),
-        resp.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>());
-    assert!(!resp.tool_calls.is_empty(), "expected at least one tool call, got: finish_reason={:?}", resp.finish_reason);
+    let resp = client
+        .chat_stream(&msgs, &tools, &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[openai tool_call] model={} elapsed={:?} tool_calls={:?}",
+        model.name,
+        start.elapsed(),
+        resp.tool_calls
+            .iter()
+            .map(|t| format!("{}:{}", t.name, t.arguments))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !resp.tool_calls.is_empty(),
+        "expected at least one tool call, got: finish_reason={:?}",
+        resp.finish_reason
+    );
     assert_eq!(resp.tool_calls[0].name, "run_shell");
     assert!(resp.tool_calls[0].parsed_args().get("command").is_some());
 }
@@ -701,31 +751,60 @@ async fn live_openai_multi_turn_conversation() {
         ChatMessage::user("Run 'echo hello' and tell me what happened."),
     ];
 
-    eprintln!("=== Multi-turn conversation start (model={}) ===", model.name);
+    eprintln!(
+        "=== Multi-turn conversation start (model={}) ===",
+        model.name
+    );
 
     // Turn 1: model calls run_shell (echo hello)
     let sink1 = CollectingSink::new(false);
     let start = Instant::now();
-    let resp1 = client.chat_stream(&msgs, &tools, &sink1, &cancel).await.expect("turn 1 failed");
-    eprintln!("[turn 1] elapsed={:?} tool_calls={:?}", start.elapsed(),
-        resp1.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>());
-    assert!(!resp1.tool_calls.is_empty(), "turn 1: expected tool call, got finish={:?} text={:?}",
-        resp1.finish_reason, resp1.text);
+    let resp1 = client
+        .chat_stream(&msgs, &tools, &sink1, &cancel)
+        .await
+        .expect("turn 1 failed");
+    eprintln!(
+        "[turn 1] elapsed={:?} tool_calls={:?}",
+        start.elapsed(),
+        resp1
+            .tool_calls
+            .iter()
+            .map(|t| format!("{}:{}", t.name, t.arguments))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !resp1.tool_calls.is_empty(),
+        "turn 1: expected tool call, got finish={:?} text={:?}",
+        resp1.finish_reason,
+        resp1.text
+    );
 
     // Simulate tool result
     let tc1 = &resp1.tool_calls[0];
     let tool_result = format!("[shell output] hello\n(exit code: 0)");
-    msgs.push(ChatMessage::assistant_with_tools(resp1.text.clone(), resp1.tool_calls.clone()));
+    msgs.push(ChatMessage::assistant_with_tools(
+        resp1.text.clone(),
+        resp1.tool_calls.clone(),
+    ));
     msgs.push(ChatMessage::tool_result(tc1.id.clone(), tool_result));
 
     // Turn 2: model summarises, no more tools needed
     msgs.push(ChatMessage::user("Summarize what happened."));
     let sink2 = CollectingSink::new(false);
     let start2 = Instant::now();
-    let resp2 = client.chat_stream(&msgs, &[], &sink2, &cancel).await.expect("turn 2 failed");
-    eprintln!("[turn 2] elapsed={:?} text={:?}", start2.elapsed(),
-        &resp2.text[..resp2.text.len().min(200)]);
-    assert!(!resp2.text.trim().is_empty(), "turn 2: expected text response");
+    let resp2 = client
+        .chat_stream(&msgs, &[], &sink2, &cancel)
+        .await
+        .expect("turn 2 failed");
+    eprintln!(
+        "[turn 2] elapsed={:?} text={:?}",
+        start2.elapsed(),
+        &resp2.text[..resp2.text.len().min(200)]
+    );
+    assert!(
+        !resp2.text.trim().is_empty(),
+        "turn 2: expected text response"
+    );
     // The summary should reference the tool execution.
     eprintln!("=== Multi-turn conversation OK ({} turns) ===", 2);
 }
@@ -771,16 +850,24 @@ async fn live_openai_five_iteration_tool_loop() {
             Ok(r) => r,
             Err(e) => panic!("iteration {i} failed: {e}"),
         };
-        eprintln!("[iter {i}] elapsed={:?} tool_calls={} text={:?}",
+        eprintln!(
+            "[iter {i}] elapsed={:?} tool_calls={} text={:?}",
             start.elapsed(),
             resp.tool_calls.len(),
-            &resp.text[..resp.text.len().min(100)]);
-        assert!(!resp.tool_calls.is_empty(),
-            "iteration {i}: expected tool call, got finish={:?}", resp.finish_reason);
+            &resp.text[..resp.text.len().min(100)]
+        );
+        assert!(
+            !resp.tool_calls.is_empty(),
+            "iteration {i}: expected tool call, got finish={:?}",
+            resp.finish_reason
+        );
         // Feed tool result
         let tc = &resp.tool_calls[0];
         let tool_result = format!("[shell output]\n{expected_output}\n(exit code: 0)");
-        msgs.push(ChatMessage::assistant_with_tools(resp.text.clone(), resp.tool_calls.clone()));
+        msgs.push(ChatMessage::assistant_with_tools(
+            resp.text.clone(),
+            resp.tool_calls.clone(),
+        ));
         msgs.push(ChatMessage::tool_result(tc.id.clone(), tool_result));
     }
     eprintln!("=== 5-iteration loop OK (model={}) ===", model.name);
@@ -801,9 +888,17 @@ async fn live_openai_truncation_detection() {
         ChatMessage::system("You MUST output a very long response with at least 200 words about the history of computers."),
         ChatMessage::user("Tell me about computer history in detail."),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
-    eprintln!("[truncation] model={} max_tokens=10 finish={:?} is_truncated={} text_len={}",
-        model.name, resp.finish_reason, resp.is_truncated(), resp.text.len());
+    let resp = client
+        .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[truncation] model={} max_tokens=10 finish={:?} is_truncated={} text_len={}",
+        model.name,
+        resp.finish_reason,
+        resp.is_truncated(),
+        resp.text.len()
+    );
     // The model might refuse or max_tokens might not hit for a short model.
     // But if finish_reason is "length", is_truncated must be true.
     if resp.finish_reason.as_deref() == Some("length") {
@@ -822,9 +917,9 @@ async fn live_openai_cancellation_mid_stream() {
     let sink = CollectingSink::new(false);
     let cancel = std::sync::Arc::new(AtomicBool::new(false));
     let cancel_clone = cancel.clone();
-    let msgs = vec![
-        ChatMessage::user("Write a 500-word essay about AI in great detail."),
-    ];
+    let msgs = vec![ChatMessage::user(
+        "Write a 500-word essay about AI in great detail.",
+    )];
 
     // Cancel after a short time (the AtomicBool is checked per SSE chunk).
     std::thread::spawn(move || {
@@ -834,17 +929,27 @@ async fn live_openai_cancellation_mid_stream() {
 
     let start = Instant::now();
     let r = client.chat_stream(&msgs, &[], &sink, &cancel).await;
-    eprintln!("[cancel test] elapsed={:?} result={:?}", start.elapsed(),
-        r.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string()));
+    eprintln!(
+        "[cancel test] elapsed={:?} result={:?}",
+        start.elapsed(),
+        r.as_ref()
+            .map(|_| "ok".to_string())
+            .unwrap_or_else(|e| e.to_string())
+    );
     match r {
         Ok(resp) => {
             // If the model finished before cancel fired, that's also valid.
-            eprintln!("[cancel test] model finished before cancel: text_len={}", resp.text.len());
+            eprintln!(
+                "[cancel test] model finished before cancel: text_len={}",
+                resp.text.len()
+            );
         }
         Err(e) => {
             assert!(
-                e.to_string().contains("cancelled") || e.to_string().contains("Cancelled")
-                    || e.to_string().contains("timeout") || e.to_string().contains("Timeout"),
+                e.to_string().contains("cancelled")
+                    || e.to_string().contains("Cancelled")
+                    || e.to_string().contains("timeout")
+                    || e.to_string().contains("Timeout"),
                 "expected cancellation or timeout, got: {e}"
             );
         }
@@ -858,7 +963,10 @@ async fn live_openai_cancellation_mid_stream() {
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
 async fn live_anthropic_streams_text_sanity() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
-    eprintln!("[anthropic text] using model={} base_url={:?}", model.name, model.base_url);
+    eprintln!(
+        "[anthropic text] using model={} base_url={:?}",
+        model.name, model.base_url
+    );
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
@@ -867,8 +975,15 @@ async fn live_anthropic_streams_text_sanity() {
         ChatMessage::user("What is the capital of France?"),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
-    eprintln!("[anthropic text] elapsed={:?} text={:?}", start.elapsed(), resp.text);
+    let resp = client
+        .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[anthropic text] elapsed={:?} text={:?}",
+        start.elapsed(),
+        resp.text
+    );
     assert!(!resp.text.trim().is_empty());
 }
 
@@ -877,7 +992,10 @@ async fn live_anthropic_streams_text_sanity() {
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
 async fn live_anthropic_single_tool_call() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
-    eprintln!("[anthropic tool] using model={} base_url={:?}", model.name, model.base_url);
+    eprintln!(
+        "[anthropic tool] using model={} base_url={:?}",
+        model.name, model.base_url
+    );
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
@@ -895,14 +1013,25 @@ async fn live_anthropic_single_tool_call() {
         ChatMessage::user("List the files."),
     ];
     let start = Instant::now();
-    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).await.expect("live call failed");
-    eprintln!("[anthropic tool_call] elapsed={:?} tool_calls={:?} finish={:?}",
+    let resp = client
+        .chat_stream(&msgs, &tools, &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[anthropic tool_call] elapsed={:?} tool_calls={:?} finish={:?}",
         start.elapsed(),
-        resp.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>(),
-        resp.finish_reason);
-    assert!(!resp.tool_calls.is_empty(),
-        "expected tool call; finish={:?} text={:?}", resp.finish_reason,
-        &resp.text[..resp.text.len().min(200)]);
+        resp.tool_calls
+            .iter()
+            .map(|t| format!("{}:{}", t.name, t.arguments))
+            .collect::<Vec<_>>(),
+        resp.finish_reason
+    );
+    assert!(
+        !resp.tool_calls.is_empty(),
+        "expected tool call; finish={:?} text={:?}",
+        resp.finish_reason,
+        &resp.text[..resp.text.len().min(200)]
+    );
     assert_eq!(resp.tool_calls[0].name, "run_shell");
     assert!(resp.tool_calls[0].parsed_args().get("command").is_some());
 }
@@ -912,7 +1041,10 @@ async fn live_anthropic_single_tool_call() {
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
 async fn live_anthropic_multi_turn_conversation() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
-    eprintln!("[anthropic multi-turn] using model={} base_url={:?}", model.name, model.base_url);
+    eprintln!(
+        "[anthropic multi-turn] using model={} base_url={:?}",
+        model.name, model.base_url
+    );
     let client = build_client(&model);
     let tools = vec![serde_json::json!({
         "name": "run_shell",
@@ -926,29 +1058,49 @@ async fn live_anthropic_multi_turn_conversation() {
     let cancel = AtomicBool::new(false);
 
     let mut msgs = vec![
-        ChatMessage::system("You are a helpful coding assistant. Use run_shell when asked to run commands."),
+        ChatMessage::system(
+            "You are a helpful coding assistant. Use run_shell when asked to run commands.",
+        ),
         ChatMessage::user("Run 'echo hello_anthropic' and tell me the result."),
     ];
 
     // Turn 1: model calls run_shell
     let sink1 = CollectingSink::new(false);
-    let resp1 = client.chat_stream(&msgs, &tools, &sink1, &cancel).await.expect("turn 1 failed");
-    eprintln!("[anth turn 1] tool_calls={:?} finish={:?}",
-        resp1.tool_calls.iter().map(|t| format!("{}:{}", t.name, t.arguments)).collect::<Vec<_>>(),
-        resp1.finish_reason);
+    let resp1 = client
+        .chat_stream(&msgs, &tools, &sink1, &cancel)
+        .await
+        .expect("turn 1 failed");
+    eprintln!(
+        "[anth turn 1] tool_calls={:?} finish={:?}",
+        resp1
+            .tool_calls
+            .iter()
+            .map(|t| format!("{}:{}", t.name, t.arguments))
+            .collect::<Vec<_>>(),
+        resp1.finish_reason
+    );
     assert!(!resp1.tool_calls.is_empty(), "turn 1: expected tool call");
 
     // Feed tool result
     let tc1 = &resp1.tool_calls[0];
     let tool_result = format!("[shell output]\nhello_anthropic\n(exit code: 0)");
-    msgs.push(ChatMessage::assistant_with_tools(resp1.text.clone(), resp1.tool_calls.clone()));
+    msgs.push(ChatMessage::assistant_with_tools(
+        resp1.text.clone(),
+        resp1.tool_calls.clone(),
+    ));
     msgs.push(ChatMessage::tool_result(tc1.id.clone(), tool_result));
 
     // Turn 2: summary
     msgs.push(ChatMessage::user("Summarize the output."));
     let sink2 = CollectingSink::new(false);
-    let resp2 = client.chat_stream(&msgs, &[], &sink2, &cancel).await.expect("turn 2 failed");
-    eprintln!("[anth turn 2] text={:?}", &resp2.text[..resp2.text.len().min(200)]);
+    let resp2 = client
+        .chat_stream(&msgs, &[], &sink2, &cancel)
+        .await
+        .expect("turn 2 failed");
+    eprintln!(
+        "[anth turn 2] text={:?}",
+        &resp2.text[..resp2.text.len().min(200)]
+    );
     assert!(!resp2.text.trim().is_empty());
     eprintln!("=== Anthropic multi-turn OK ===");
 }
@@ -958,7 +1110,10 @@ async fn live_anthropic_multi_turn_conversation() {
 #[ignore = "requires env: LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY=anthropic"]
 async fn live_anthropic_five_iteration_tool_loop() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
-    eprintln!("[anthropic 5-iter] using model={} base_url={:?}", model.name, model.base_url);
+    eprintln!(
+        "[anthropic 5-iter] using model={} base_url={:?}",
+        model.name, model.base_url
+    );
     let client = build_client(&model);
     let tools = vec![serde_json::json!({
         "name": "run_shell",
@@ -982,13 +1137,22 @@ async fn live_anthropic_five_iteration_tool_loop() {
             Ok(r) => r,
             Err(e) => panic!("anthropic iteration {i} failed: {e}"),
         };
-        eprintln!("[anth iter {i}] elapsed={:?} tool_calls={}",
-            start.elapsed(), resp.tool_calls.len());
-        assert!(!resp.tool_calls.is_empty(),
-            "iteration {i}: expected tool call, finish={:?}", resp.finish_reason);
+        eprintln!(
+            "[anth iter {i}] elapsed={:?} tool_calls={}",
+            start.elapsed(),
+            resp.tool_calls.len()
+        );
+        assert!(
+            !resp.tool_calls.is_empty(),
+            "iteration {i}: expected tool call, finish={:?}",
+            resp.finish_reason
+        );
         let tc = &resp.tool_calls[0];
         let tool_result = format!("[shell output]\nanthropic_iter_{i}\n(exit code: 0)");
-        msgs.push(ChatMessage::assistant_with_tools(resp.text.clone(), resp.tool_calls.clone()));
+        msgs.push(ChatMessage::assistant_with_tools(
+            resp.text.clone(),
+            resp.tool_calls.clone(),
+        ));
         msgs.push(ChatMessage::tool_result(tc.id.clone(), tool_result));
     }
     eprintln!("=== Anthropic 5-iteration loop OK ===");
@@ -1001,17 +1165,29 @@ async fn live_anthropic_truncation_detection() {
     let model = live_model_from_env(Gateway::Anthropic).expect("LLM_API_KEY not set");
     let mut model = model;
     model.max_tokens = 10;
-    eprintln!("[anthropic truncation] using model={} max_tokens=10", model.name);
+    eprintln!(
+        "[anthropic truncation] using model={} max_tokens=10",
+        model.name
+    );
     let client = build_client(&model);
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
     let msgs = vec![
-        ChatMessage::system("Write a very long paragraph about computer history with at least 200 words."),
+        ChatMessage::system(
+            "Write a very long paragraph about computer history with at least 200 words.",
+        ),
         ChatMessage::user("Tell me about computers."),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
-    eprintln!("[anthropic truncation] finish={:?} is_truncated={} text_len={}",
-        resp.finish_reason, resp.is_truncated(), resp.text.len());
+    let resp = client
+        .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[anthropic truncation] finish={:?} is_truncated={} text_len={}",
+        resp.finish_reason,
+        resp.is_truncated(),
+        resp.text.len()
+    );
     if resp.finish_reason.as_deref() == Some("max_tokens") {
         assert!(resp.is_truncated());
     }
@@ -1042,15 +1218,25 @@ async fn live_openai_reasoning_then_tool_call() {
         }
     })];
     let msgs = vec![
-        ChatMessage::system("You MUST call run_shell with command='echo thinking_works'. Think about it first."),
+        ChatMessage::system(
+            "You MUST call run_shell with command='echo thinking_works'. Think about it first.",
+        ),
         ChatMessage::user("Run echo."),
     ];
-    let resp = client.chat_stream(&msgs, &tools, &sink, &cancel).await.expect("live call failed");
-    eprintln!("[reasoning+tool] finish={:?} reasoning_len={} text_len={} tool_calls={}",
+    let resp = client
+        .chat_stream(&msgs, &tools, &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[reasoning+tool] finish={:?} reasoning_len={} text_len={} tool_calls={}",
         resp.finish_reason,
-        resp.reasoning_content.as_ref().map(|r| r.len()).unwrap_or(0),
+        resp.reasoning_content
+            .as_ref()
+            .map(|r| r.len())
+            .unwrap_or(0),
         resp.text.len(),
-        resp.tool_calls.len());
+        resp.tool_calls.len()
+    );
     // The model may or may not emit reasoning_content. But if it does, we
     // must have both reasoning and tool_calls correctly separated.
     if resp.tool_calls.is_empty() {
@@ -1061,7 +1247,10 @@ async fn live_openai_reasoning_then_tool_call() {
     }
     if let Some(reasoning) = &resp.reasoning_content {
         assert!(!reasoning.is_empty());
-        eprintln!("[reasoning+tool] reasoning present ({} chars)", reasoning.len());
+        eprintln!(
+            "[reasoning+tool] reasoning present ({} chars)",
+            reasoning.len()
+        );
     }
 }
 
@@ -1102,8 +1291,14 @@ async fn live_openai_text_only_on_multimodal_model() {
         ChatMessage::system("Answer in one sentence only."),
         ChatMessage::user("What is 2+2?"),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
-    eprintln!("[multimodal text-only] text={:?}", &resp.text[..resp.text.len().min(200)]);
+    let resp = client
+        .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[multimodal text-only] text={:?}",
+        &resp.text[..resp.text.len().min(200)]
+    );
     assert!(resp.text.to_lowercase().contains("4"));
 }
 
@@ -1119,8 +1314,14 @@ async fn live_anthropic_text_only_on_multimodal_model() {
         ChatMessage::system("Answer in one sentence only."),
         ChatMessage::user("What is 2+2?"),
     ];
-    let resp = client.chat_stream(&msgs, &[], &sink, &cancel).await.expect("live call failed");
-    eprintln!("[anth multimodal text-only] text={:?}", &resp.text[..resp.text.len().min(200)]);
+    let resp = client
+        .chat_stream(&msgs, &[], &sink, &cancel)
+        .await
+        .expect("live call failed");
+    eprintln!(
+        "[anth multimodal text-only] text={:?}",
+        &resp.text[..resp.text.len().min(200)]
+    );
     assert!(resp.text.to_lowercase().contains("4"));
 }
 
@@ -1156,20 +1357,33 @@ async fn live_openai_full_react_loop_with_shell() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task(
-        "Run 'echo live_react_test' using the shell tool and tell me the output.",
-        None,
-        &sink,
-        &cancel,
-    ).await.expect("react loop failed");
+    let res = rt
+        .run_task(
+            "Run 'echo live_react_test' using the shell tool and tell me the output.",
+            None,
+            &sink,
+            &cancel,
+        )
+        .await
+        .expect("react loop failed");
 
-    eprintln!("[live react] status={:?} iterations={}", res.status, res.iterations);
-    eprintln!("[live react] final_text={:?}", &res.final_text[..res.final_text.len().min(300)]);
+    eprintln!(
+        "[live react] status={:?} iterations={}",
+        res.status, res.iterations
+    );
+    eprintln!(
+        "[live react] final_text={:?}",
+        &res.final_text[..res.final_text.len().min(300)]
+    );
     let lines = sink.lines();
     eprintln!("[live react] event_count={}", lines.len());
 
-    assert_eq!(format!("{:?}", res.status), "Completed",
-        "react loop should complete; final_text={:?}", res.final_text);
+    assert_eq!(
+        format!("{:?}", res.status),
+        "Completed",
+        "react loop should complete; final_text={:?}",
+        res.final_text
+    );
 
     // The final text (or an observation) should mention the echo output.
     let has_live_react_test = lines.iter().any(|l| l.contains("live_react_test"))
@@ -1209,21 +1423,32 @@ async fn live_anthropic_full_react_loop_with_shell() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task(
-        "Run 'echo live_react_anthropic_test' using the run_shell tool and report the output.",
-        None,
-        &sink,
-        &cancel,
-    ).await.expect("react loop failed");
+    let res = rt
+        .run_task(
+            "Run 'echo live_react_anthropic_test' using the run_shell tool and report the output.",
+            None,
+            &sink,
+            &cancel,
+        )
+        .await
+        .expect("react loop failed");
 
-    eprintln!("[live anth react] status={:?} iterations={}", res.status, res.iterations);
-    eprintln!("[live anth react] final_text={:?}", &res.final_text[..res.final_text.len().min(300)]);
+    eprintln!(
+        "[live anth react] status={:?} iterations={}",
+        res.status, res.iterations
+    );
+    eprintln!(
+        "[live anth react] final_text={:?}",
+        &res.final_text[..res.final_text.len().min(300)]
+    );
     let lines = sink.lines();
     eprintln!("[live anth react] event_count={}", lines.len());
 
     assert_eq!(format!("{:?}", res.status), "Completed");
 
-    let has_output = lines.iter().any(|l| l.contains("live_react_anthropic_test"))
+    let has_output = lines
+        .iter()
+        .any(|l| l.contains("live_react_anthropic_test"))
         || res.final_text.contains("live_react_anthropic_test");
     assert!(has_output, "expected 'live_react_anthropic_test' in output");
 

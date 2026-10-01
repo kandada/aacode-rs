@@ -12,15 +12,17 @@ pub mod config;
 pub mod error;
 pub mod stream;
 
-pub mod llm;
-pub mod tools;
-pub mod session;
-pub mod context;
 pub mod agent;
+pub mod artifacts;
+pub mod context;
+pub mod llm;
 pub mod mcp;
+pub mod observation;
+pub mod session;
+pub mod tools;
 
-pub mod runtime;
 pub mod ffi;
+pub mod runtime;
 
 pub use config::AgentConfig;
 pub use error::{AacodeError, Result};

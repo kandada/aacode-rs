@@ -38,9 +38,33 @@ const FAILURES_TO_OPEN: u32 = 1;
 /// Minimum window always granted to the final HTML-scrape fallback.
 const SCRAPE_MIN_SECS: f64 = 3.0;
 
+/// Realistic desktop Chrome UA for plain HTTP fetches (fetch_url / scrape).
+/// The webview (browser tools) uses the platform browser UA instead.
+const DESKTOP_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// Process-wide HTTP client. Carries a persistent cookie jar and realistic
+/// browser default headers so plain fetches look like a normal browser request
+/// (and keep cookies across calls). `Accept-Encoding` is left to reqwest.
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(DESKTOP_UA));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    );
+    headers.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+    );
+    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
+    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
+    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
+    headers.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .default_headers(headers)
+        .cookie_store(true)
         .build()
         .expect("reqwest client")
 });
@@ -256,37 +280,55 @@ impl SearchWebTool {
         self.enforce_rate_limit(engine, remaining).await;
         let budget = remaining.min(PER_ENGINE_CAP_SECS);
         let r = match engine {
-            "searxng" => searxng_search(
-                self.cfg.searxng_url.as_deref().unwrap_or("http://localhost:8080"),
-                query,
-                max_results,
-                budget,
-            ).await,
-            "brave" => brave_search(
-                self.cfg.brave_api_key.as_deref().unwrap_or(""),
-                query,
-                max_results,
-                budget,
-            ).await,
-            "google_cse" => google_cse_search(
-                self.cfg.google_cse_key.as_deref().unwrap_or(""),
-                self.cfg.google_cse_cx.as_deref().unwrap_or(""),
-                query,
-                max_results,
-                budget,
-            ).await,
-            "bing" => bing_search(
-                self.cfg.bing_api_key.as_deref().unwrap_or(""),
-                query,
-                max_results,
-                budget,
-            ).await,
-            "serpapi" => serpapi_search(
-                self.cfg.serpapi_key.as_deref().unwrap_or(""),
-                query,
-                max_results,
-                budget,
-            ).await,
+            "searxng" => {
+                searxng_search(
+                    self.cfg
+                        .searxng_url
+                        .as_deref()
+                        .unwrap_or("http://localhost:8080"),
+                    query,
+                    max_results,
+                    budget,
+                )
+                .await
+            }
+            "brave" => {
+                brave_search(
+                    self.cfg.brave_api_key.as_deref().unwrap_or(""),
+                    query,
+                    max_results,
+                    budget,
+                )
+                .await
+            }
+            "google_cse" => {
+                google_cse_search(
+                    self.cfg.google_cse_key.as_deref().unwrap_or(""),
+                    self.cfg.google_cse_cx.as_deref().unwrap_or(""),
+                    query,
+                    max_results,
+                    budget,
+                )
+                .await
+            }
+            "bing" => {
+                bing_search(
+                    self.cfg.bing_api_key.as_deref().unwrap_or(""),
+                    query,
+                    max_results,
+                    budget,
+                )
+                .await
+            }
+            "serpapi" => {
+                serpapi_search(
+                    self.cfg.serpapi_key.as_deref().unwrap_or(""),
+                    query,
+                    max_results,
+                    budget,
+                )
+                .await
+            }
             _ => return Attempt::Skipped("unknown-engine"),
         };
         match r {
@@ -323,15 +365,22 @@ impl Tool for SearchWebTool {
 
     async fn call(&self, args: &Value, cancel: &AtomicBool) -> Result<String> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(self.timeout_secs);
+        let max_results = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
+        let timeout = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.timeout_secs);
 
         if query.is_empty() {
             return Ok(json!({"success": false, "error": "empty query"}).to_string());
         }
 
-        let (success, engine, results, tried) =
-            self.search_with_fallback(query, max_results, timeout, cancel).await;
+        let (success, engine, results, tried) = self
+            .search_with_fallback(query, max_results, timeout, cancel)
+            .await;
 
         Ok(json!({
             "success": success,
@@ -347,20 +396,34 @@ impl Tool for SearchWebTool {
 
 // ──────────────────── Engine-specific search helpers ────────────────────
 
-async fn searxng_search(base: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+async fn searxng_search(
+    base: &str,
+    query: &str,
+    max_results: usize,
+    budget: f64,
+) -> Result<Vec<Value>> {
     let url = format!("{}/search", base.trim_end_matches('/'));
     let resp = HTTP_CLIENT
         .get(&url)
         .query(&[("q", query), ("format", "json")])
         .timeout(Duration::from_secs_f64(budget))
-        .send().await
+        .send()
+        .await
         .map_err(|e| AacodeError::Network(e.to_string()))?;
-    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(extract_results(&v, max_results, "title", "url", "content"))
 }
 
-async fn brave_search(api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+async fn brave_search(
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+    budget: f64,
+) -> Result<Vec<Value>> {
     let resp = HTTP_CLIENT
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("Accept", "application/json")
@@ -368,12 +431,20 @@ async fn brave_search(api_key: &str, query: &str, max_results: usize, budget: f6
         .header("X-Subscription-Token", api_key)
         .query(&[("q", query), ("count", &max_results.to_string())])
         .timeout(Duration::from_secs_f64(budget))
-        .send().await
+        .send()
+        .await
         .map_err(|e| AacodeError::Network(e.to_string()))?;
-    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     let mut out = Vec::new();
-    if let Some(arr) = v.get("web").and_then(|r| r.get("results")).and_then(|r| r.as_array()) {
+    if let Some(arr) = v
+        .get("web")
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.as_array())
+    {
         for item in arr.iter().take(max_results) {
             out.push(json!({
                 "title": item.get("title").and_then(|x| x.as_str()).unwrap_or(""),
@@ -385,31 +456,63 @@ async fn brave_search(api_key: &str, query: &str, max_results: usize, budget: f6
     Ok(out)
 }
 
-async fn google_cse_search(api_key: &str, cx: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+async fn google_cse_search(
+    api_key: &str,
+    cx: &str,
+    query: &str,
+    max_results: usize,
+    budget: f64,
+) -> Result<Vec<Value>> {
     let resp = HTTP_CLIENT
         .get("https://www.googleapis.com/customsearch/v1")
-        .query(&[("key", api_key), ("cx", cx), ("q", query), ("num", &max_results.to_string())])
+        .query(&[
+            ("key", api_key),
+            ("cx", cx),
+            ("q", query),
+            ("num", &max_results.to_string()),
+        ])
         .timeout(Duration::from_secs_f64(budget))
-        .send().await
+        .send()
+        .await
         .map_err(|e| AacodeError::Network(e.to_string()))?;
-    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(extract_results(&v, max_results, "title", "link", "snippet"))
 }
 
-async fn bing_search(_api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+async fn bing_search(
+    _api_key: &str,
+    query: &str,
+    max_results: usize,
+    budget: f64,
+) -> Result<Vec<Value>> {
     // Bing v7 API requires Ocp-Apim-Subscription-Key.
     let resp = HTTP_CLIENT
         .get("https://api.bing.microsoft.com/v7.0/search")
         .header("Ocp-Apim-Subscription-Key", _api_key)
-        .query(&[("q", query), ("count", &max_results.to_string()), ("mkt", "en-US")])
+        .query(&[
+            ("q", query),
+            ("count", &max_results.to_string()),
+            ("mkt", "en-US"),
+        ])
         .timeout(Duration::from_secs_f64(budget))
-        .send().await
+        .send()
+        .await
         .map_err(|e| AacodeError::Network(e.to_string()))?;
-    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     let mut out = Vec::new();
-    if let Some(arr) = v.get("webPages").and_then(|r| r.get("value")).and_then(|r| r.as_array()) {
+    if let Some(arr) = v
+        .get("webPages")
+        .and_then(|r| r.get("value"))
+        .and_then(|r| r.as_array())
+    {
         for item in arr.iter().take(max_results) {
             out.push(json!({
                 "title": item.get("name").and_then(|x| x.as_str()).unwrap_or(""),
@@ -421,21 +524,45 @@ async fn bing_search(_api_key: &str, query: &str, max_results: usize, budget: f6
     Ok(out)
 }
 
-async fn serpapi_search(api_key: &str, query: &str, max_results: usize, budget: f64) -> Result<Vec<Value>> {
+async fn serpapi_search(
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+    budget: f64,
+) -> Result<Vec<Value>> {
     let resp = HTTP_CLIENT
         .get("https://serpapi.com/search")
-        .query(&[("api_key", api_key), ("q", query), ("engine", "google"), ("num", &max_results.to_string())])
+        .query(&[
+            ("api_key", api_key),
+            ("q", query),
+            ("engine", "google"),
+            ("num", &max_results.to_string()),
+        ])
         .timeout(Duration::from_secs_f64(budget))
-        .send().await
+        .send()
+        .await
         .map_err(|e| AacodeError::Network(e.to_string()))?;
-    let body = resp.text().await.map_err(|e| AacodeError::Network(e.to_string()))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| AacodeError::Network(e.to_string()))?;
     let v: Value = serde_json::from_str(&body)?;
     Ok(extract_results(&v, max_results, "title", "link", "snippet"))
 }
 
 /// Extract {title, url, content} from a JSON search response's results array.
-fn extract_results(v: &Value, max_results: usize, title_k: &str, url_k: &str, snippet_k: &str) -> Vec<Value> {
-    let arr = match v.get("results").or_else(|| v.get("items")).and_then(|r| r.as_array()) {
+fn extract_results(
+    v: &Value,
+    max_results: usize,
+    title_k: &str,
+    url_k: &str,
+    snippet_k: &str,
+) -> Vec<Value> {
+    let arr = match v
+        .get("results")
+        .or_else(|| v.get("items"))
+        .and_then(|r| r.as_array())
+    {
         Some(a) => a,
         None => return Vec::new(),
     };
@@ -453,13 +580,115 @@ fn extract_results(v: &Value, max_results: usize, title_k: &str, url_k: &str, sn
 
 // ──────────────────────── HTML fallback scrape ──────────────────────────
 
-async fn fallback_scrape(query: &str, max_results: usize, budget: f64) -> Option<(String, Vec<Value>)> {
+/// Bing RSS search (format=rss). Much cleaner and more query-accurate than
+/// scraping the HTML result page, and stable across the `www` / `cn` hosts.
+/// Races both endpoints and returns the first non-empty set.
+async fn bing_rss_scrape(query: &str, max_results: usize, budget: f64) -> Option<Vec<Value>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Value>>(2);
+    for base in ["https://www.bing.com/search", "https://cn.bing.com/search"] {
+        let q = query.to_string();
+        let bu = base.to_string();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Some(v) = scrape_bing_rss(&bu, &q, max_results, budget).await {
+                let _ = tx.send(v).await;
+            }
+        });
+    }
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs_f64(budget), rx.recv())
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn scrape_bing_rss(
+    base_url: &str,
+    query: &str,
+    max_results: usize,
+    budget: f64,
+) -> Option<Vec<Value>> {
+    let resp = HTTP_CLIENT
+        .get(base_url)
+        .header("User-Agent", DESKTOP_UA)
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .query(&[("q", query), ("format", "rss")])
+        .timeout(Duration::from_secs_f64(budget))
+        .send()
+        .await
+        .ok()?;
+    let xml = resp.text().await.ok()?;
+    let results = parse_bing_rss(&xml, max_results);
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
+}
+
+/// Parse a Bing RSS document into result objects (pure — unit-testable).
+fn parse_bing_rss(xml: &str, max_results: usize) -> Vec<Value> {
+    let Ok(item_re) = regex::Regex::new(r"(?s)<item>(.*?)</item>") else {
+        return vec![];
+    };
+    let Ok(title_re) = regex::Regex::new(r"(?s)<title>(.*?)</title>") else {
+        return vec![];
+    };
+    let Ok(link_re) = regex::Regex::new(r"(?s)<link>(.*?)</link>") else {
+        return vec![];
+    };
+    let Ok(desc_re) = regex::Regex::new(r"(?s)<description>(.*?)</description>") else {
+        return vec![];
+    };
+    let Ok(clean_re) = regex::Regex::new(r#"<[^>]+>"#) else {
+        return vec![];
+    };
+    let pick = |re: &regex::Regex, it: &str| -> String {
+        re.captures(it)
+            .map(|c| strip_cdata(&c[1]))
+            .unwrap_or_default()
+    };
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cap in item_re.captures_iter(xml) {
+        let it = &cap[1];
+        let title = html_unescape(&pick(&title_re, it)).trim().to_string();
+        let url = normalize_result_url(&pick(&link_re, it));
+        let snippet = html_unescape(clean_re.replace_all(&pick(&desc_re, it), "").trim());
+        if !is_quality_result(&url, &title) || seen.contains(&url) {
+            continue;
+        }
+        seen.insert(url.clone());
+        results.push(json!({
+            "title": title,
+            "url": url,
+            "content": snippet,
+            "engine": "bing_rss",
+        }));
+        if results.len() >= max_results {
+            break;
+        }
+    }
+    results
+}
+
+async fn fallback_scrape(
+    query: &str,
+    max_results: usize,
+    budget: f64,
+) -> Option<(String, Vec<Value>)> {
     if budget <= 0.5 {
         return None;
     }
+    // 1) Prefer Bing RSS: clean XML, query-accurate, and endpoint-agnostic.
+    //    Global (`www`) and China (`cn`) endpoints are raced — both are valid
+    //    for a globally distributed app (Google Play / global App Store).
+    if let Some(results) = bing_rss_scrape(query, max_results, (budget * 0.6).max(2.0)).await {
+        return Some(("bing_rss".to_string(), results));
+    }
+    // 2) Parallel HTML scrape race; first NON-EMPTY (after quality filtering) wins.
     // (name, url, result_regex, clean_regex, user_agent)
-    // All raced in parallel; first NON-EMPTY (after quality filtering) wins.
-    let scrapers: [(&str, &str, &str, &str, &str); 3] = [
+    let scrapers: [(&str, &str, &str, &str, &str); 4] = [
         (
             "ddg_scrape",
             "https://html.duckduckgo.com/html/",
@@ -472,6 +701,13 @@ async fn fallback_scrape(query: &str, max_results: usize, budget: f64) -> Option
             "https://www.bing.com/search",
             // Anchor on the <h2> title link — the first <a> inside b_algo is
             // often the cite/breadcrumb link, not the result title.
+            r#"(?s)<li\s+class="b_algo"[^>]*>.*?<h2[^>]*>\s*<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>.*?<p[^>]*>(.*?)</p>"#,
+            r#"<[^>]+>"#,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ),
+        (
+            "bing_scrape_cn",
+            "https://cn.bing.com/search",
             r#"(?s)<li\s+class="b_algo"[^>]*>.*?<h2[^>]*>\s*<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>.*?<p[^>]*>(.*?)</p>"#,
             r#"<[^>]+>"#,
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -504,7 +740,10 @@ async fn fallback_scrape(query: &str, max_results: usize, budget: f64) -> Option
     }
     drop(tx);
 
-    tokio::time::timeout(Duration::from_secs_f64(budget), rx.recv()).await.ok().flatten()
+    tokio::time::timeout(Duration::from_secs_f64(budget), rx.recv())
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn scrape_one(
@@ -523,7 +762,8 @@ async fn scrape_one(
         .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
         .query(&[("q", query)])
         .timeout(Duration::from_secs_f64(budget))
-        .send().await;
+        .send()
+        .await;
     let resp = match resp {
         Ok(r) => r,
         Err(_) => return None,
@@ -537,7 +777,10 @@ async fn scrape_one(
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for caps in re.captures_iter(&html) {
-        let raw_url = caps.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+        let raw_url = caps
+            .get(1)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
         let url = normalize_result_url(&raw_url);
         let title = html_unescape(
             clean
@@ -573,6 +816,8 @@ async fn scrape_one(
 /// DuckDuckGo html results use redirect links like
 /// `//duckduckgo.com/l/?uddg=<percent-encoded-url>&rut=...` — unwrap them.
 fn normalize_result_url(url: &str) -> String {
+    // Feeds HTML-escape `&` as `&amp;` inside hrefs/links.
+    let url = html_unescape(url);
     if let Some(pos) = url.find("uddg=") {
         let rest = &url[pos + 5..];
         let enc = rest.split('&').next().unwrap_or(rest);
@@ -581,7 +826,7 @@ fn normalize_result_url(url: &str) -> String {
     if let Some(stripped) = url.strip_prefix("//") {
         return format!("https://{stripped}");
     }
-    url.to_string()
+    url
 }
 
 fn percent_decode(s: &str) -> String {
@@ -603,13 +848,95 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn html_unescape(s: &str) -> String {
-    s.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        if s.as_bytes()[i] == b'&' {
+            if let Some(rel) = s[i..].find(';') {
+                let semi = i + rel;
+                // Entity names/refs are short; ignore absurd runs.
+                if semi - i <= 12 {
+                    if let Some(ch) = decode_entity(&s[i + 1..semi]) {
+                        out.push(ch);
+                        i = semi + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Decode a single HTML entity body (the text between `&` and `;`): numeric
+/// (`#123`, `#x1F`) or a small set of common named entities.
+fn decode_entity(ent: &str) -> Option<char> {
+    if let Some(hex) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
+        return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+    }
+    if let Some(dec) = ent.strip_prefix('#') {
+        return dec.parse::<u32>().ok().and_then(char::from_u32);
+    }
+    Some(match ent {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" | "ensp" | "emsp" | "thinsp" | "zwnj" | "zwj" => ' ',
+        "middot" => '·',
+        "copy" => '©',
+        "reg" => '®',
+        "trade" => '™',
+        "hellip" => '…',
+        "mdash" => '—',
+        "ndash" | "minus" => '–',
+        "laquo" => '«',
+        "raquo" => '»',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "times" => '×',
+        "divide" => '÷',
+        "deg" => '°',
+        "plusmn" => '±',
+        "sup2" => '²',
+        "sup3" => '³',
+        "frac12" => '½',
+        "frac14" => '¼',
+        "euro" => '€',
+        "pound" => '£',
+        "yen" => '¥',
+        "cent" => '¢',
+        "sect" => '§',
+        "para" => '¶',
+        "bull" => '•',
+        "dagger" => '†',
+        "prime" => '′',
+        "Prime" => '″',
+        "lsaquo" => '‹',
+        "rsaquo" => '›',
+        "larr" => '←',
+        "rarr" => '→',
+        "harr" => '↔',
+        "ne" => '≠',
+        "le" => '≤',
+        "ge" => '≥',
+        _ => return None,
+    })
+}
+
+/// Strip an optional `<![CDATA[ ... ]]>` wrapper (Bing RSS descriptions).
+fn strip_cdata(s: &str) -> String {
+    let t = s.trim();
+    t.strip_prefix("<![CDATA[")
+        .and_then(|x| x.strip_suffix("]]>"))
+        .map(|x| x.to_string())
+        .unwrap_or_else(|| t.to_string())
 }
 
 /// Drop junk entries: breadcrumb/cite pseudo-titles ("site.com › path"),
@@ -622,14 +949,62 @@ fn is_quality_result(url: &str, title: &str) -> bool {
         return false;
     }
     // A "title" that is just a URL/domain (no spaces, looks like a host).
-    if !title.contains(' ') && (title.contains("http") || title.contains(".com") || title.contains(".org")) {
+    if !title.contains(' ')
+        && (title.contains("http") || title.contains(".com") || title.contains(".org"))
+    {
         return false;
     }
-    // Bing ad redirects.
-    if url.contains("bing.com/aclick") || url.contains("duckduckgo.com/y.js") {
+    // Search engines / ad redirects / SERP landing pages are not content.
+    if looks_like_search_url(url) {
+        return false;
+    }
+    // Titles that are obviously a search box / SERP.
+    let t = title.trim();
+    if t.contains("百度一下") || t.contains("搜索结果") {
         return false;
     }
     true
+}
+
+/// Whether a URL is a search-engine / ad-redirect / SERP page rather than a
+/// content page. Kept deliberately high-precision to avoid dropping legitimate
+/// results: only known search hosts, or a search *path* combined with a search
+/// query param (a bare `?word=` on e.g. a dictionary entry is NOT filtered).
+fn looks_like_search_url(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    const HOSTS: &[&str] = &[
+        "bing.com/aclick",
+        "bing.com/search",
+        "duckduckgo.com/y.js",
+        "mc.baidu.com",
+        "baidu.com/s?",
+        "m.baidu.com/from=",
+        "so.com/s?",
+        "sogou.com/web",
+        "google.com/search",
+        "google.com/url?",
+        "search.yahoo.com",
+        "yandex.com/search",
+        "sm.cn/s?",
+    ];
+    if HOSTS.iter().any(|h| u.contains(h)) {
+        return true;
+    }
+    // Search *path* + a search query param, e.g. `/s?q=`, `/search?query=`.
+    let (path, query) = match u.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => return false,
+    };
+    let search_path = ["/s", "/search", "/web", "/results", "/find", "/query"]
+        .iter()
+        .any(|s| path.ends_with(s));
+    if !search_path {
+        return false;
+    }
+    const PARAMS: &[&str] = &["q=", "word=", "query=", "wd=", "keyword=", "kw="];
+    PARAMS
+        .iter()
+        .any(|p| query.starts_with(p) || query.contains(&format!("&{p}")))
 }
 
 // ─────────────────────────── detect engine type ─────────────────────────
@@ -659,6 +1034,58 @@ fn current_time() -> f64 {
 
 // ─────────────────────────── fetch_url ──────────────────────────────────
 
+/// Decode an HTTP body honoring its charset. reqwest is built with
+/// `default-features = false` (no `charset` feature), so `resp.text()` assumes
+/// UTF-8 and mangles GBK/GB2312 pages. Prefer the Content-Type charset, then a
+/// `<meta charset>` / `http-equiv` sniff in the first 4 KB, else UTF-8 lossy.
+fn decode_body(bytes: &[u8], content_type: &str) -> String {
+    let label = charset_from_content_type(content_type).or_else(|| sniff_meta_charset(bytes));
+    match label
+        .as_deref()
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+    {
+        Some(enc) if enc != encoding_rs::UTF_8 => {
+            let (s, _, _) = enc.decode(bytes);
+            s.into_owned()
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn charset_from_content_type(ct: &str) -> Option<String> {
+    let lower = ct.to_ascii_lowercase();
+    let i = lower.find("charset=")?;
+    // ASCII lowercasing preserves byte offsets, so `i` is valid in `ct`.
+    let rest = &ct[i + "charset=".len()..];
+    let val: String = rest
+        .trim_start_matches(['"', '\'', ' '])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_ascii_lowercase())
+    }
+}
+
+fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(4096)];
+    let s = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let i = s.find("charset=")?;
+    let rest = &s[i + "charset=".len()..];
+    let val: String = rest
+        .trim_start_matches(['"', '\'', ' '])
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val)
+    }
+}
+
 pub struct FetchUrlTool {
     pub project_path: PathBuf,
     pub timeout_secs: u64,
@@ -671,9 +1098,27 @@ impl Tool for FetchUrlTool {
             "fetch_url",
             "Fetch the content of a URL (cleaned text). Also available via run_shell + curl.",
             vec![
-                ToolParameter::new("url", ParamType::String, true, "URL to fetch", &["link", "uri", "address"]),
-                ToolParameter::new("timeout", ParamType::Integer, false, "Timeout seconds", &["time_limit", "max_time", "wait"]),
-                ToolParameter::new("max_content_length", ParamType::Integer, false, "Max cleaned chars", &["max_length", "max_chars"]),
+                ToolParameter::new(
+                    "url",
+                    ParamType::String,
+                    true,
+                    "URL to fetch",
+                    &["link", "uri", "address"],
+                ),
+                ToolParameter::new(
+                    "timeout",
+                    ParamType::Integer,
+                    false,
+                    "Timeout seconds",
+                    &["time_limit", "max_time", "wait"],
+                ),
+                ToolParameter::new(
+                    "max_content_length",
+                    ParamType::Integer,
+                    false,
+                    "Max cleaned chars",
+                    &["max_length", "max_chars"],
+                ),
             ],
         )
     }
@@ -683,40 +1128,125 @@ impl Tool for FetchUrlTool {
         if url.is_empty() {
             return Ok(json!({"success": false, "error": "empty url"}).to_string());
         }
-        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(self.timeout_secs);
-        let max_len = args.get("max_content_length").and_then(|v| v.as_u64()).unwrap_or(5000) as usize;
+        let timeout = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.timeout_secs);
+        let max_len = args
+            .get("max_content_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5000) as usize;
 
+        // Use the shared client's browser UA / Accept-Language. Do NOT override
+        // the UA with a bot string: many sites (Baidu, 知乎, …) answer a bot UA
+        // with 403 / an anti-bot page, so a plain fetch looked "blocked".
         let resp = HTTP_CLIENT
             .get(url)
-            .header("User-Agent", "aacode-rs/0.1")
             .timeout(Duration::from_secs_f64(timeout as f64))
-            .send().await;
+            .send()
+            .await;
         let (status, body) = match resp {
             Ok(r) => {
                 let status = r.status().as_u16();
-                (status, r.text().await.unwrap_or_default())
+                let ctype = r
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = r.bytes().await.unwrap_or_default();
+                (status, decode_body(&bytes, &ctype))
             }
             Err(e) => {
-                return Ok(json!({"success": false, "url": url, "error": e.to_string()}).to_string());
+                return Ok(
+                    json!({"success": false, "url": url, "error": e.to_string()}).to_string(),
+                );
             }
         };
 
         let raw_len = body.len();
         let cleaned = clean_html(&body);
+        let cleaned_len = cleaned.chars().count();
         let content: String = cleaned.chars().take(max_len).collect();
         let saved = save_extract(&self.project_path, &cleaned);
 
-        Ok(json!({
-            "success": true,
+        let block = detect_block(status, &body, cleaned_len);
+        let ok = (200..300).contains(&status) && block.is_none();
+
+        #[allow(unused_mut)]
+        let mut out = json!({
+            "success": ok,
             "url": url,
             "status_code": status,
             "raw_length": raw_len,
-            "content_length": cleaned.chars().count(),
+            "content_length": cleaned_len,
             "content": content,
             "extract_file": saved,
-        })
-        .to_string())
+        });
+        if let Some(reason) = block {
+            out["blocked"] = json!(true);
+            out["block_reason"] = json!(reason);
+            out["hint"] = json!(
+                "Blocked by the site's anti-bot / JS challenge — a plain HTTP fetch cannot pass it. \
+                 Use `browser_tools` + `browser_call`: `navigate` to the URL, then `get_page_text` (or `extract_text`). \
+                 For sites with a mobile/AMP version or a public API, those often bypass the challenge."
+            );
+        } else if !ok {
+            out["hint"] = json!(format!(
+                "HTTP {status} — the server returned an error page; verify the URL or try a web search."
+            ));
+        } else if cleaned_len < 200 {
+            #[cfg(feature = "browser")]
+            {
+                out["hint"] = json!(
+                    "little text extracted — this page may need JavaScript; try fetch_rendered, or browser_tools + browser_call (navigate → get_page_text)"
+                );
+            }
+        }
+        Ok(out.to_string())
     }
+}
+
+/// Heuristically decide whether a fetch was blocked by anti-bot / a JS
+/// challenge. Primary signal is the HTTP status; for 2xx responses we look for
+/// a script-heavy shell with almost no readable text plus generic challenge
+/// wording (English + Chinese). Deliberately small/generic rather than matching
+/// any single site.
+pub(crate) fn detect_block(status: u16, body: &str, cleaned_len: usize) -> Option<&'static str> {
+    if status >= 400 {
+        return Some("http_status");
+    }
+    if status == 0 {
+        return Some("no_response");
+    }
+    if cleaned_len >= 120 {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    const CHALLENGE_WORDS: &[&str] = &[
+        "captcha",
+        "challenge",
+        "are you a robot",
+        "verify you are human",
+        "access denied",
+        "just a moment",
+        "attention required",
+        "checking your browser",
+        "enable javascript",
+        "安全验证",
+        "验证码",
+        "人机验证",
+        "访问验证",
+        "滑动验证",
+    ];
+    if CHALLENGE_WORDS.iter().any(|w| lower.contains(w)) {
+        return Some("anti_bot");
+    }
+    // A near-empty document that is mostly <script> → likely a JS challenge.
+    if lower.matches("<script").count() >= 2 && cleaned_len < 40 {
+        return Some("js_challenge");
+    }
+    None
 }
 
 fn save_extract(project_path: &std::path::Path, content: &str) -> Option<String> {
@@ -756,17 +1286,15 @@ pub fn clean_html(html: &str) -> String {
     for c in stripped.chars() {
         match c {
             '<' => in_tag = true,
-            '>' => { in_tag = false; out.push(' '); }
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
             _ if !in_tag => out.push(c),
             _ => {}
         }
     }
-    let decoded = out
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"");
+    let decoded = html_unescape(&out);
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -780,7 +1308,11 @@ fn remove_blocks(html: &str) -> String {
     while i < n {
         let rest: String = low[i..].iter().take(8).collect();
         if rest.starts_with("<script") || rest.starts_with("<style") {
-            let close = if rest.starts_with("<script") { "</script>" } else { "</style>" };
+            let close = if rest.starts_with("<script") {
+                "</script>"
+            } else {
+                "</style>"
+            };
             let low_rest: String = low[i..].iter().collect();
             if let Some(pos) = low_rest.find(close) {
                 i += pos + close.len();
@@ -793,6 +1325,136 @@ fn remove_blocks(html: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Structure-aware HTML → text: drops `<script>/<style>/<noscript>` and comments,
+/// turns block tags into line breaks, strips the remaining tags, decodes common
+/// entities, then collapses whitespace and duplicate lines.
+///
+/// More readable (and usually smaller) than [`clean_html`], which flattens the
+/// whole document to a single line. Used to compress browser page dumps.
+pub fn html_to_text(html: &str) -> String {
+    let stripped = remove_tag_blocks(html);
+    let mut out = String::with_capacity(stripped.len() / 2);
+    let mut in_tag = false;
+    let mut tag = String::new();
+    for c in stripped.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                tag.clear();
+            }
+            '>' => {
+                in_tag = false;
+                out.push(if is_block_tag(&tag) { '\n' } else { ' ' });
+            }
+            _ if in_tag => tag.push(c.to_ascii_lowercase()),
+            _ => out.push(c),
+        }
+    }
+    let decoded = decode_entities(&out);
+    let mut clean = String::with_capacity(decoded.len());
+    let mut prev: Option<String> = None;
+    for raw in decoded.lines() {
+        let line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() || prev.as_deref() == Some(line.as_str()) {
+            continue;
+        }
+        if !clean.is_empty() {
+            clean.push('\n');
+        }
+        clean.push_str(&line);
+        prev = Some(line);
+    }
+    clean
+}
+
+/// Remove `<script>/<style>/<noscript>` blocks and `<!-- -->` comments.
+fn remove_tag_blocks(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    let n = html.len();
+    while i < n {
+        let rest = &lower[i..];
+        let close = if rest.starts_with("<script") {
+            Some("</script>")
+        } else if rest.starts_with("<style") {
+            Some("</style>")
+        } else if rest.starts_with("<noscript") {
+            Some("</noscript>")
+        } else if rest.starts_with("<!--") {
+            Some("-->")
+        } else {
+            None
+        };
+        if let Some(c) = close {
+            match rest.find(c) {
+                Some(p) => {
+                    i += p + c.len();
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let ch = html[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Whether a (lowercased, `/`-or-attribute-suffixed) tag name is block-level.
+fn is_block_tag(tag: &str) -> bool {
+    let t = tag
+        .trim_start_matches('/')
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .next()
+        .unwrap_or("");
+    matches!(
+        t,
+        "p" | "div"
+            | "br"
+            | "li"
+            | "ul"
+            | "ol"
+            | "tr"
+            | "td"
+            | "th"
+            | "table"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "blockquote"
+            | "pre"
+            | "hr"
+            | "form"
+            | "figure"
+            | "figcaption"
+            | "main"
+    )
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–")
+        .replace("&hellip;", "…")
 }
 
 // ─────────────────────────── search_code ────────────────────────────────
@@ -819,7 +1481,10 @@ impl Tool for SearchCodeTool {
         if query.is_empty() {
             return Ok(json!({"success": false, "error": "empty query"}).to_string());
         }
-        let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        let max = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
 
         // Prefer SearXNG with IT categories (fast connect timeout so a dead
         // host degrades to the GitHub fallback quickly).
@@ -829,14 +1494,18 @@ impl Tool for SearchCodeTool {
                 .get(&url)
                 .query(&[("q", query), ("format", "json"), ("categories", "it")])
                 .timeout(Duration::from_secs_f64(PER_ENGINE_CAP_SECS))
-                .send().await
+                .send()
+                .await
             {
                 Ok(r) => {
                     let body = r.text().await.unwrap_or_default();
                     if let Ok(v) = serde_json::from_str::<Value>(&body) {
                         let results = extract_results(&v, max, "title", "url", "content");
                         if !results.is_empty() {
-                            return Ok(json!({"success": true, "query": query, "results": results}).to_string());
+                            return Ok(
+                                json!({"success": true, "query": query, "results": results})
+                                    .to_string(),
+                            );
                         }
                     }
                 }
@@ -855,7 +1524,8 @@ impl Tool for SearchCodeTool {
             .header("User-Agent", "aacode-rs")
             .header("Accept", "application/vnd.github+json")
             .timeout(Duration::from_secs_f64(self.timeout_secs as f64))
-            .send().await;
+            .send()
+            .await;
         match resp {
             Ok(r) => {
                 let body = r.text().await.unwrap_or_default();
@@ -882,7 +1552,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push_str("%20"),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -902,6 +1574,15 @@ mod tests {
         assert!(cleaned.contains("World"));
         assert!(!cleaned.contains("color:red"));
         assert!(!cleaned.contains("var x"));
+    }
+
+    #[test]
+    fn html_to_text_keeps_block_lines_and_drops_scripts() {
+        let html = "<h1>Title</h1><script>var x=1;</script><p>Hello&nbsp;world</p>\
+                    <!-- c --><div>a</div><div>a</div><div>b</div>";
+        let text = html_to_text(html);
+        assert_eq!(text, "Title\nHello world\na\nb");
+        assert!(!text.contains('<'));
     }
 
     #[test]
@@ -929,10 +1610,50 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_url_empty() {
-        let t = FetchUrlTool { project_path: std::env::temp_dir(), timeout_secs: 5 };
+        let t = FetchUrlTool {
+            project_path: std::env::temp_dir(),
+            timeout_secs: 5,
+        };
         let cancel = AtomicBool::new(false);
         let out = t.call(&json!({"url": ""}), &cancel).await.unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], false);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["success"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_url_hints_when_content_short() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let _ = req.respond(tiny_http::Response::from_string(
+                    "<html><body>hi</body></html>",
+                ));
+            }
+        });
+        let t = FetchUrlTool {
+            project_path: std::env::temp_dir(),
+            timeout_secs: 5,
+        };
+        let cancel = AtomicBool::new(false);
+        let out = t
+            .call(
+                &json!({"url": format!("http://127.0.0.1:{port}/")}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["success"], true);
+        #[cfg(feature = "browser")]
+        assert!(
+            v.get("hint").is_some(),
+            "short content should hint fetch_rendered: {v}"
+        );
+        #[cfg(not(feature = "browser"))]
+        assert!(v.get("hint").is_none());
     }
 
     #[test]
@@ -959,7 +1680,10 @@ mod tests {
         let a = SearchWebTool::new(SearchConfig::default(), 5);
         let b = SearchWebTool::new(SearchConfig::default(), 5);
         a.record_outcome("test_engine_shared", false);
-        assert!(b.circuit_open("test_engine_shared"), "breaker must be shared");
+        assert!(
+            b.circuit_open("test_engine_shared"),
+            "breaker must be shared"
+        );
         b.record_outcome("test_engine_shared", true);
         assert!(!a.circuit_open("test_engine_shared"));
     }
@@ -978,7 +1702,10 @@ mod tests {
         assert!(matches!(a, Attempt::Skipped("not-configured")));
         let a = t.try_engine("searxng", "q", 3, 5.0).await;
         assert!(matches!(a, Attempt::Skipped("not-configured")));
-        assert!(start.elapsed().as_millis() < 200, "skips must not hit the network");
+        assert!(
+            start.elapsed().as_millis() < 200,
+            "skips must not hit the network"
+        );
     }
 
     /// Serializes tests that touch the process-wide "searxng" breaker entry.
@@ -1012,12 +1739,18 @@ mod tests {
         };
         let t = SearchWebTool::new(cfg, 1);
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"query": "rust", "timeout": 1}), &cancel).await.unwrap();
+        let out = t
+            .call(&json!({"query": "rust", "timeout": 1}), &cancel)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let tried = v["engines_tried"].as_array().unwrap();
         assert!(!tried.is_empty());
         let first = tried[0].as_str().unwrap();
-        assert!(first.starts_with("searxng:"), "first tried should be searxng, got {first}");
+        assert!(
+            first.starts_with("searxng:"),
+            "first tried should be searxng, got {first}"
+        );
         t.record_outcome("searxng", true); // clean up shared breaker state
     }
 
@@ -1066,11 +1799,17 @@ mod tests {
     #[test]
     fn quality_filter_drops_junk() {
         // Breadcrumb pseudo-titles from cite links.
-        assert!(!is_quality_result("https://a.com", "rust-lang.orghttps://rust-lang.org › zh-CN"));
+        assert!(!is_quality_result(
+            "https://a.com",
+            "rust-lang.orghttps://rust-lang.org › zh-CN"
+        ));
         // Domain-only titles.
         assert!(!is_quality_result("https://a.com", "rust-lang.org"));
         // Ads/redirects.
-        assert!(!is_quality_result("https://www.bing.com/aclick?x=1", "Real Title"));
+        assert!(!is_quality_result(
+            "https://www.bing.com/aclick?x=1",
+            "Real Title"
+        ));
         // Good results pass.
         assert!(is_quality_result(
             "https://blog.rust-lang.org/2024/07/25/Rust-1.80.0.html",
@@ -1080,6 +1819,161 @@ mod tests {
 
     #[test]
     fn html_unescape_entities() {
-        assert_eq!(html_unescape("a &amp; b&#39;s &lt;tag&gt;"), "a & b's <tag>");
+        assert_eq!(
+            html_unescape("a &amp; b&#39;s &lt;tag&gt;"),
+            "a & b's <tag>"
+        );
+    }
+
+    #[test]
+    fn decode_body_honors_charset() {
+        // "中文" encoded as GBK.
+        let gbk = [0xD6u8, 0xD0, 0xCE, 0xC4];
+        assert_eq!(decode_body(&gbk, "text/html; charset=gbk"), "中文");
+        // Header charset wins.
+        assert_eq!(
+            decode_body("中文".as_bytes(), "text/html; charset=utf-8"),
+            "中文"
+        );
+        // No header charset → sniff <meta charset>.
+        let mut html = b"<html><head><meta charset=\"gb18030\"></head><body>".to_vec();
+        html.extend_from_slice(&gbk);
+        assert!(decode_body(&html, "text/html").contains("中文"));
+        // Plain UTF-8 fallback.
+        assert_eq!(decode_body("中文".as_bytes(), "text/html"), "中文");
+        // Charset parsing helpers.
+        assert_eq!(
+            charset_from_content_type("text/html; Charset=\"GB2312\""),
+            Some("gb2312".to_string())
+        );
+        assert_eq!(charset_from_content_type("text/html"), None);
+    }
+
+    #[test]
+    fn charset_from_content_type_edge_cases() {
+        // Extra parameters after charset are ignored.
+        assert_eq!(
+            charset_from_content_type("text/html; charset=gbk; x=1"),
+            Some("gbk".to_string())
+        );
+        // No space, uppercase name/value.
+        assert_eq!(
+            charset_from_content_type("CHARSET=UTF-8"),
+            Some("utf-8".to_string())
+        );
+        // Empty value yields None.
+        assert_eq!(charset_from_content_type("text/html; charset="), None);
+        // No charset at all.
+        assert_eq!(charset_from_content_type("application/json"), None);
+    }
+
+    #[test]
+    fn sniff_meta_charset_variants() {
+        assert_eq!(
+            sniff_meta_charset(
+                b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=gb2312\">"
+            ),
+            Some("gb2312".to_string())
+        );
+        assert_eq!(sniff_meta_charset(b"<html>no meta</html>"), None);
+    }
+
+    #[test]
+    fn html_unescape_extended_entities() {
+        assert_eq!(
+            html_unescape("a&ensp;b&#0183;c&#176;d&mdash;e"),
+            "a b·c°d—e"
+        );
+        assert_eq!(html_unescape("&lt;x&gt;&amp;&#x27;"), "<x>&'");
+        assert_eq!(html_unescape("&unknown; stays"), "&unknown; stays");
+    }
+
+    #[test]
+    fn detect_block_classifies() {
+        // Non-2xx is always blocked.
+        assert_eq!(detect_block(403, "百度安全验证", 6), Some("http_status"));
+        assert_eq!(detect_block(404, "not found", 9), Some("http_status"));
+        // Healthy page.
+        assert_eq!(
+            detect_block(200, "<html><body>hello</body></html>", 500),
+            None
+        );
+        // 2xx challenge page.
+        assert_eq!(
+            detect_block(200, "<html><body>安全验证</body></html>", 4),
+            Some("anti_bot")
+        );
+        assert_eq!(
+            detect_block(200, "<html><script>a</script><script>b</script></html>", 0),
+            Some("js_challenge")
+        );
+    }
+
+    #[test]
+    fn parse_bing_rss_items() {
+        let xml = r#"<rss><channel>
+          <item><title><![CDATA[西安市10月份气温查询]]></title><link>https://t.com/x</link><description>历史每年西安10月的气温</description></item>
+          <item><title>西安2025年10月份历史天气</title><link>https://ip.cn/a</link><description>天气查询 &amp; 数据</description></item>
+        </channel></rss>"#;
+        let v = parse_bing_rss(xml, 5);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0]["title"], "西安市10月份气温查询");
+        assert_eq!(v[0]["url"], "https://t.com/x");
+        assert_eq!(v[0]["engine"], "bing_rss");
+        assert!(v[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("天气查询 & 数据"));
+    }
+
+    #[test]
+    fn quality_filter_rejects_search_landing() {
+        // Search / SERP / ad landing pages are not content.
+        assert!(!is_quality_result(
+            "https://mc.baidu.com/s?word=%E7%99%BE%E5%BA%A6",
+            "百度官方网站入口 - 百度"
+        ));
+        assert!(!is_quality_result(
+            "https://www.bing.com/search?q=x",
+            "x - Bing"
+        ));
+        // A bare `?q=` on a non-search path is NOT treated as a SERP (kept).
+        assert!(is_quality_result(
+            "https://example.com/?q=weather",
+            "Weather"
+        ));
+        assert!(!is_quality_result("https://baidu.com/s?wd=x", "百度一下"));
+        // Search path + param (generic SERP) is dropped.
+        assert!(!is_quality_result(
+            "https://shop.example.com/s?q=shoes",
+            "shoes"
+        ));
+        // Real content pages survive (no false positives).
+        assert!(is_quality_result(
+            "https://baike.baidu.com/item/%E8%9C%98%E8%9B%9B",
+            "蜘蛛_百度百科"
+        ));
+        assert!(is_quality_result(
+            "https://www.tianqi24.com/xian/history10.html",
+            "西安市10月份气温查询"
+        ));
+        // A bare `?word=` on a dictionary entry (content, not a SERP) survives.
+        assert!(is_quality_result(
+            "https://dict.youdao.com/result?word=apple",
+            "apple - 有道词典"
+        ));
+        // A content page that merely has a `&q=` tracking param survives.
+        assert!(is_quality_result(
+            "https://example.com/article?id=1&q=foo",
+            "An article"
+        ));
+    }
+
+    #[test]
+    fn normalize_url_unescapes_amp() {
+        assert_eq!(
+            normalize_result_url("https://a.com/x?a=1&amp;b=2"),
+            "https://a.com/x?a=1&b=2"
+        );
     }
 }

@@ -148,10 +148,7 @@ pub fn parse_openai_chunk(
         }
     } else {
         // ── Layer B: tag strategy ──
-        let content = delta
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let content = delta.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let (think_chunk, content_chunk) = feed_tag_parser(
             &mut state.tag_buffer,
             &mut state.in_think,
@@ -436,7 +433,7 @@ pub fn finalize_openai(
 
 #[derive(Default, Clone)]
 pub struct AnthropicBlockAcc {
-    pub kind: String,         // "text" | "thinking" | "tool_use"
+    pub kind: String, // "text" | "thinking" | "tool_use"
     pub id: String,
     pub name: String,
     pub text: String,
@@ -641,8 +638,18 @@ mod tests {
     fn openai_parses_content() {
         let sink = CollectingSink::new(false);
         let mut state = OpenAiParseState::default();
-        parse_openai_chunk(r#"{"choices":[{"delta":{"content":"Hello"}}]}"#, &mut state, &sink).unwrap();
-        parse_openai_chunk(r#"{"choices":[{"delta":{"content":" world"}}]}"#, &mut state, &sink).unwrap();
+        parse_openai_chunk(
+            r#"{"choices":[{"delta":{"content":"Hello"}}]}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
+        parse_openai_chunk(
+            r#"{"choices":[{"delta":{"content":" world"}}]}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
         assert_eq!(state.text, "Hello world");
         assert_eq!(state.valid_chunks, 2);
     }
@@ -673,17 +680,35 @@ mod tests {
     fn openai_reasoning_accumulates() {
         let sink = CollectingSink::new(false);
         let mut state = OpenAiParseState::default();
-        parse_openai_chunk(r#"{"choices":[{"delta":{"reasoning_content":"step 1"}}]}"#, &mut state, &sink).unwrap();
-        parse_openai_chunk(r#"{"choices":[{"delta":{"reasoning_content":" step 2"}}]}"#, &mut state, &sink).unwrap();
+        parse_openai_chunk(
+            r#"{"choices":[{"delta":{"reasoning_content":"step 1"}}]}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
+        parse_openai_chunk(
+            r#"{"choices":[{"delta":{"reasoning_content":" step 2"}}]}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
         assert_eq!(state.reasoning, "step 1 step 2");
-        assert!(sink.lines().iter().any(|l| l.contains(r#""seg":"thinking""#)));
+        assert!(sink
+            .lines()
+            .iter()
+            .any(|l| l.contains(r#""seg":"thinking""#)));
     }
 
     #[test]
     fn openai_reasoning_alt_field() {
         let sink = CollectingSink::new(false);
         let mut state = OpenAiParseState::default();
-        parse_openai_chunk(r#"{"choices":[{"delta":{"reasoning":"thinking"}}]}"#, &mut state, &sink).unwrap();
+        parse_openai_chunk(
+            r#"{"choices":[{"delta":{"reasoning":"thinking"}}]}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
         assert_eq!(state.reasoning, "thinking");
     }
 
@@ -704,7 +729,12 @@ mod tests {
     fn openai_tool_call_no_index_defaults_zero() {
         let sink = CollectingSink::new(false);
         let mut state = OpenAiParseState::default();
-        parse_openai_chunk(r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"ls"}}]}}]}"#, &mut state, &sink).unwrap();
+        parse_openai_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"ls"}}]}}]}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
         assert_eq!(state.tool_accs.get(&0).unwrap().name, "ls");
     }
 
@@ -725,7 +755,12 @@ mod tests {
     fn openai_content_with_finish_reason() {
         let sink = CollectingSink::new(false);
         let mut state = OpenAiParseState::default();
-        parse_openai_chunk(r#"{"choices":[{"delta":{"content":"last"},"finish_reason":"stop"}]}"#, &mut state, &sink).unwrap();
+        parse_openai_chunk(
+            r#"{"choices":[{"delta":{"content":"last"},"finish_reason":"stop"}]}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
         assert_eq!(state.text, "last");
         assert_eq!(state.finish_reason.as_deref(), Some("stop"));
     }
@@ -1119,7 +1154,12 @@ mod tests {
     fn anthropic_parses_text() {
         let sink = CollectingSink::new(false);
         let mut state = AnthropicParseState::default();
-        parse_anthropic_chunk(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#, &mut state, &sink).unwrap();
+        parse_anthropic_chunk(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            &mut state,
+            &sink,
+        )
+        .unwrap();
         parse_anthropic_chunk(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#, &mut state, &sink).unwrap();
         assert_eq!(state.text, "Hello");
     }
@@ -1141,7 +1181,11 @@ mod tests {
     fn anthropic_detects_error_event() {
         let sink = CollectingSink::new(false);
         let mut state = AnthropicParseState::default();
-        let err = parse_anthropic_chunk(r#"{"type":"error","error":{"type":"overloaded","message":"Overloaded"}}"#, &mut state, &sink);
+        let err = parse_anthropic_chunk(
+            r#"{"type":"error","error":{"type":"overloaded","message":"Overloaded"}}"#,
+            &mut state,
+            &sink,
+        );
         assert!(err.is_err());
         assert!(format!("{}", err.unwrap_err()).contains("Overloaded"));
     }

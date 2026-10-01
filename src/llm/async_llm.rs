@@ -36,47 +36,75 @@ where
     S: futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
     fn new(stream: S) -> Self {
-        AsyncSseStream { stream, buffer: Vec::new(), done: false, first_read: true }
+        AsyncSseStream {
+            stream,
+            buffer: Vec::new(),
+            done: false,
+            first_read: true,
+        }
     }
 
     async fn next_data(&mut self) -> std::result::Result<Option<String>, AacodeError> {
-        if self.done { return Ok(None); }
+        if self.done {
+            return Ok(None);
+        }
         loop {
             if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
                 let line_bytes = self.buffer[..pos].to_vec();
                 self.buffer.drain(..=pos);
-                let line = String::from_utf8_lossy(&line_bytes).into_owned()
-                    .trim_end_matches('\r').to_string();
+                let line = String::from_utf8_lossy(&line_bytes)
+                    .into_owned()
+                    .trim_end_matches('\r')
+                    .to_string();
                 if self.first_read {
                     self.first_read = false;
                     if line.starts_with('\u{FEFF}') {
                         let s = line[3..].to_string();
-                        if s.trim_end_matches(['\r', '\n']).is_empty() { continue; }
+                        if s.trim_end_matches(['\r', '\n']).is_empty() {
+                            continue;
+                        }
                         if let Some(payload) = Self::extract(&s) {
-                            if payload == "[DONE]" { self.done = true; return Ok(None); }
+                            if payload == "[DONE]" {
+                                self.done = true;
+                                return Ok(None);
+                            }
                             return Ok(Some(payload));
                         }
                         continue;
                     }
-                    if line.trim().is_empty() { continue; }
+                    if line.trim().is_empty() {
+                        continue;
+                    }
                 }
-                if line.trim().is_empty() { continue; }
+                if line.trim().is_empty() {
+                    continue;
+                }
                 if let Some(payload) = Self::extract(&line) {
-                    if payload == "[DONE]" { self.done = true; return Ok(None); }
+                    if payload == "[DONE]" {
+                        self.done = true;
+                        return Ok(None);
+                    }
                     return Ok(Some(payload));
                 }
                 continue;
             }
             match self.stream.next().await {
-                Some(Ok(chunk)) => { self.buffer.extend_from_slice(&chunk); continue; }
+                Some(Ok(chunk)) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    continue;
+                }
                 Some(Err(e)) => return Err(AacodeError::Network(format!("SSE: {e}"))),
                 None => {
                     if !self.buffer.is_empty() {
                         let bytes = std::mem::take(&mut self.buffer);
-                        let line = String::from_utf8_lossy(&bytes).into_owned()
-                            .trim_end_matches(['\r', '\n']).to_string();
+                        let line = String::from_utf8_lossy(&bytes)
+                            .into_owned()
+                            .trim_end_matches(['\r', '\n'])
+                            .to_string();
                         if let Some(payload) = Self::extract(&line) {
-                            if payload != "[DONE]" { return Ok(Some(payload)); }
+                            if payload != "[DONE]" {
+                                return Ok(Some(payload));
+                            }
                         }
                     }
                     self.done = true;
@@ -133,32 +161,44 @@ impl OpenAiAsyncClient {
     }
 
     fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
-        messages.iter().map(|m| {
-            let mut obj = json!({"role": m.role});
-            let map = obj.as_object_mut().unwrap();
-            if let Some(tcs) = &m.tool_calls {
-                let arr: Vec<Value> = tcs.iter().map(|tc| json!({
-                    "id": tc.id, "type": "function",
-                    "function": {"name": tc.name, "arguments": tc.arguments}
-                })).collect();
-                map.insert("tool_calls".into(), Value::Array(arr));
-                map.insert("content".into(), Value::String(m.content.clone()));
-            } else {
-                map.insert("content".into(), Value::String(m.content.clone()));
-            }
-            if let Some(id) = &m.tool_call_id {
-                map.insert("tool_call_id".into(), Value::String(id.clone()));
-            }
-            if let Some(rc) = &m.reasoning_content {
-                map.insert("reasoning_content".into(), Value::String(rc.clone()));
-            }
-            obj
-        }).collect()
+        messages
+            .iter()
+            .map(|m| {
+                let mut obj = json!({"role": m.role});
+                let map = obj.as_object_mut().unwrap();
+                if let Some(tcs) = &m.tool_calls {
+                    let arr: Vec<Value> = tcs
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id, "type": "function",
+                                "function": {"name": tc.name, "arguments": tc.arguments}
+                            })
+                        })
+                        .collect();
+                    map.insert("tool_calls".into(), Value::Array(arr));
+                    map.insert("content".into(), Value::String(m.content.clone()));
+                } else {
+                    map.insert("content".into(), Value::String(m.content.clone()));
+                }
+                if let Some(id) = &m.tool_call_id {
+                    map.insert("tool_call_id".into(), Value::String(id.clone()));
+                }
+                if let Some(rc) = &m.reasoning_content {
+                    map.insert("reasoning_content".into(), Value::String(rc.clone()));
+                }
+                obj
+            })
+            .collect()
     }
 
     fn build_body(&self, messages: &[ChatMessage], tools: &[Value], stream: bool) -> Value {
         let m = self.model.name.to_lowercase();
-        let temperature = if m.contains("kimi") || m.contains("moonshot") { 1.0 } else { self.model.temperature as f64 };
+        let temperature = if m.contains("kimi") || m.contains("moonshot") {
+            1.0
+        } else {
+            self.model.temperature as f64
+        };
         let mut body = json!({
             "model": self.model.name,
             "messages": Self::build_messages(messages),
@@ -173,20 +213,34 @@ impl OpenAiAsyncClient {
         body
     }
 
-    async fn post_stream(&self, body: &Value) -> Result<impl futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>> {
-        let api_key = self.model.api_key.as_deref().filter(|k| !k.trim().is_empty())
+    async fn post_stream(
+        &self,
+        body: &Value,
+    ) -> Result<impl futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>>
+    {
+        let api_key = self
+            .model
+            .api_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
             .ok_or_else(|| AacodeError::Config("API key not configured".into()))?;
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.endpoint())
             .bearer_auth(api_key)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
-            .json(body).send().await
+            .json(body)
+            .send()
+            .await
             .map_err(|e| AacodeError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
             let msg = resp.text().await.unwrap_or_default();
-            return Err(AacodeError::Api(format!("HTTP {code}: {}", truncate(&msg, 500))));
+            return Err(AacodeError::Api(format!(
+                "HTTP {code}: {}",
+                truncate(&msg, 500)
+            )));
         }
         Ok(resp.bytes_stream())
     }
@@ -207,26 +261,38 @@ impl LlmClient for OpenAiAsyncClient {
         let mut state = parse::OpenAiParseState::default();
 
         while let Some(payload) = sse.next_data().await? {
-            if cancel.load(Ordering::SeqCst) { return Err(AacodeError::Cancelled); }
+            if cancel.load(Ordering::SeqCst) {
+                return Err(AacodeError::Cancelled);
+            }
             parse::parse_openai_chunk(&payload, &mut state, emitter)?;
         }
         parse::finalize_openai(state, emitter)
     }
 
     async fn validate(&self) -> Result<()> {
-        let api_key = self.model.api_key.as_deref().filter(|k| !k.trim().is_empty())
+        let api_key = self
+            .model
+            .api_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
             .ok_or_else(|| AacodeError::Config("API key not configured".into()))?;
         let body = json!({"model": self.model.name, "messages": [{"role":"user","content":"Hi"}], "max_tokens": 4, "stream": false});
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.endpoint())
             .bearer_auth(api_key)
             .header("Content-Type", "application/json")
-            .json(&body).send().await
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AacodeError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
             let msg = resp.text().await.unwrap_or_default();
-            return Err(AacodeError::Api(format!("HTTP {code}: {}", truncate(&msg, 300))));
+            return Err(AacodeError::Api(format!(
+                "HTTP {code}: {}",
+                truncate(&msg, 300)
+            )));
         }
         Ok(())
     }
@@ -261,10 +327,14 @@ impl AnthropicAsyncClient {
         let mut out: Vec<Value> = Vec::new();
         let mut pending: Vec<Value> = Vec::new();
         fn flush(out: &mut Vec<Value>, pending: &mut Vec<Value>) {
-            if !pending.is_empty() { out.push(json!({"role":"user","content":std::mem::take(pending)})); }
+            if !pending.is_empty() {
+                out.push(json!({"role":"user","content":std::mem::take(pending)}));
+            }
         }
         for m in messages {
-            if m.role != "tool" { flush(&mut out, &mut pending); }
+            if m.role != "tool" {
+                flush(&mut out, &mut pending);
+            }
             match m.role.as_str() {
                 "system" => { if !system.is_empty() { system.push_str("\n\n"); } system.push_str(&m.content); }
                 "tool" => pending.push(json!({"type":"tool_result","tool_use_id":m.tool_call_id.clone().unwrap_or_default(),"content":m.content})),
@@ -285,14 +355,24 @@ impl AnthropicAsyncClient {
         (system, out)
     }
 
-    fn build_body(&self, messages: &[ChatMessage], tools: &[Value], stream: bool, mode: &'static str) -> Value {
+    fn build_body(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        stream: bool,
+        mode: &'static str,
+    ) -> Value {
         let (system, msgs) = Self::build_messages(messages);
         let mut body = json!({
             "model": self.model.name, "max_tokens": self.model.max_tokens,
             "messages": msgs, "stream": stream,
         });
-        if !system.is_empty() { body["system"] = Value::String(system); }
-        if !tools.is_empty() { body["tools"] = Value::Array(tools.to_vec()); }
+        if !system.is_empty() {
+            body["system"] = Value::String(system);
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools.to_vec());
+        }
         // thinking 模式状态机注入（仅当 mode != none 时）
         if let Some(tk) = thinking_kw_for_mode(mode) {
             body["thinking"] = tk;
@@ -300,21 +380,35 @@ impl AnthropicAsyncClient {
         body
     }
 
-    async fn post_stream(&self, body: &Value) -> Result<impl futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>> {
-        let api_key = self.model.api_key.as_deref().filter(|k| !k.trim().is_empty())
+    async fn post_stream(
+        &self,
+        body: &Value,
+    ) -> Result<impl futures::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>>
+    {
+        let api_key = self
+            .model
+            .api_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
             .ok_or_else(|| AacodeError::Config("API key not configured".into()))?;
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.endpoint())
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
-            .json(body).send().await
+            .json(body)
+            .send()
+            .await
             .map_err(|e| AacodeError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
             let msg = resp.text().await.unwrap_or_default();
-            return Err(AacodeError::Api(format!("HTTP {code}: {}", truncate(&msg, 500))));
+            return Err(AacodeError::Api(format!(
+                "HTTP {code}: {}",
+                truncate(&msg, 500)
+            )));
         }
         Ok(resp.bytes_stream())
     }
@@ -388,20 +482,30 @@ impl LlmClient for AnthropicAsyncClient {
     }
 
     async fn validate(&self) -> Result<()> {
-        let api_key = self.model.api_key.as_deref().filter(|k| !k.trim().is_empty())
+        let api_key = self
+            .model
+            .api_key
+            .as_deref()
+            .filter(|k| !k.trim().is_empty())
             .ok_or_else(|| AacodeError::Config("API key not configured".into()))?;
         let body = json!({"model": self.model.name, "max_tokens": 4, "messages": [{"role":"user","content":"Hi"}]});
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.endpoint())
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&body).send().await
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AacodeError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let code = resp.status().as_u16();
             let msg = resp.text().await.unwrap_or_default();
-            return Err(AacodeError::Api(format!("HTTP {code}: {}", truncate(&msg, 300))));
+            return Err(AacodeError::Api(format!(
+                "HTTP {code}: {}",
+                truncate(&msg, 300)
+            )));
         }
         Ok(())
     }
@@ -410,14 +514,23 @@ impl LlmClient for AnthropicAsyncClient {
 // ── Shared helpers ─────────────────────────────────────────────────────────
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() } else { let h: String = s.chars().take(n).collect(); format!("{h}...") }
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let h: String = s.chars().take(n).collect();
+        format!("{h}...")
+    }
 }
 
 fn adjust_base(base: &str) -> String {
     let lower = base.to_lowercase();
     if lower.contains("minimax") || lower.contains("deepseek") || lower.contains("moonshot") {
-        if let Some(s) = base.strip_suffix("/v1") { return format!("{}/anthropic", s.trim_end_matches('/')); }
-        if !base.trim_end_matches('/').ends_with("/anthropic") { return format!("{}/anthropic", base.trim_end_matches('/')); }
+        if let Some(s) = base.strip_suffix("/v1") {
+            return format!("{}/anthropic", s.trim_end_matches('/'));
+        }
+        if !base.trim_end_matches('/').ends_with("/anthropic") {
+            return format!("{}/anthropic", base.trim_end_matches('/'));
+        }
     }
     base.to_string()
 }
@@ -468,7 +581,9 @@ mod tests {
     #[tokio::test]
     async fn test_async_sse_parses() {
         let bytes = bytes::Bytes::from("data: {\"a\":1}\n\ndata: [DONE]\n\n");
-        let stream = Box::pin(futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes) }));
+        let stream = Box::pin(futures::stream::once(async move {
+            Ok::<_, reqwest::Error>(bytes)
+        }));
         let mut sse = AsyncSseStream::new(stream);
         assert_eq!(sse.next_data().await.unwrap().unwrap(), "{\"a\":1}");
         assert!(sse.next_data().await.unwrap().is_none());

@@ -26,7 +26,9 @@ impl Tool for ListMcpToolsTool {
     }
     async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
         let mgr = self.mgr.clone();
-        tokio::task::spawn_blocking(move || Ok(mgr.list_tools().to_string())).await.map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
+        tokio::task::spawn_blocking(move || Ok(mgr.list_tools().to_string()))
+            .await
+            .map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
     }
 }
 
@@ -40,16 +42,37 @@ impl Tool for CallMcpToolTool {
             "call_mcp_tool",
             "Call an MCP tool. tool_name is 'server.tool' or just 'tool'.",
             vec![
-                ToolParameter::new("tool_name", ParamType::String, true, "server.tool or tool", &["tool", "name", "function"]),
-                ToolParameter::new("arguments", ParamType::Object, false, "Tool arguments", &["args", "params", "input"]),
+                ToolParameter::new(
+                    "tool_name",
+                    ParamType::String,
+                    true,
+                    "server.tool or tool",
+                    &["tool", "name", "function"],
+                ),
+                ToolParameter::new(
+                    "arguments",
+                    ParamType::Object,
+                    false,
+                    "Tool arguments",
+                    &["args", "params", "input"],
+                ),
             ],
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let name = args.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let arguments = args.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+        let name = args
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let arguments = args
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
         let mgr = self.mgr.clone();
-        tokio::task::spawn_blocking(move || Ok(mgr.call_tool(&name, arguments).to_string())).await.map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
+        tokio::task::spawn_blocking(move || Ok(mgr.call_tool(&name, arguments).to_string()))
+            .await
+            .map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
     }
 }
 
@@ -63,7 +86,9 @@ impl Tool for McpStatusTool {
     }
     async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
         let mgr = self.mgr.clone();
-        tokio::task::spawn_blocking(move || Ok(mgr.status().to_string())).await.map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
+        tokio::task::spawn_blocking(move || Ok(mgr.status().to_string()))
+            .await
+            .map_err(|e| crate::error::AacodeError::Other(format!("{e}")))?
     }
 }
 

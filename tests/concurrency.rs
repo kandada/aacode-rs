@@ -32,11 +32,9 @@ impl MockLlm {
                 let body = queue
                     .next()
                     .unwrap_or_else(|| "data: [DONE]\n\n".to_string());
-                let header = tiny_http::Header::from_bytes(
-                    &b"Content-Type"[..],
-                    &b"text/event-stream"[..],
-                )
-                .unwrap();
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                        .unwrap();
                 let response = tiny_http::Response::from_string(body).with_header(header);
                 let _ = request.respond(response);
             }
@@ -76,7 +74,12 @@ fn tmp_project(tag: &str) -> std::path::PathBuf {
     d
 }
 
-fn task_json(addr: &str, project: &std::path::Path, task: &str, session_id: Option<&str>) -> CString {
+fn task_json(
+    addr: &str,
+    project: &std::path::Path,
+    task: &str,
+    session_id: Option<&str>,
+) -> CString {
     let mut v = json!({
         "task": task,
         "project_path": project.to_string_lossy(),
@@ -114,7 +117,9 @@ macro_rules! collector {
             if line.is_null() {
                 return;
             }
-            let s = unsafe { CStr::from_ptr(line) }.to_string_lossy().to_string();
+            let s = unsafe { CStr::from_ptr(line) }
+                .to_string_lossy()
+                .to_string();
             $buf.lock().unwrap().push(s);
         }
     };
@@ -151,8 +156,14 @@ fn parallel_tasks_have_isolated_streams() {
     assert!(a_lines.contains("MARKER_ALPHA"), "alpha stream: {a_lines}");
     assert!(b_lines.contains("MARKER_BRAVO"), "bravo stream: {b_lines}");
     // The crucial isolation property:
-    assert!(!a_lines.contains("MARKER_BRAVO"), "alpha stream polluted by bravo");
-    assert!(!b_lines.contains("MARKER_ALPHA"), "bravo stream polluted by alpha");
+    assert!(
+        !a_lines.contains("MARKER_BRAVO"),
+        "alpha stream polluted by bravo"
+    );
+    assert!(
+        !b_lines.contains("MARKER_ALPHA"),
+        "bravo stream polluted by alpha"
+    );
 }
 
 collector!(BUF_SLOW, cb_slow);
@@ -216,8 +227,14 @@ fn terminal_done_event_carries_status_and_final_text() {
         .find(|l| l.contains(r#""type":"done""#))
         .cloned()
         .unwrap_or_default();
-    assert!(done_line.contains(r#""status":"completed""#), "done line: {done_line}");
-    assert!(done_line.contains("DONE_MARKER"), "final_text missing: {done_line}");
+    assert!(
+        done_line.contains(r#""status":"completed""#),
+        "done line: {done_line}"
+    );
+    assert!(
+        done_line.contains("DONE_MARKER"),
+        "final_text missing: {done_line}"
+    );
 }
 
 #[test]

@@ -153,7 +153,9 @@ pub fn build_compact_view_cached<'a>(
             .map(|m| {
                 m.content
                     .trim_start_matches("## 🧠 History Summary (compacted)\n")
-                    .trim_end_matches("\n\n(Older turns compacted; continue based on recent context.)")
+                    .trim_end_matches(
+                        "\n\n(Older turns compacted; continue based on recent context.)",
+                    )
                     .to_string()
             })
             .unwrap_or_default();
@@ -243,9 +245,9 @@ pub fn build_compact_view(
     // summary system message for the middle
     let (ms, me) = middle_range;
     if me > ms {
-        let summarized = summary.map(|s| s.to_string()).unwrap_or_else(|| {
-            heuristic_summary(&rounds[ms..me])
-        });
+        let summarized = summary
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| heuristic_summary(&rounds[ms..me]));
         view.push(ChatMessage::system(format!(
             "## 🧠 History Summary (compacted)\n{summarized}\n\n(Older turns compacted; continue based on recent context.)"
         )));
@@ -365,10 +367,7 @@ mod tests {
         // every assistant-with-tool_calls must be followed by a tool result
         for i in 0..view.len() {
             if view[i].tool_calls.is_some() {
-                let has_result = view
-                    .iter()
-                    .skip(i + 1)
-                    .any(|m| m.role == "tool");
+                let has_result = view.iter().skip(i + 1).any(|m| m.role == "tool");
                 assert!(has_result, "tool_calls without following tool result");
             }
         }
@@ -443,13 +442,21 @@ mod tests {
         let (v2, _, _) = build_compact_view_cached(&msgs, &cfg(10), &mut cache);
         assert!(v2.len() > v1_len);
         let v2_fp = fingerprint(&v2);
-        assert_eq!(v1_fp, v2_fp[..v1_len], "compacted view prefix must be byte-stable");
+        assert_eq!(
+            v1_fp,
+            v2_fp[..v1_len],
+            "compacted view prefix must be byte-stable"
+        );
         let v2_len = v2.len();
         drop(v2);
 
         msgs.push(ChatMessage::user("follow-up 2"));
         let (v3, _, _) = build_compact_view_cached(&msgs, &cfg(10), &mut cache);
-        assert_eq!(v2_fp, fingerprint(&v3[..v2_len]), "second append must also extend the prefix");
+        assert_eq!(
+            v2_fp,
+            fingerprint(&v3[..v2_len]),
+            "second append must also extend the prefix"
+        );
     }
 
     #[test]

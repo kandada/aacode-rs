@@ -86,9 +86,7 @@ pub trait EventSink: Send + Sync {
 
     /// seg_content event. seg ∈ {thinking, thought, action, observation}
     fn seg(&self, seg: &str, content: &str) {
-        self.emit_line(
-            &json!({"type": "seg_content", "seg": seg, "content": content}).to_string(),
-        );
+        self.emit_line(&json!({"type": "seg_content", "seg": seg, "content": content}).to_string());
     }
 
     /// Merged startup event (additive, backward compatible): task + session
@@ -113,9 +111,7 @@ pub trait EventSink: Send + Sync {
     /// rebuild). Legacy clients ignore this event and keep using
     /// `seg_content`.
     fn seg_append(&self, seg: &str, content: &str) {
-        self.emit_line(
-            &json!({"type": "seg_append", "seg": seg, "content": content}).to_string(),
-        );
+        self.emit_line(&json!({"type": "seg_append", "seg": seg, "content": content}).to_string());
     }
 
     /// Incremental segment update (additive, backward compatible): replace
@@ -123,9 +119,7 @@ pub trait EventSink: Send + Sync {
     /// Same patching semantics as `seg_append`; legacy clients ignore it and
     /// keep using `seg_content`.
     fn seg_reset(&self, seg: &str, content: &str) {
-        self.emit_line(
-            &json!({"type": "seg_reset", "seg": seg, "content": content}).to_string(),
-        );
+        self.emit_line(&json!({"type": "seg_reset", "seg": seg, "content": content}).to_string());
     }
 
     /// Emit the legacy `seg_content` (authoritative full content, for old
@@ -345,7 +339,8 @@ impl EventSink for CliSink {
         if self.tty {
             self.emit(&format!("\x1b[34;1m🎯 {task}\x1b[0m"));
         } else {
-            self.inner.emit_line(&json!({"type": "start", "task": task}).to_string());
+            self.inner
+                .emit_line(&json!({"type": "start", "task": task}).to_string());
         }
     }
 
@@ -358,15 +353,18 @@ impl EventSink for CliSink {
             };
             self.emit(label);
         } else {
-            self.inner.emit_line(
-                &json!({"type": event, "session_id": _session_id}).to_string(),
-            );
+            self.inner
+                .emit_line(&json!({"type": event, "session_id": _session_id}).to_string());
         }
     }
 
     fn session_origin(&self, task: &str, _session_id: &str, created: bool) {
         if self.tty {
-            let label = if created { "New session" } else { "Switched session" };
+            let label = if created {
+                "New session"
+            } else {
+                "Switched session"
+            };
             self.emit(&format!("\x1b[34;1m{label}: {task}\x1b[0m"));
         } else {
             self.inner.session_origin(task, _session_id, created);
@@ -426,7 +424,11 @@ impl EventSink for CliSink {
                         self.emit(&format!("  {marker} exit {code}  ·  {sz} bytes\x1b[0m"));
                         if !stdout.is_empty() {
                             let s: String = stdout.lines().take(20).collect::<Vec<_>>().join("\n");
-                            let more = if stdout.lines().count() > 20 { "\n  ... (truncated)" } else { "" };
+                            let more = if stdout.lines().count() > 20 {
+                                "\n  ... (truncated)"
+                            } else {
+                                ""
+                            };
                             self.emit(&format!("{s}{more}"));
                         }
                         if !stderr.is_empty() {
@@ -458,7 +460,10 @@ impl EventSink for CliSink {
         if self.tty {
             let short = if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                 if name == "run_shell" {
-                    v.get("command").and_then(|x| x.as_str()).unwrap_or(args).to_string()
+                    v.get("command")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(args)
+                        .to_string()
                 } else if let Some(desc) = v.get("description").and_then(|x| x.as_str()) {
                     format!("{desc}")
                 } else if let Some(query) = v.get("query").and_then(|x| x.as_str()) {
@@ -536,7 +541,8 @@ impl EventSink for CliSink {
         if self.tty {
             self.done(session_id);
         } else {
-            self.inner.done_result(session_id, _status, _iterations, _final_text);
+            self.inner
+                .done_result(session_id, _status, _iterations, _final_text);
         }
     }
 
@@ -667,7 +673,10 @@ mod tests {
     #[test]
     fn incremental_events_emitted_on_opt_in() {
         let s = CollectingSink::new(true);
-        assert!(!s.supports_incremental(), "legacy CollectingSink must not opt in");
+        assert!(
+            !s.supports_incremental(),
+            "legacy CollectingSink must not opt in"
+        );
         // Use an explicit incremental-capable sink via the trait methods.
         struct Inc(CollectingSink);
         impl EventSink for Inc {
@@ -693,7 +702,11 @@ mod tests {
         let big = "z".repeat(5000);
         s.seg_observation(&big, 3000);
         let all = s.lines();
-        assert_eq!(all.len(), 1, "legacy sink must emit only the seg_content line");
+        assert_eq!(
+            all.len(),
+            1,
+            "legacy sink must emit only the seg_content line"
+        );
         let v: serde_json::Value = serde_json::from_str(&all[0]).unwrap();
         assert_eq!(v["type"], "seg_content");
         assert_eq!(v["seg"], "observation");
@@ -723,7 +736,10 @@ mod tests {
         let big = "z".repeat(5000);
         let display = observation_display(&big, 3000);
         assert!(display.len() < 5000, "display must be capped");
-        assert!(display.contains("Display truncated"), "truncation notice present");
+        assert!(
+            display.contains("Display truncated"),
+            "truncation notice present"
+        );
         assert!(display.contains("5000 chars total"), "total chars reported");
 
         // The live event must carry the same string.

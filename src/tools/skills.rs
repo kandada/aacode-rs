@@ -42,7 +42,10 @@ use std::time::Duration;
 /// only hosts that explicitly declare support (e.g. Android app brings cron
 /// scheduling) will see them, keeping desktop/CLI deployments untouched.
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    ("skill_creator", include_str!("builtin_skills/skill_creator.md")),
+    (
+        "skill_creator",
+        include_str!("builtin_skills/skill_creator.md"),
+    ),
     ("book_writer", include_str!("builtin_skills/book_writer.md")),
     ("agent_cron", include_str!("builtin_skills/agent_cron.md")),
 ];
@@ -93,7 +96,10 @@ pub fn discover_skills(
             let prompt_dir = vfs_skills_dir.unwrap_or(&dir_str);
             for (name, body) in BUILTIN_SKILLS {
                 // skill_creator and book_writer are always injected. All others are gated.
-                if *name != "skill_creator" && *name != "book_writer" && !extra_builtins.iter().any(|x| x == *name) {
+                if *name != "skill_creator"
+                    && *name != "book_writer"
+                    && !extra_builtins.iter().any(|x| x == *name)
+                {
                     continue;
                 }
                 let content = body.replace("{SKILLS_DIR}", prompt_dir);
@@ -242,10 +248,7 @@ impl Tool for RunSkillsTool {
                 .map(|s| s.to_string())
         });
 
-        let timeout = args
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5);
+        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5);
 
         let pp = self.project_path.clone();
         let ud = self.user_dir.clone();
@@ -253,8 +256,12 @@ impl Tool for RunSkillsTool {
         let vsd = self.vfs_skills_dir.clone();
         let skills = match tokio::time::timeout(
             Duration::from_secs(timeout),
-            tokio::task::spawn_blocking(move || discover_skills(&pp, ud.as_deref(), &eb, vsd.as_deref())),
-        ).await {
+            tokio::task::spawn_blocking(move || {
+                discover_skills(&pp, ud.as_deref(), &eb, vsd.as_deref())
+            }),
+        )
+        .await
+        {
             Ok(Ok(s)) => s,
             _ => return Ok("Error: skill discovery timed out".to_string()),
         };
@@ -336,7 +343,10 @@ mod tests {
         setup_skill(&d, "pandas", "## Description\nData analysis helper\n");
         let t = tool(d.clone());
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "__list__"}), &cancel).await.unwrap();
+        let out = t
+            .call(&json!({"skill_name": "__list__"}), &cancel)
+            .await
+            .unwrap();
         assert!(out.contains("pandas"));
         assert!(out.contains("Data analysis helper"));
         // Legacy mode must NOT inject builtins at all (not even skill_creator).
@@ -347,11 +357,18 @@ mod tests {
     #[tokio::test]
     async fn info_returns_full_md() {
         let d = tmp();
-        setup_skill(&d, "numpy", "## Description\nNumeric\n## Usage\nrun stuff\n");
+        setup_skill(
+            &d,
+            "numpy",
+            "## Description\nNumeric\n## Usage\nrun stuff\n",
+        );
         let t = tool(d.clone());
         let cancel = AtomicBool::new(false);
         let out = t
-            .call(&json!({"skill_name": "__info__", "params": {"skill_name": "numpy"}}), &cancel)
+            .call(
+                &json!({"skill_name": "__info__", "params": {"skill_name": "numpy"}}),
+                &cancel,
+            )
             .await
             .unwrap();
         assert!(out.contains("## Usage"));
@@ -363,7 +380,10 @@ mod tests {
         setup_skill(&d, "deploy", "## Description\nDeploy\nSteps: do X\n");
         let t = tool(d.clone());
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "deploy"}), &cancel).await.unwrap();
+        let out = t
+            .call(&json!({"skill_name": "deploy"}), &cancel)
+            .await
+            .unwrap();
         assert!(out.contains("document skill"));
         assert!(out.contains("Steps: do X"));
     }
@@ -373,7 +393,10 @@ mod tests {
         let d = tmp();
         let t = tool(d);
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "ghost"}), &cancel).await.unwrap();
+        let out = t
+            .call(&json!({"skill_name": "ghost"}), &cancel)
+            .await
+            .unwrap();
         assert!(out.contains("not found"));
     }
 
@@ -405,10 +428,19 @@ mod tests {
         setup_skill_at(&user, "api_probe", "## Description\nProbe an API\n");
         let skills = discover_skills(&project, Some(&user), &[], None);
         let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"skill_creator"), "skill_creator must always appear: {names:?}");
-        assert!(names.contains(&"book_writer"), "book_writer must always appear: {names:?}");
+        assert!(
+            names.contains(&"skill_creator"),
+            "skill_creator must always appear: {names:?}"
+        );
+        assert!(
+            names.contains(&"book_writer"),
+            "book_writer must always appear: {names:?}"
+        );
         assert!(names.contains(&"api_probe"));
-        assert!(!names.contains(&"agent_cron"), "agent_cron must NOT appear without extra_builtins");
+        assert!(
+            !names.contains(&"agent_cron"),
+            "agent_cron must NOT appear without extra_builtins"
+        );
     }
 
     #[test]
@@ -427,7 +459,9 @@ mod tests {
         let skills = discover_skills(&project, Some(&user), &[], None);
         let creator = skills.iter().find(|s| s.name == "skill_creator").unwrap();
         assert!(!creator.full_md.contains("{SKILLS_DIR}"));
-        assert!(creator.full_md.contains(&user.to_string_lossy().to_string()));
+        assert!(creator
+            .full_md
+            .contains(&user.to_string_lossy().to_string()));
     }
 
     #[test]
@@ -444,7 +478,11 @@ mod tests {
     async fn user_dir_mode_via_tool_and_prompt_with_agent_cron_gated() {
         let project = tmp();
         let user = tmp();
-        setup_skill_at(&user, "remote_box", "## Description\nRemote sandbox\n## Remote Endpoint\nhttps://x\n## Secret\nabc\n");
+        setup_skill_at(
+            &user,
+            "remote_box",
+            "## Description\nRemote sandbox\n## Remote Endpoint\nhttps://x\n## Secret\nabc\n",
+        );
         // Without extra_builtins, agent_cron is absent.
         let t = RunSkillsTool {
             project_path: project.clone(),
@@ -453,14 +491,20 @@ mod tests {
             extra_builtins: vec!["agent_cron".into()],
         };
         let cancel = AtomicBool::new(false);
-        let out = t.call(&json!({"skill_name": "__list__"}), &cancel).await.unwrap();
+        let out = t
+            .call(&json!({"skill_name": "__list__"}), &cancel)
+            .await
+            .unwrap();
         assert!(out.contains("remote_box"));
         assert!(out.contains("agent_cron"));
         // The prompt/summary list must never leak endpoint/secret details.
         assert!(!out.contains("https://x"));
         assert!(!out.contains("abc"));
         let info = t
-            .call(&json!({"skill_name": "__info__", "params": {"skill_name": "remote_box"}}), &cancel)
+            .call(
+                &json!({"skill_name": "__info__", "params": {"skill_name": "remote_box"}}),
+                &cancel,
+            )
             .await
             .unwrap();
         assert!(info.contains("## Remote Endpoint"));

@@ -13,15 +13,19 @@
 //! 策略顺序：`adaptive` → `enabled` → `none`，命中后该模型会话内
 //! 不再尝试更高优先级模式。
 
-use std::sync::{Mutex, OnceLock};
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// thinking 模式三态（按推荐度排序）
 pub const THINKING_MODE_ADAPTIVE: &str = "adaptive"; // 无需 budget_tokens
 pub const THINKING_MODE_ENABLED: &str = "enabled"; // 需 budget_tokens
 pub const THINKING_MODE_NONE: &str = "none"; // 不带 thinking
 
-pub const THINKING_MODE_ORDER: &[&str] = &[THINKING_MODE_ADAPTIVE, THINKING_MODE_ENABLED, THINKING_MODE_NONE];
+pub const THINKING_MODE_ORDER: &[&str] = &[
+    THINKING_MODE_ADAPTIVE,
+    THINKING_MODE_ENABLED,
+    THINKING_MODE_NONE,
+];
 
 /// 默认 budget_tokens（仅 enabled 模式使用）
 /// 30k 平衡了 thinking 深度与响应空间，且避开 Anthropic 文档警告的 32k 警戒线。
@@ -164,7 +168,10 @@ mod tests {
 
     #[test]
     fn next_mode_adaptive_to_enabled() {
-        assert_eq!(next_mode(THINKING_MODE_ADAPTIVE), Some(THINKING_MODE_ENABLED));
+        assert_eq!(
+            next_mode(THINKING_MODE_ADAPTIVE),
+            Some(THINKING_MODE_ENABLED)
+        );
     }
 
     #[test]
@@ -189,11 +196,21 @@ mod tests {
         let mut steps = vec![mode];
         loop {
             match next_mode(mode) {
-                Some(n) => { steps.push(n); mode = n; }
+                Some(n) => {
+                    steps.push(n);
+                    mode = n;
+                }
                 None => break,
             }
         }
-        assert_eq!(steps, vec![THINKING_MODE_ADAPTIVE, THINKING_MODE_ENABLED, THINKING_MODE_NONE]);
+        assert_eq!(
+            steps,
+            vec![
+                THINKING_MODE_ADAPTIVE,
+                THINKING_MODE_ENABLED,
+                THINKING_MODE_NONE
+            ]
+        );
     }
 
     #[test]
@@ -317,7 +334,10 @@ mod tests {
     #[test]
     fn cache_round_trip() {
         cache_mode("test-model-cache-rt", THINKING_MODE_ENABLED);
-        assert_eq!(get_cached_mode("test-model-cache-rt"), THINKING_MODE_ENABLED);
+        assert_eq!(
+            get_cached_mode("test-model-cache-rt"),
+            THINKING_MODE_ENABLED
+        );
         cache_mode("test-model-cache-rt", THINKING_MODE_NONE);
         assert_eq!(get_cached_mode("test-model-cache-rt"), THINKING_MODE_NONE);
     }
@@ -328,7 +348,11 @@ mod tests {
     fn mode_order_is_correct() {
         assert_eq!(
             THINKING_MODE_ORDER,
-            &[THINKING_MODE_ADAPTIVE, THINKING_MODE_ENABLED, THINKING_MODE_NONE]
+            &[
+                THINKING_MODE_ADAPTIVE,
+                THINKING_MODE_ENABLED,
+                THINKING_MODE_NONE
+            ]
         );
     }
 

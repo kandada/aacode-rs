@@ -30,12 +30,12 @@ impl MockLlm {
                 // Drain the body.
                 let mut buf = String::new();
                 let _ = request.as_reader().read_to_string(&mut buf);
-                let body = queue.next().unwrap_or_else(|| "data: [DONE]\n\n".to_string());
-                let header = tiny_http::Header::from_bytes(
-                    &b"Content-Type"[..],
-                    &b"text/event-stream"[..],
-                )
-                .unwrap();
+                let body = queue
+                    .next()
+                    .unwrap_or_else(|| "data: [DONE]\n\n".to_string());
+                let header =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                        .unwrap();
                 let response = tiny_http::Response::from_string(body).with_header(header);
                 let _ = request.respond(response);
                 // Stop after we run out of scripted responses + one extra.
@@ -100,7 +100,10 @@ async fn full_loop_completes_immediately() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task("say hello", None, &sink, &cancel).await.unwrap();
+    let res = rt
+        .run_task("say hello", None, &sink, &cancel)
+        .await
+        .unwrap();
     assert_eq!(
         format!("{:?}", res.status),
         "Completed",
@@ -109,7 +112,9 @@ async fn full_loop_completes_immediately() {
     );
     let lines = sink.lines();
     assert!(lines.iter().any(|l| l.contains(r#""type":"start""#)));
-    assert!(lines.iter().any(|l| l.contains(r#""type":"session_created""#)));
+    assert!(lines
+        .iter()
+        .any(|l| l.contains(r#""type":"session_created""#)));
     assert!(lines.iter().any(|l| l.contains(r#""type":"done""#)));
 }
 
@@ -117,7 +122,11 @@ async fn full_loop_completes_immediately() {
 async fn full_loop_runs_shell_tool_then_completes() {
     // First response: call run_shell to write a file. Second: complete.
     let mock = MockLlm::start(vec![
-        sse_tool_call("c1", "run_shell", "{\"command\":\"echo integration > out.txt\"}"),
+        sse_tool_call(
+            "c1",
+            "run_shell",
+            "{\"command\":\"echo integration > out.txt\"}",
+        ),
         sse_content("Wrote out.txt successfully.", "stop"),
     ]);
     let cfg = config_for(&mock.addr);
@@ -126,7 +135,10 @@ async fn full_loop_runs_shell_tool_then_completes() {
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
 
-    let res = rt.run_task("write a file", None, &sink, &cancel).await.unwrap();
+    let res = rt
+        .run_task("write a file", None, &sink, &cancel)
+        .await
+        .unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
 
     // The observation for run_shell must have been emitted.
@@ -170,14 +182,23 @@ async fn event_protocol_ordering_and_shapes() {
 
     let lines = sink.lines();
     // start comes before done
-    let start_idx = lines.iter().position(|l| l.contains(r#""type":"start""#)).unwrap();
-    let done_idx = lines.iter().position(|l| l.contains(r#""type":"done""#)).unwrap();
+    let start_idx = lines
+        .iter()
+        .position(|l| l.contains(r#""type":"start""#))
+        .unwrap();
+    let done_idx = lines
+        .iter()
+        .position(|l| l.contains(r#""type":"done""#))
+        .unwrap();
     assert!(start_idx < done_idx);
 
     // Every JSON event line must be valid JSON and single-line.
     for l in &lines {
         if l.starts_with('{') {
-            assert!(serde_json::from_str::<serde_json::Value>(l).is_ok(), "bad json line: {l}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(l).is_ok(),
+                "bad json line: {l}"
+            );
             assert!(!l.contains('\n'));
         }
     }
@@ -211,7 +232,8 @@ async fn python_write_and_test_closed_loop() {
     let cancel = AtomicBool::new(false);
 
     let res = rt
-        .run_task("write add() and test it", None, &sink, &cancel).await
+        .run_task("write add() and test it", None, &sink, &cancel)
+        .await
         .unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
 
@@ -247,14 +269,16 @@ async fn python_script_file_execution() {
     let rt = AgentRuntime::init(cfg, proj.clone()).unwrap();
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
-    let res = rt.run_task("run a script", None, &sink, &cancel).await.unwrap();
+    let res = rt
+        .run_task("run a script", None, &sink, &cancel)
+        .await
+        .unwrap();
     assert_eq!(format!("{:?}", res.status), "Completed");
     assert!(proj.join("run.py").exists());
     // If python executed the script, "42" appears in an observation.
     let lines = sink.lines();
     let _ = lines.iter().any(|l| l.contains("42"));
 }
-
 
 // ───────────────── network robustness (first-token hang fixes) ─────────────────
 
@@ -314,7 +338,9 @@ async fn llm_retry_recovers_and_reports_status() {
             let (mut header_end, mut content_len) = (0usize, 0usize);
             loop {
                 let Ok(n) = stream.read(&mut buf) else { break };
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 req.extend_from_slice(&buf[..n]);
                 if header_end == 0 {
                     if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -360,7 +386,10 @@ async fn llm_retry_recovers_and_reports_status() {
     assert!(
         lines.iter().any(|l| l.contains("llm retry")),
         "retry status must be emitted for the UI: {:#?}",
-        lines.iter().filter(|l| l.contains("tool_progress")).collect::<Vec<_>>()
+        lines
+            .iter()
+            .filter(|l| l.contains("tool_progress"))
+            .collect::<Vec<_>>()
     );
     assert!(
         lines.iter().any(|l| l.contains("recovered")),
@@ -395,12 +424,15 @@ async fn resumed_session_with_dangling_tool_calls_is_repaired() {
                 let (mut header_end, mut content_len) = (0usize, 0usize);
                 loop {
                     let Ok(n) = stream.read(&mut buf) else { break };
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     req.extend_from_slice(&buf[..n]);
                     if header_end == 0 {
                         if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
                             header_end = pos + 4;
-                            let headers = String::from_utf8_lossy(&req[..header_end]).to_lowercase();
+                            let headers =
+                                String::from_utf8_lossy(&req[..header_end]).to_lowercase();
                             content_len = headers
                                 .lines()
                                 .find_map(|l| l.strip_prefix("content-length:"))
@@ -408,11 +440,14 @@ async fn resumed_session_with_dangling_tool_calls_is_repaired() {
                                 .unwrap_or(0);
                         }
                     }
-                    if header_end > 0 && req.len() >= header_end + content_len { break; }
+                    if header_end > 0 && req.len() >= header_end + content_len {
+                        break;
+                    }
                 }
-                captured.lock().unwrap().push(
-                    String::from_utf8_lossy(&req[header_end..]).to_string(),
-                );
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req[header_end..]).to_string());
                 let body = "data: {\"choices\":[{\"delta\":{\"content\":\"resumed fine\"}}]}\n\n\
                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
                             data: [DONE]\n\n";
@@ -434,8 +469,16 @@ async fn resumed_session_with_dangling_tool_calls_is_repaired() {
         let assistant = ChatMessage::assistant_with_tools(
             String::new(),
             vec![
-                ToolCall { id: "call_lost_1".into(), name: "run_shell".into(), arguments: "{}".into() },
-                ToolCall { id: "call_lost_2".into(), name: "run_shell".into(), arguments: "{}".into() },
+                ToolCall {
+                    id: "call_lost_1".into(),
+                    name: "run_shell".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "call_lost_2".into(),
+                    name: "run_shell".into(),
+                    arguments: "{}".into(),
+                },
             ],
         );
         let _ = sm.add_message(SessionMessage::from_chat(&assistant));
@@ -450,7 +493,10 @@ async fn resumed_session_with_dangling_tool_calls_is_repaired() {
     let rt = AgentRuntime::init(cfg, proj).unwrap();
     let sink = CollectingSink::new(false);
     let cancel = AtomicBool::new(false);
-    let res = rt.run_task("continue the task", Some(&sid), &sink, &cancel).await.unwrap();
+    let res = rt
+        .run_task("continue the task", Some(&sid), &sink, &cancel)
+        .await
+        .unwrap();
 
     assert_eq!(format!("{:?}", res.status), "Completed", "{:?}", res.status);
 
@@ -480,4 +526,3 @@ async fn resumed_session_with_dangling_tool_calls_is_repaired() {
         "synthetic tool result missing from the request"
     );
 }
-

@@ -58,7 +58,7 @@ impl AgentRuntime {
     /// shell backend. The native backend needs no setup; the fastshell backend
     /// initializes a VFS sandbox + embedded CPython.
     pub fn init(mut config: AgentConfig, project_path: PathBuf) -> Result<Self> {
-    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+        // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
         // Wire config.timeouts.model_request into model's per-request deadline
         if config.model.request_timeout_secs.is_none() {
             config.model.request_timeout_secs = Some(config.timeouts.model_request);
@@ -202,7 +202,9 @@ mod tests {
         cfg.model.api_key = Some("x".into());
         cfg.shell_backend = ShellBackendChoice::Native;
         let rt = AgentRuntime::init(cfg, d.clone()).unwrap();
-        let out = rt.backend.run("echo hi > f.txt && cat f.txt", None, 10, 0, &d);
+        let out = rt
+            .backend
+            .run("echo hi > f.txt && cat f.txt", None, 10, 0, &d);
         assert!(out.stdout.contains("hi"));
         // File created at the real project dir (no VFS jail nesting).
         assert!(d.join("f.txt").exists());
@@ -216,7 +218,9 @@ mod tests {
         cfg.shell_backend = ShellBackendChoice::Fastshell;
         let rt = AgentRuntime::init(cfg, d).unwrap();
         assert_eq!(rt.backend_kind(), "fastshell");
-        let out = rt.backend.run("echo hi", None, 10, 0, std::path::Path::new("."));
+        let out = rt
+            .backend
+            .run("echo hi", None, 10, 0, std::path::Path::new("."));
         assert!(out.stdout.contains("hi"));
     }
 
@@ -242,8 +246,14 @@ mod tests {
             api_key: Some("sk-mm".into()),
             ..Default::default()
         });
-        assert!(cfg.multimodal.as_ref().unwrap().request_timeout_secs.is_none(),
-            "before init, request_timeout_secs should be None");
+        assert!(
+            cfg.multimodal
+                .as_ref()
+                .unwrap()
+                .request_timeout_secs
+                .is_none(),
+            "before init, request_timeout_secs should be None"
+        );
         let rt = AgentRuntime::init(cfg, d).unwrap();
         assert_eq!(
             rt.config.multimodal.as_ref().unwrap().request_timeout_secs,
@@ -262,7 +272,12 @@ mod tests {
             api_key: Some("sk-mm".into()),
             ..Default::default()
         });
-        assert!(cfg.multimodal.as_ref().unwrap().request_timeout_secs.is_none());
+        assert!(cfg
+            .multimodal
+            .as_ref()
+            .unwrap()
+            .request_timeout_secs
+            .is_none());
         let mut fs = Fastshell::new();
         let mut fscfg = Config::default();
         fscfg.sandbox_path = d.to_string_lossy().to_string();

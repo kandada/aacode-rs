@@ -52,7 +52,10 @@ impl Tool for DelegateTaskTool {
         if task.is_empty() {
             return Ok(json!({"success": false, "error": "missing task_description"}).to_string());
         }
-        let agent_type = args.get("agent_type").and_then(|v| v.as_str()).unwrap_or("general");
+        let agent_type = args
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general");
         let registry = (self.sub_registry)();
         // Sub-agent output is collected but not streamed to the main sink to
         // avoid confusing the UI; the returned summary is what matters.
@@ -66,7 +69,8 @@ impl Tool for DelegateTaskTool {
             &self.project_path,
             &sink,
             cancel,
-        ).await?;
+        )
+        .await?;
         Ok(json!({
             "success": true,
             "agent_type": agent_type,
@@ -119,24 +123,27 @@ mod tests {
     fn delegate_runs_sub_agent() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-        let llm: Arc<dyn LlmClient> = Arc::new(OneShot {
-            text: Mutex::new(Some("sub result".into())),
-        });
-        let factory: SubRegistryFactory = Arc::new(|| ToolRegistry::new());
-        let tool = DelegateTaskTool {
-            llm,
-            config: AgentConfig::default(),
-            project_path: tmp(),
-            sub_registry: factory,
-        };
-        let cancel = AtomicBool::new(false);
-        let out = tool
-            .call(&json!({"task_description": "do sub", "agent_type": "code"}), &cancel)
-            .await
-            .unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["success"], true);
-        assert_eq!(v["result"], "sub result");
+            let llm: Arc<dyn LlmClient> = Arc::new(OneShot {
+                text: Mutex::new(Some("sub result".into())),
+            });
+            let factory: SubRegistryFactory = Arc::new(|| ToolRegistry::new());
+            let tool = DelegateTaskTool {
+                llm,
+                config: AgentConfig::default(),
+                project_path: tmp(),
+                sub_registry: factory,
+            };
+            let cancel = AtomicBool::new(false);
+            let out = tool
+                .call(
+                    &json!({"task_description": "do sub", "agent_type": "code"}),
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["success"], true);
+            assert_eq!(v["result"], "sub result");
         });
     }
 
@@ -154,6 +161,9 @@ mod tests {
         };
         let cancel = AtomicBool::new(false);
         let out = tool.call(&json!({}), &cancel).await.unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], false);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["success"],
+            false
+        );
     }
 }

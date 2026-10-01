@@ -35,8 +35,8 @@ use crate::stream::CallbackSink;
 use serde_json::json;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The C stream callback type: receives one NUL-terminated UTF-8 line plus the
 /// opaque `userdata` context supplied at `aacode_task_start`. The userdata lets
@@ -47,6 +47,39 @@ pub type StreamCallback = extern "C" fn(*const c_char, *mut c_void);
 pub struct AacodeTask {
     cancel: Arc<AtomicBool>,
     result_rx: mpsc::Receiver<String>,
+    /// Sender for a terminal result when the task is aborted (see cancel/free).
+    tx: mpsc::Sender<String>,
+    /// The spawned task, so `cancel`/`free` can abort it.
+    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Session key to release **synchronously** on cancel/free. The task future
+    /// (which owns the `SessionGuard`) is only dropped at its next await point
+    /// after `abort()`, so without this a new message on the same session races
+    /// the drop and is rejected with "already has a task running".
+    session_key: Option<String>,
+    /// fastshell cancel flag: set on cancel to abort a running command, which
+    /// would otherwise keep holding the fastshell lock until it finishes (making
+    /// the next command report "could not acquire lock after Ns (busy)").
+    fs_cancel: Option<Arc<AtomicBool>>,
+}
+
+impl AacodeTask {
+    fn new(
+        cancel: Arc<AtomicBool>,
+        result_rx: mpsc::Receiver<String>,
+        tx: mpsc::Sender<String>,
+        join: Option<tokio::task::JoinHandle<()>>,
+        session_key: Option<String>,
+        fs_cancel: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        AacodeTask {
+            cancel,
+            result_rx,
+            tx,
+            join: Mutex::new(join),
+            session_key,
+            fs_cancel,
+        }
+    }
 }
 
 /// Wrapper making the raw `userdata` pointer safe to move into the tokio task
@@ -70,33 +103,51 @@ impl SendUserData {
 /// In-flight session ids (project_path + session_id). Two concurrent tasks on
 /// the SAME session would corrupt the session file (last-writer-wins), so the
 /// second submission is rejected up front.
-static RUNNING_SESSIONS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+static RUNNING_SESSIONS: OnceLock<Mutex<std::collections::HashMap<String, Arc<()>>>> =
+    OnceLock::new();
 
-fn running_sessions() -> &'static Mutex<std::collections::HashSet<String>> {
-    RUNNING_SESSIONS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+fn running_sessions() -> &'static Mutex<std::collections::HashMap<String, Arc<()>>> {
+    RUNNING_SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Release a session synchronously. Called on cancel/free so the next message on
+/// the same session can start immediately, instead of racing the async task drop
+/// (which only happens at the cancelled future's next await point).
+fn release_session(key: &str) {
+    running_sessions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(key);
 }
 
 /// RAII guard marking a session as busy. `try_acquire` returns None when the
-/// session already has an in-flight task.
+/// session already has an in-flight task. Each acquisition gets a unique token
+/// so a cancelled task's late `Drop` never removes a *new* task's guard.
 struct SessionGuard {
     key: String,
+    token: Arc<()>,
 }
 
 impl SessionGuard {
     fn try_acquire(key: String) -> Option<Self> {
-        let mut set = running_sessions().lock().unwrap_or_else(|e| e.into_inner());
-        if set.contains(&key) {
+        let mut map = running_sessions().lock().unwrap_or_else(|e| e.into_inner());
+        if map.contains_key(&key) {
             return None;
         }
-        set.insert(key.clone());
-        Some(SessionGuard { key })
+        let token = Arc::new(());
+        map.insert(key.clone(), token.clone());
+        Some(SessionGuard { key, token })
     }
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let mut set = running_sessions().lock().unwrap_or_else(|e| e.into_inner());
-        set.remove(&self.key);
+        let mut map = running_sessions().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cur) = map.get(&self.key) {
+            if Arc::ptr_eq(cur, &self.token) {
+                map.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -113,6 +164,23 @@ fn to_c_string(s: String) -> *mut c_char {
     CString::new(s)
         .unwrap_or_else(|_| CString::new("").unwrap())
         .into_raw()
+}
+
+/// Run an FFI body, converting a panic into an error JSON instead of letting it
+/// unwind across the `extern "C"` boundary.
+///
+/// On Rust 1.81+ a panic escaping an `extern "C"` function aborts the whole
+/// process — so an `unwrap` on corrupt on-disk session data (or any other
+/// panic) would be a silent crash with no business-level stack. Every
+/// non-task FFI entry point funnels through here so a panic degrades to a
+/// normal error result instead.
+fn guard_cchar(f: impl FnOnce() -> *mut c_char) -> *mut c_char {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(ptr) => ptr,
+        Err(_) => to_c_string(
+            serde_json::json!({"success": false, "error": "internal panic"}).to_string(),
+        ),
+    }
 }
 
 /// Decide the shell sandbox root for the SDK (mobile/embedded host) path.
@@ -146,9 +214,7 @@ fn resolve_shell_root(
     let Some(user_dir) = user_dir else {
         return (project.to_string(), None);
     };
-    let canon = |s: &str| {
-        std::fs::canonicalize(s).unwrap_or_else(|_| std::path::PathBuf::from(s))
-    };
+    let canon = |s: &str| std::fs::canonicalize(s).unwrap_or_else(|_| std::path::PathBuf::from(s));
     let sandbox_c = canon(sandbox);
     let project_c = canon(project);
     let user_dir_c = canon(user_dir);
@@ -180,7 +246,10 @@ fn resolve_shell_root(
         if user_dir_c.strip_prefix(ancestor).is_ok() {
             if let Ok(rel) = project_c.strip_prefix(ancestor) {
                 if !rel.as_os_str().is_empty() {
-                    return (ancestor.to_string_lossy().to_string(), Some(rel.to_string_lossy().to_string()));
+                    return (
+                        ancestor.to_string_lossy().to_string(),
+                        Some(rel.to_string_lossy().to_string()),
+                    );
                 }
             }
         }
@@ -194,13 +263,17 @@ fn resolve_shell_root(
 fn build_runtime(
     config: &AgentConfig,
     project_path: &str,
-) -> Result<AgentRuntime, String> {
+) -> Result<(AgentRuntime, Option<Arc<AtomicBool>>), String> {
     if let Some(sdk) = fastshell::sdk::try_get_sdk_instance() {
         let sandbox = {
             let guard = sdk.lock().unwrap_or_else(|e| e.into_inner());
             guard.vfs_root()
         };
-        let pp = if project_path == "." { sandbox.clone() } else { project_path.to_string() };
+        let pp = if project_path == "." {
+            sandbox.clone()
+        } else {
+            project_path.to_string()
+        };
         // Shell sandbox root + optional cwd reposition (see resolve_shell_root).
         let (shell_root, cd_rel) =
             resolve_shell_root(&sandbox, &pp, config.skills.user_dir.as_deref());
@@ -236,9 +309,17 @@ fn build_runtime(
                 }
             }
         }
-        Ok(AgentRuntime::with_fastshell(cfg, std::path::PathBuf::from(pp), fs_arc))
+        let fs_cancel = fs_arc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel_handle();
+        Ok((
+            AgentRuntime::with_fastshell(cfg, std::path::PathBuf::from(pp), fs_arc),
+            Some(fs_cancel),
+        ))
     } else {
         AgentRuntime::init(config.clone(), std::path::PathBuf::from(project_path))
+            .map(|rt| (rt, None))
             .map_err(|e| e.to_string())
     }
 }
@@ -270,7 +351,14 @@ pub extern "C" fn aacode_task_start(
             let msg = "null task_json";
             emit(&json!({"type": "error", "message": msg}).to_string());
             let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
-            return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+            return Box::into_raw(Box::new(AacodeTask::new(
+                cancel,
+                rx,
+                tx.clone(),
+                None,
+                None,
+                None,
+            )));
         }
     };
 
@@ -280,64 +368,125 @@ pub extern "C" fn aacode_task_start(
             let msg = format!("bad task_json: {e}");
             emit(&json!({"type": "error", "message": msg}).to_string());
             let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
-            return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+            return Box::into_raw(Box::new(AacodeTask::new(
+                cancel,
+                rx,
+                tx.clone(),
+                None,
+                None,
+                None,
+            )));
         }
     };
-    let task = v.get("task").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let task = v
+        .get("task")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if task.is_empty() {
         let msg = "missing task";
         emit(&json!({"type": "error", "message": msg}).to_string());
         let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
-        return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+        return Box::into_raw(Box::new(AacodeTask::new(
+            cancel,
+            rx,
+            tx.clone(),
+            None,
+            None,
+            None,
+        )));
     }
-    let project_path = v.get("project_path").and_then(|x| x.as_str()).unwrap_or(".").to_string();
-    let session_id = v.get("session_id").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let project_path = v
+        .get("project_path")
+        .and_then(|x| x.as_str())
+        .unwrap_or(".")
+        .to_string();
+    let session_id = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
 
     // Reject a second concurrent task on the same session (would corrupt the
     // session file). New sessions (no session_id) are always allowed.
-    let session_guard = match &session_id {
-        Some(sid) => {
-            let key = format!("{project_path}::{sid}");
-            match SessionGuard::try_acquire(key) {
-                Some(g) => Some(g),
-                None => {
-                    let msg = format!("session '{sid}' already has a task running");
-                    emit(&json!({"type": "error", "message": msg}).to_string());
-                    let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
-                    return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
-                }
+    let session_key: Option<String> = session_id
+        .as_ref()
+        .map(|sid| format!("{project_path}::{sid}"));
+    let session_guard = match &session_key {
+        Some(key) => match SessionGuard::try_acquire(key.clone()) {
+            Some(g) => Some(g),
+            None => {
+                let sid = session_id.as_deref().unwrap_or("");
+                let msg = format!("session '{sid}' already has a task running");
+                emit(&json!({"type": "error", "message": msg}).to_string());
+                let _ = tx.send(json!({"status": "error", "error": msg}).to_string());
+                return Box::into_raw(Box::new(AacodeTask::new(
+                    cancel,
+                    rx,
+                    tx.clone(),
+                    None,
+                    None,
+                    None,
+                )));
             }
-        }
+        },
         None => None,
     };
 
     let mut config: AgentConfig = serde_json::from_value(v).unwrap_or_default();
     config.apply_env();
 
-    let rt = match build_runtime(&config, &project_path) {
-        Ok(rt) => rt,
+    let (rt, fs_cancel) = match build_runtime(&config, &project_path) {
+        Ok(x) => x,
         Err(e) => {
             emit(&json!({"type": "error", "message": e}).to_string());
             let _ = tx.send(json!({"status": "error", "error": e}).to_string());
-            return Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }));
+            return Box::into_raw(Box::new(AacodeTask::new(
+                cancel,
+                rx,
+                tx.clone(),
+                None,
+                None,
+                None,
+            )));
         }
     };
 
     let cancel2 = cancel.clone();
-    let _join = TOKIO_RT.spawn(async move {
+    let tx_for_handle = tx.clone();
+    let join = TOKIO_RT.spawn(async move {
         // Hold the session guard for the duration of the task.
         let _guard = session_guard;
-        let result = rt
-            .run_task(&task, session_id.as_deref(), &CallbackSink::new(Box::new(emit)), &cancel2)
-            .await;
+        // Guard against a panic in the agent (e.g. an `unwrap` on bad data):
+        // without this, a panic leaves `result_rx` open forever and
+        // `aacode_task_wait` blocks until the host's 180-minute timeout — a
+        // silent "task interrupted". Turn a panic into a normal error result.
+        use futures::FutureExt;
+        let result = std::panic::AssertUnwindSafe(rt.run_task(
+            &task,
+            session_id.as_deref(),
+            &CallbackSink::new(Box::new(emit)),
+            &cancel2,
+        ))
+        .catch_unwind()
+        .await;
         let json = match result {
-            Ok(res) => res.to_result_json().to_string(),
-            Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
+            Ok(Ok(res)) => res.to_result_json().to_string(),
+            Ok(Err(e)) => json!({"status": "error", "error": e.to_string()}).to_string(),
+            Err(_) => {
+                json!({"status": "error", "error": "agent panicked (internal error)"}).to_string()
+            }
         };
         let _ = tx.send(json);
     });
 
-    Box::into_raw(Box::new(AacodeTask { cancel, result_rx: rx }))
+    Box::into_raw(Box::new(AacodeTask::new(
+        cancel,
+        rx,
+        tx_for_handle,
+        Some(join),
+        session_key,
+        fs_cancel,
+    )))
 }
 
 /// Block until the task finishes; return the terminal JSON result string
@@ -364,6 +513,24 @@ pub extern "C" fn aacode_task_cancel(handle: *mut AacodeTask) {
     }
     let h = unsafe { &*handle };
     h.cancel.store(true, Ordering::SeqCst);
+    // Abort a running command so it stops holding the fastshell lock (tokio
+    // cannot cancel a running `spawn_blocking` task, so the flag is the only
+    // way to release the lock promptly).
+    if let Some(c) = &h.fs_cancel {
+        c.store(true, Ordering::SeqCst);
+    }
+    // Abort the task future (so it is dropped at its next await point).
+    if let Some(join) = h.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        join.abort();
+    }
+    // Release the session **synchronously** so the next message on the same
+    // session can start immediately (the aborted future may not have been
+    // dropped yet).
+    if let Some(k) = &h.session_key {
+        release_session(k);
+    }
+    // Best-effort terminal result for hosts that call `wait` after cancelling.
+    let _ = h.tx.send(json!({"status": "cancelled"}).to_string());
 }
 
 /// Free a finished handle.
@@ -372,6 +539,20 @@ pub extern "C" fn aacode_task_free(handle: *mut AacodeTask) {
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
     if handle.is_null() {
         return;
+    }
+    // Safety net: if the host frees a still-running task without cancelling it,
+    // abort so it does not keep holding the session guard.
+    {
+        let h = unsafe { &*handle };
+        if let Some(join) = h.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            join.abort();
+            if let Some(c) = &h.fs_cancel {
+                c.store(true, Ordering::SeqCst);
+            }
+        }
+        if let Some(k) = &h.session_key {
+            release_session(k);
+        }
     }
     unsafe {
         drop(Box::from_raw(handle));
@@ -383,49 +564,60 @@ pub extern "C" fn aacode_task_free(handle: *mut AacodeTask) {
 #[no_mangle]
 pub extern "C" fn aacode_validate_api_key(config_json: *const c_char) -> *mut c_char {
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let input = match unsafe { cstr(config_json) } {
-        Some(s) => s.to_string(),
-        None => return to_c_string(json!({"valid": false, "error": "null config"}).to_string()),
-    };
-    let mut config: AgentConfig = serde_json::from_str(&input).unwrap_or_default();
-    config.apply_env();
-    let client = crate::llm::build_client(&config.model);
-    let handle = TOKIO_RT.handle().clone();
-    let out = std::thread::scope(|s| {
-        s.spawn(move || match handle.block_on(async { client.validate().await }) {
-            Ok(()) => json!({"valid": true}),
-            Err(e) => json!({"valid": false, "error": e.to_string()}),
-        })
-        .join()
-        .unwrap()
-    });
-    to_c_string(out.to_string())
+    guard_cchar(|| {
+        let input = match unsafe { cstr(config_json) } {
+            Some(s) => s.to_string(),
+            None => {
+                return to_c_string(json!({"valid": false, "error": "null config"}).to_string())
+            }
+        };
+        let mut config: AgentConfig = serde_json::from_str(&input).unwrap_or_default();
+        config.apply_env();
+        let client = crate::llm::build_client(&config.model);
+        let handle = TOKIO_RT.handle().clone();
+        let out = std::thread::scope(|s| {
+            s.spawn(
+                move || match handle.block_on(async { client.validate().await }) {
+                    Ok(()) => json!({"valid": true}),
+                    Err(e) => json!({"valid": false, "error": e.to_string()}),
+                },
+            )
+            // A panic in the validation thread must not abort the process.
+            .join()
+            .unwrap_or_else(|_| json!({"valid": false, "error": "validation thread panicked"}))
+        });
+        to_c_string(out.to_string())
+    })
 }
 
 /// List sessions for a project path. Returns a JSON array.
 #[no_mangle]
 pub extern "C" fn aacode_list_sessions(project_path: *const c_char) -> *mut c_char {
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let pp = match unsafe { cstr(project_path) } {
-        Some(s) => s.to_string(),
-        None => return to_c_string(json!({"success": false, "error": "null path"}).to_string()),
-    };
-    let sm = SessionManager::new(std::path::Path::new(&pp));
-    let sessions: Vec<serde_json::Value> = sm
-        .list_sessions()
-        .into_iter()
-        .map(|s| {
-            json!({
-                "session_id": s.session_id,
-                "title": s.title,
-                "created_at": s.created_at,
-                "last_activity": s.last_activity,
-                "total_messages": s.total_messages,
-                "status": s.status,
+    guard_cchar(|| {
+        let pp = match unsafe { cstr(project_path) } {
+            Some(s) => s.to_string(),
+            None => {
+                return to_c_string(json!({"success": false, "error": "null path"}).to_string())
+            }
+        };
+        let sm = SessionManager::new(std::path::Path::new(&pp));
+        let sessions: Vec<serde_json::Value> = sm
+            .list_sessions()
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "session_id": s.session_id,
+                    "title": s.title,
+                    "created_at": s.created_at,
+                    "last_activity": s.last_activity,
+                    "total_messages": s.total_messages,
+                    "status": s.status,
+                })
             })
-        })
-        .collect();
-    to_c_string(json!({"success": true, "sessions": sessions}).to_string())
+            .collect();
+        to_c_string(json!({"success": true, "sessions": sessions}).to_string())
+    })
 }
 
 /// Get the messages of a session. Returns a JSON array of {role, content, ...}.
@@ -435,25 +627,26 @@ pub extern "C" fn aacode_get_session_messages(
     session_id: *const c_char,
 ) -> *mut c_char {
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
-    let pp = unsafe { cstr(project_path) }.unwrap_or("").to_string();
-    let sid = unsafe { cstr(session_id) }.unwrap_or("").to_string();
-    let sm = SessionManager::new(std::path::Path::new(&pp));
-    let msgs = sm.read_session_messages(&sid);
-    let arr: Vec<serde_json::Value> = msgs
-        .iter()
-        .map(|m| {
-            json!({
-                "role": m.role,
-                "content": m.content,
-                "timestamp": m.timestamp,
-                "tool_calls": m.tool_calls,
-                "tool_call_id": m.tool_call_id,
-                "reasoning_content": m.reasoning_content,
-                "segments": m.segments,
+    guard_cchar(|| {
+        let pp = unsafe { cstr(project_path) }.unwrap_or("").to_string();
+        let sid = unsafe { cstr(session_id) }.unwrap_or("").to_string();
+        let sm = SessionManager::new(std::path::Path::new(&pp));
+        let msgs = sm.read_session_messages(&sid);
+        let arr: Vec<serde_json::Value> = msgs
+            .iter()
+            .map(|m| {
+                json!({
+                    "role": m.role,
+                    "content": m.content,
+                    "timestamp": m.timestamp,
+                    "tool_calls": m.tool_calls,
+                    "tool_call_id": m.tool_call_id,
+                    "reasoning_content": m.reasoning_content,
+                })
             })
-        })
-        .collect();
-    to_c_string(json!({"success": true, "messages": arr}).to_string())
+            .collect();
+        to_c_string(json!({"success": true, "messages": arr}).to_string())
+    })
 }
 
 // ── Session store FFI (see SESSION_FFI.md) ─────────────────────────
@@ -473,7 +666,6 @@ fn message_to_json(m: &SessionMessage) -> serde_json::Value {
         "tool_calls": m.tool_calls,
         "tool_call_id": m.tool_call_id,
         "reasoning_content": m.reasoning_content,
-        "segments": m.segments,
     })
 }
 
@@ -509,27 +701,29 @@ pub extern "C" fn aacode_session_version() -> u32 {
 /// List sessions for a project (SESSION_FFI contract). Returns a JSON array.
 #[no_mangle]
 pub extern "C" fn aacode_session_list(project_path: *const c_char) -> *mut c_char {
-    let pp = match unsafe { cstr(project_path) } {
-        Some(s) => s.to_string(),
-        None => return session_err("null project_path"),
-    };
-    let sm = SessionManager::new(std::path::Path::new(&pp));
-    let sessions: Vec<serde_json::Value> = sm
-        .list_sessions()
-        .into_iter()
-        .map(|s| {
-            json!({
-                "session_id": s.session_id,
-                "title": s.title,
-                "created_at": s.created_at,
-                "last_activity": s.last_activity,
-                "total_messages": s.total_messages,
-                "total_tokens": s.total_tokens,
-                "status": s.status,
+    guard_cchar(|| {
+        let pp = match unsafe { cstr(project_path) } {
+            Some(s) => s.to_string(),
+            None => return session_err("null project_path"),
+        };
+        let sm = SessionManager::new(std::path::Path::new(&pp));
+        let sessions: Vec<serde_json::Value> = sm
+            .list_sessions()
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "session_id": s.session_id,
+                    "title": s.title,
+                    "created_at": s.created_at,
+                    "last_activity": s.last_activity,
+                    "total_messages": s.total_messages,
+                    "total_tokens": s.total_tokens,
+                    "status": s.status,
+                })
             })
-        })
-        .collect();
-    to_c_string(json!({"success": true, "sessions": sessions}).to_string())
+            .collect();
+        to_c_string(json!({"success": true, "sessions": sessions}).to_string())
+    })
 }
 
 /// Paginated session messages (SESSION_FFI contract).
@@ -540,32 +734,34 @@ pub extern "C" fn aacode_session_messages(
     offset: u32,
     limit: u32,
 ) -> *mut c_char {
-    let (pp, sid) = match session_id_args(project_path, session_id) {
-        Ok(v) => v,
-        Err(e) => return session_err(&e),
-    };
-    let sm = SessionManager::new(std::path::Path::new(&pp));
-    let all = sm.read_session_messages(&sid);
-    let total = all.len();
-    let offset = offset as usize;
-    let limit = limit as usize;
-    let end = total.saturating_sub(offset);
-    let start = end.saturating_sub(limit);
-    let slice: Vec<serde_json::Value> = if start < end {
-        all[start..end].iter().map(message_to_json).collect()
-    } else {
-        Vec::new()
-    };
-    to_c_string(
-        json!({
-            "success": true,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "messages": slice,
-        })
-        .to_string(),
-    )
+    guard_cchar(|| {
+        let (pp, sid) = match session_id_args(project_path, session_id) {
+            Ok(v) => v,
+            Err(e) => return session_err(&e),
+        };
+        let sm = SessionManager::new(std::path::Path::new(&pp));
+        let all = sm.read_session_messages(&sid);
+        let total = all.len();
+        let offset = offset as usize;
+        let limit = limit as usize;
+        let end = total.saturating_sub(offset);
+        let start = end.saturating_sub(limit);
+        let slice: Vec<serde_json::Value> = if start < end {
+            all[start..end].iter().map(message_to_json).collect()
+        } else {
+            Vec::new()
+        };
+        to_c_string(
+            json!({
+                "success": true,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "messages": slice,
+            })
+            .to_string(),
+        )
+    })
 }
 
 /// Idempotent create-or-touch a session (SESSION_FFI contract).
@@ -575,17 +771,19 @@ pub extern "C" fn aacode_session_ensure(
     session_id: *const c_char,
     title: *const c_char,
 ) -> *mut c_char {
-    let (pp, sid) = match session_id_args(project_path, session_id) {
-        Ok(v) => v,
-        Err(e) => return session_err(&e),
-    };
-    let title = unsafe { cstr(title) }.unwrap_or("").to_string();
-    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sm = SessionManager::new(std::path::Path::new(&pp));
-    match sm.ensure_session(&sid, &title) {
-        Ok(()) => to_c_string(json!({"success": true}).to_string()),
-        Err(e) => session_err(&e.to_string()),
-    }
+    guard_cchar(|| {
+        let (pp, sid) = match session_id_args(project_path, session_id) {
+            Ok(v) => v,
+            Err(e) => return session_err(&e),
+        };
+        let title = unsafe { cstr(title) }.unwrap_or("").to_string();
+        let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sm = SessionManager::new(std::path::Path::new(&pp));
+        match sm.ensure_session(&sid, &title) {
+            Ok(()) => to_c_string(json!({"success": true}).to_string()),
+            Err(e) => session_err(&e.to_string()),
+        }
+    })
 }
 
 /// Set an explicit title on a session (SESSION_FFI contract).
@@ -595,17 +793,19 @@ pub extern "C" fn aacode_session_rename(
     session_id: *const c_char,
     title: *const c_char,
 ) -> *mut c_char {
-    let (pp, sid) = match session_id_args(project_path, session_id) {
-        Ok(v) => v,
-        Err(e) => return session_err(&e),
-    };
-    let title = unsafe { cstr(title) }.unwrap_or("").to_string();
-    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sm = SessionManager::new(std::path::Path::new(&pp));
-    match sm.rename_session(&sid, &title) {
-        Ok(()) => to_c_string(json!({"success": true}).to_string()),
-        Err(e) => session_err(&e.to_string()),
-    }
+    guard_cchar(|| {
+        let (pp, sid) = match session_id_args(project_path, session_id) {
+            Ok(v) => v,
+            Err(e) => return session_err(&e),
+        };
+        let title = unsafe { cstr(title) }.unwrap_or("").to_string();
+        let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sm = SessionManager::new(std::path::Path::new(&pp));
+        match sm.rename_session(&sid, &title) {
+            Ok(()) => to_c_string(json!({"success": true}).to_string()),
+            Err(e) => session_err(&e.to_string()),
+        }
+    })
 }
 
 /// Bump `last_activity` of a session (SESSION_FFI contract).
@@ -614,16 +814,18 @@ pub extern "C" fn aacode_session_touch(
     project_path: *const c_char,
     session_id: *const c_char,
 ) -> *mut c_char {
-    let (pp, sid) = match session_id_args(project_path, session_id) {
-        Ok(v) => v,
-        Err(e) => return session_err(&e),
-    };
-    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sm = SessionManager::new(std::path::Path::new(&pp));
-    match sm.touch_session(&sid) {
-        Ok(()) => to_c_string(json!({"success": true}).to_string()),
-        Err(e) => session_err(&e.to_string()),
-    }
+    guard_cchar(|| {
+        let (pp, sid) = match session_id_args(project_path, session_id) {
+            Ok(v) => v,
+            Err(e) => return session_err(&e),
+        };
+        let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sm = SessionManager::new(std::path::Path::new(&pp));
+        match sm.touch_session(&sid) {
+            Ok(()) => to_c_string(json!({"success": true}).to_string()),
+            Err(e) => session_err(&e.to_string()),
+        }
+    })
 }
 
 /// Delete a session (idempotent; SESSION_FFI contract).
@@ -632,16 +834,18 @@ pub extern "C" fn aacode_session_delete(
     project_path: *const c_char,
     session_id: *const c_char,
 ) -> *mut c_char {
-    let (pp, sid) = match session_id_args(project_path, session_id) {
-        Ok(v) => v,
-        Err(e) => return session_err(&e),
-    };
-    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sm = SessionManager::new(std::path::Path::new(&pp));
-    match sm.delete_session(&sid) {
-        Ok(_) => to_c_string(json!({"success": true}).to_string()),
-        Err(e) => session_err(&e.to_string()),
-    }
+    guard_cchar(|| {
+        let (pp, sid) = match session_id_args(project_path, session_id) {
+            Ok(v) => v,
+            Err(e) => return session_err(&e),
+        };
+        let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sm = SessionManager::new(std::path::Path::new(&pp));
+        match sm.delete_session(&sid) {
+            Ok(_) => to_c_string(json!({"success": true}).to_string()),
+            Err(e) => session_err(&e.to_string()),
+        }
+    })
 }
 
 /// Append messages to a session (SESSION_FFI contract).
@@ -651,23 +855,96 @@ pub extern "C" fn aacode_session_append(
     session_id: *const c_char,
     msgs_json: *const c_char,
 ) -> *mut c_char {
-    let (pp, sid) = match session_id_args(project_path, session_id) {
-        Ok(v) => v,
-        Err(e) => return session_err(&e),
-    };
-    let msgs_str = match unsafe { cstr(msgs_json) } {
-        Some(s) => s,
-        None => return session_err("null msgs_json"),
-    };
-    let msgs: Vec<SessionMessage> = match serde_json::from_str(msgs_str) {
-        Ok(v) => v,
-        Err(e) => return session_err(&format!("bad msgs_json: {e}")),
-    };
-    let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sm = SessionManager::new(std::path::Path::new(&pp));
-    match sm.append_session_messages(&sid, msgs) {
-        Ok(()) => to_c_string(json!({"success": true}).to_string()),
-        Err(e) => session_err(&e.to_string()),
+    guard_cchar(|| {
+        let (pp, sid) = match session_id_args(project_path, session_id) {
+            Ok(v) => v,
+            Err(e) => return session_err(&e),
+        };
+        let msgs_str = match unsafe { cstr(msgs_json) } {
+            Some(s) => s,
+            None => return session_err("null msgs_json"),
+        };
+        let msgs: Vec<SessionMessage> = match serde_json::from_str(msgs_str) {
+            Ok(v) => v,
+            Err(e) => return session_err(&format!("bad msgs_json: {e}")),
+        };
+        let _guard = SESSION_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sm = SessionManager::new(std::path::Path::new(&pp));
+        match sm.append_session_messages(&sid, msgs) {
+            Ok(()) => to_c_string(json!({"success": true}).to_string()),
+            Err(e) => session_err(&e.to_string()),
+        }
+    })
+}
+
+/// Register the host WebView backend used by the browser tools (feature
+/// `browser`). Call **once, before starting any task**, and before the browser
+/// is first used. `ops` points at an `FbWebViewOps` table (see fastbrowser's
+/// `fastbrowser.h`); the host must keep it alive for the process lifetime.
+///
+/// Returns 0 on success, non-zero on error. Safe to call when the `browser`
+/// feature is disabled — it simply reports unsupported (-1).
+#[no_mangle]
+pub unsafe extern "C" fn aacode_browser_register_webview_ops(ops: *const c_void) -> i32 {
+    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+    #[cfg(feature = "browser")]
+    {
+        if ops.is_null() {
+            return -1;
+        }
+        fastbrowser::sdk::ffi::fastbrowser_register_webview_ops(
+            ops as *const fastbrowser::sdk::ffi::FbWebViewOps,
+        )
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        let _ = ops;
+        -1
+    }
+}
+
+/// Register the host native-surface backend (Android `AccessibilityService`)
+/// used by the desktop/`ax_*` tools. Call **once, before starting any task**.
+/// `ops` points at an `FbSurfaceOps` table (see fastbrowser's `fastbrowser.h`);
+/// the host must keep it alive for the process lifetime.
+///
+/// Returns 0 on success, non-zero on error. Safe to call when the `browser`
+/// feature is disabled (reports -1).
+#[no_mangle]
+pub unsafe extern "C" fn aacode_browser_register_surface_ops(ops: *const c_void) -> i32 {
+    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+    #[cfg(feature = "browser")]
+    {
+        if ops.is_null() {
+            return -1;
+        }
+        fastbrowser::sdk::ffi::fastbrowser_register_surface_ops(
+            ops as *const fastbrowser::sdk::ffi::FbSurfaceOps,
+        )
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        let _ = ops;
+        -1
+    }
+}
+
+/// Whether the browser backend is available (feature `browser` compiled **and**
+/// a host WebView registered). Returns 1/0.
+#[no_mangle]
+pub extern "C" fn aacode_browser_available() -> i32 {
+    // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
+    #[cfg(feature = "browser")]
+    {
+        if crate::tools::browser::is_available() {
+            1
+        } else {
+            0
+        }
+    }
+    #[cfg(not(feature = "browser"))]
+    {
+        0
     }
 }
 
@@ -723,7 +1000,9 @@ mod tests {
         let (out, events) = run_task("not json");
         assert!(out.contains("bad task_json"), "got: {out}");
         assert!(
-            events.iter().any(|l| l.contains(r#""type":"error""#) && l.contains("bad task_json")),
+            events
+                .iter()
+                .any(|l| l.contains(r#""type":"error""#) && l.contains("bad task_json")),
             "error event must be emitted: {events:?}"
         );
     }
@@ -808,6 +1087,90 @@ mod tests {
         drop(g1);
         let g3 = SessionGuard::try_acquire("p::s1".to_string());
         assert!(g3.is_some(), "released session must be reacquirable");
+    }
+
+    /// Cancelling a task must release its session guard promptly (abort), so a
+    /// new message on the same session is not rejected with "already has a task
+    /// running".
+    #[test]
+    fn cancel_aborts_task_and_releases_guard() {
+        let key = format!("/tmp/p::cancel_{}", uuid::Uuid::new_v4().simple());
+        let (tx, rx) = mpsc::channel::<String>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = cancel.clone();
+        let key2 = key.clone();
+        let join = TOKIO_RT.spawn(async move {
+            let _g = SessionGuard::try_acquire(key2).unwrap();
+            let _ = ready_tx.send(());
+            // A step that never checks the cancel flag (like a long tool call).
+            futures::future::pending::<()>().await;
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("task should acquire the guard");
+        assert!(
+            SessionGuard::try_acquire(key.clone()).is_none(),
+            "guard held while running"
+        );
+
+        let handle = Box::into_raw(Box::new(AacodeTask::new(
+            cancel2,
+            rx,
+            tx,
+            Some(join),
+            None,
+            None,
+        )));
+        aacode_task_cancel(handle);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            SessionGuard::try_acquire(key.clone()).is_some(),
+            "guard must be released after cancel"
+        );
+        aacode_task_free(handle);
+    }
+
+    /// Cancel must release the session **synchronously** (not just when the
+    /// aborted future is dropped), so the next message can start immediately
+    /// even if the old task is stuck in a non-awaiting section.
+    #[test]
+    fn cancel_releases_session_synchronously() {
+        let key = format!("/tmp/p::sync_{}", uuid::Uuid::new_v4().simple());
+        let (tx, rx) = mpsc::channel::<String>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let key2 = key.clone();
+        let join = TOKIO_RT.spawn(async move {
+            let _g = SessionGuard::try_acquire(key2).unwrap();
+            let _ = ready_tx.send(());
+            // Busy-wait without awaiting: `abort()` cannot drop this future
+            // until it yields, so only a synchronous release can free the key.
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+            while std::time::Instant::now() < end {
+                std::hint::spin_loop();
+            }
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("task should acquire the guard");
+        assert!(SessionGuard::try_acquire(key.clone()).is_none());
+
+        let handle = Box::into_raw(Box::new(AacodeTask::new(
+            cancel,
+            rx,
+            tx,
+            Some(join),
+            Some(key.clone()),
+            None,
+        )));
+        aacode_task_cancel(handle);
+        // No sleep: the key must already be free.
+        assert!(
+            SessionGuard::try_acquire(key.clone()).is_some(),
+            "cancel must release the session synchronously"
+        );
+        aacode_task_free(handle);
     }
 
     #[test]
@@ -985,7 +1348,10 @@ mod tests {
         let r = call_str(|| aacode_session_delete(pp.as_ptr(), sid.as_ptr()));
         assert!(r.contains("\"success\":true"), "delete: {r}");
         let r = call_str(|| aacode_session_delete(pp.as_ptr(), sid.as_ptr()));
-        assert!(r.contains("\"success\":true"), "delete again (idempotent): {r}");
+        assert!(
+            r.contains("\"success\":true"),
+            "delete again (idempotent): {r}"
+        );
     }
 
     #[test]
@@ -995,7 +1361,10 @@ mod tests {
         let sid = CString::new("s1").unwrap();
         let bad = CString::new("not json").unwrap();
         let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), bad.as_ptr()));
-        assert!(r.contains("\"success\":false"), "bad msgs_json must error: {r}");
+        assert!(
+            r.contains("\"success\":false"),
+            "bad msgs_json must error: {r}"
+        );
         assert!(r.contains("bad msgs_json"));
     }
 
@@ -1018,7 +1387,6 @@ mod tests {
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
-                        segments: None,
                     }],
                 )
                 .unwrap();
@@ -1027,10 +1395,16 @@ mod tests {
         // offset=0 limit=2 → newest two (m3, m4)
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 2));
         assert!(r.contains("\"total\":5"), "total: {r}");
-        assert!(r.contains("m4") && r.contains("m3") && !r.contains("m0"), "page0: {r}");
+        assert!(
+            r.contains("m4") && r.contains("m3") && !r.contains("m0"),
+            "page0: {r}"
+        );
         // offset=2 limit=2 → m1, m2
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 2, 2));
-        assert!(r.contains("m2") && r.contains("m1") && !r.contains("m3"), "page1: {r}");
+        assert!(
+            r.contains("m2") && r.contains("m1") && !r.contains("m3"),
+            "page1: {r}"
+        );
     }
 
     #[test]
@@ -1045,7 +1419,10 @@ mod tests {
         let pp = CString::new(proj).unwrap();
         let evil = CString::new("../escape").unwrap();
         let r = call_str(|| aacode_session_ensure(pp.as_ptr(), evil.as_ptr(), std::ptr::null()));
-        assert!(r.contains("\"success\":false"), "path traversal must be rejected: {r}");
+        assert!(
+            r.contains("\"success\":false"),
+            "path traversal must be rejected: {r}"
+        );
         assert!(r.contains("invalid session_id"));
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), evil.as_ptr(), 0, 50));
         assert!(r.contains("\"success\":false"));
@@ -1071,7 +1448,6 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
-                    segments: None,
                 }],
             )
             .unwrap();
@@ -1079,11 +1455,17 @@ mod tests {
         // limit=0 → no messages, total still reported.
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 0));
         assert!(r.contains("\"total\":1"), "limit=0 total: {r}");
-        assert!(!r.contains("\"hi\""), "limit=0 must return no messages: {r}");
+        assert!(
+            !r.contains("\"hi\""),
+            "limit=0 must return no messages: {r}"
+        );
         // offset beyond total → empty.
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 5, 10));
         assert!(r.contains("\"total\":1"));
-        assert!(!r.contains("\"hi\""), "offset beyond total must be empty: {r}");
+        assert!(
+            !r.contains("\"hi\""),
+            "offset beyond total must be empty: {r}"
+        );
     }
 
     #[test]
@@ -1100,7 +1482,9 @@ mod tests {
     }
 
     #[test]
-    fn session_append_and_read_segments() {
+    fn session_append_ignores_segments_field() {
+        // A host may still send legacy `segments`; it must be accepted (success)
+        // and dropped — never re-persisted or read back.
         let proj = mkdirs(&tmp_root("sess_segs"));
         let pp = CString::new(proj).unwrap();
         let sid = CString::new("s1").unwrap();
@@ -1113,12 +1497,14 @@ mod tests {
         ]"#;
         let mj = CString::new(msgs).unwrap();
         let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), mj.as_ptr()));
-        assert!(r.contains("\"success\":true"), "append segments: {r}");
+        assert!(r.contains("\"success\":true"), "append: {r}");
 
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 50));
-        assert!(r.contains("\"type\":\"thinking\""), "thinking segment round-trips: {r}");
-        assert!(r.contains("\"name\":\"run_shell\""), "action name round-trips: {r}");
-        assert!(r.contains("\"created_at\":\"1700000001.001\""), "created_at round-trips: {r}");
+        assert!(r.contains("\"ok\""), "content preserved: {r}");
+        assert!(
+            !r.contains("segments"),
+            "legacy segments must be dropped, not persisted: {r}"
+        );
     }
 
     #[test]
@@ -1129,45 +1515,19 @@ mod tests {
         let msgs = r#"[{"role":"user","content":"hi","timestamp":"1700000001"}]"#;
         let mj = CString::new(msgs).unwrap();
         let r = call_str(|| aacode_session_append(pp.as_ptr(), sid.as_ptr(), mj.as_ptr()));
-        assert!(r.contains("\"success\":true"), "append without segments: {r}");
+        assert!(
+            r.contains("\"success\":true"),
+            "append without segments: {r}"
+        );
         let r = call_str(|| aacode_session_messages(pp.as_ptr(), sid.as_ptr(), 0, 50));
-        assert!(r.contains("\"hi\""), "message without segments still read: {r}");
-        // Optional field rendered as null in the wire (consistent with tool_calls).
-        assert!(r.contains("\"segments\":null"), "absent segments serialize as null: {r}");
-    }
-
-    #[test]
-    fn legacy_get_session_messages_carries_segments() {
-        let proj = mkdirs(&tmp_root("sess_legacy_seg"));
-        let pp = CString::new(proj.clone()).unwrap();
-        let sid = CString::new("s1").unwrap();
-        {
-            let mut sm = SessionManager::new(std::path::Path::new(&proj));
-            sm.ensure_session("s1", "").unwrap();
-            sm.append_session_messages(
-                "s1",
-                vec![SessionMessage {
-                    role: "assistant".to_string(),
-                    content: "ok".to_string(),
-                    timestamp: "1700000001".to_string(),
-                    tokens: 1,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    segments: Some(vec![crate::session::MessageSegment {
-                        kind: "thought".into(),
-                        content: "ok".into(),
-                        name: None,
-                        created_at: Some("1700000001.001".into()),
-                    }]),
-                }],
-            )
-            .unwrap();
-        }
-        let r = call_str(|| aacode_get_session_messages(pp.as_ptr(), sid.as_ptr()));
-        assert!(r.contains("\"success\":true"), "legacy read: {r}");
-        assert!(r.contains("\"type\":\"thought\""), "legacy carries segments: {r}");
-        assert!(r.contains("\"created_at\":\"1700000001.001\""), "legacy segment created_at: {r}");
+        assert!(
+            r.contains("\"hi\""),
+            "message without segments still read: {r}"
+        );
+        assert!(
+            !r.contains("segments"),
+            "segments are never emitted in the wire: {r}"
+        );
     }
 
     #[test]
@@ -1177,5 +1537,19 @@ mod tests {
         let r = call_str(|| aacode_session_list(pp.as_ptr()));
         assert!(r.contains("\"success\":true"));
         assert!(r.contains("\"sessions\":[]"), "empty project: {r}");
+    }
+}
+
+#[cfg(test)]
+mod surface_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn register_surface_ops_rejects_null() {
+        // Null table is always rejected (with or without the `browser` feature).
+        assert_eq!(
+            unsafe { aacode_browser_register_surface_ops(std::ptr::null()) },
+            -1
+        );
     }
 }

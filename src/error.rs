@@ -88,7 +88,9 @@ mod tests {
     #[test]
     fn display_formats() {
         assert_eq!(AacodeError::Cancelled.to_string(), "cancelled");
-        assert!(AacodeError::Config("x".into()).to_string().contains("config"));
+        assert!(AacodeError::Config("x".into())
+            .to_string()
+            .contains("config"));
     }
 
     #[test]

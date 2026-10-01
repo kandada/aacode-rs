@@ -15,8 +15,8 @@
 //! quirks — multibyte content, null fields, keep-alive pings, multi-chunk
 //! argument fragments, interleaved reasoning+content, empty finish chunks.
 
-use aacode_rs::llm::openai::parse_openai_stream;
 use aacode_rs::llm::anthropic::parse_anthropic_stream;
+use aacode_rs::llm::openai::parse_openai_stream;
 use aacode_rs::stream::CollectingSink;
 use std::io::Cursor;
 use std::sync::atomic::AtomicBool;
@@ -89,11 +89,20 @@ fn openai_deepseek_reasoner_split() {
         "data: [DONE]\n\n"
     );
     let (resp, lines) = run_openai(raw);
-    assert_eq!(resp.reasoning_content.as_deref(), Some("Let me think step by step."));
+    assert_eq!(
+        resp.reasoning_content.as_deref(),
+        Some("Let me think step by step.")
+    );
     assert_eq!(resp.text, "The answer is 42.");
     // thinking seg emitted before thought seg
-    let ti = lines.iter().position(|l| l.contains(r#""seg":"thinking""#)).unwrap();
-    let to = lines.iter().position(|l| l.contains(r#""seg":"thought""#)).unwrap();
+    let ti = lines
+        .iter()
+        .position(|l| l.contains(r#""seg":"thinking""#))
+        .unwrap();
+    let to = lines
+        .iter()
+        .position(|l| l.contains(r#""seg":"thought""#))
+        .unwrap();
     assert!(ti < to);
 }
 
@@ -260,7 +269,6 @@ fn openai_content_with_finish_reason_same_chunk() {
     assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
 }
 
-
 // ─────────────────────────── Anthropic / Claude ───────────────────────────
 
 /// Realistic Claude stream: message_start, content_block_start(text), ping,
@@ -295,7 +303,10 @@ fn anthropic_extended_thinking() {
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
     );
     let (resp, _) = run_anthropic(raw);
-    assert_eq!(resp.reasoning_content.as_deref(), Some("Considering options"));
+    assert_eq!(
+        resp.reasoning_content.as_deref(),
+        Some("Considering options")
+    );
     assert_eq!(resp.text, "Final answer");
 }
 
@@ -395,7 +406,6 @@ fn anthropic_in_stream_error() {
     assert!(format!("{}", r.err().unwrap()).contains("Overloaded"));
 }
 
-
 // ─────────────── Live API compatibility (opt-in, requires key) ───────────────
 //
 // Run with a real key to prove wire-format compatibility against the actual
@@ -481,7 +491,8 @@ async fn live_openai_tool_call() {
 #[ignore = "requires a real Anthropic-compatible LLM_API_KEY"]
 async fn live_anthropic_streams_text() {
     let mut model = ModelConfig {
-        name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| "claude-3-5-sonnet-20241022".into()),
+        name: std::env::var("LLM_MODEL_NAME")
+            .unwrap_or_else(|_| "claude-3-5-sonnet-20241022".into()),
         api_key: std::env::var("LLM_API_KEY").ok(),
         base_url: std::env::var("LLM_API_URL").ok(),
         gateway: Gateway::Anthropic,
@@ -508,7 +519,8 @@ async fn live_anthropic_streams_text() {
 #[ignore = "requires a real Anthropic-compatible LLM_API_KEY"]
 async fn live_anthropic_tool_call() {
     let mut model = ModelConfig {
-        name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| "claude-3-5-sonnet-20241022".into()),
+        name: std::env::var("LLM_MODEL_NAME")
+            .unwrap_or_else(|_| "claude-3-5-sonnet-20241022".into()),
         api_key: std::env::var("LLM_API_KEY").ok(),
         base_url: std::env::var("LLM_API_URL").ok(),
         gateway: Gateway::Anthropic,
@@ -543,8 +555,6 @@ async fn live_anthropic_tool_call() {
     // input_json_delta must have assembled into valid JSON with a command
     assert!(resp.tool_calls[0].parsed_args().get("command").is_some());
 }
-
-
 
 // ──────── regression / cross-cutting ────────
 

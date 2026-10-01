@@ -41,6 +41,36 @@ impl ParamType {
             ParamType::Object => v.is_object(),
         }
     }
+
+    /// Best-effort coerce a value to this type. LLMs frequently send numbers /
+    /// booleans as strings (e.g. `"max_output": "3000"`); non-coercible values
+    /// are returned unchanged so validation still reports a clear type error.
+    pub fn coerce(&self, v: &Value) -> Value {
+        match (self, v) {
+            (ParamType::Integer, Value::String(s)) => s
+                .trim()
+                .parse::<i64>()
+                .map(|n| json!(n))
+                .unwrap_or_else(|_| v.clone()),
+            (ParamType::Number, Value::String(s)) => {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    json!(n)
+                } else if let Ok(f) = s.trim().parse::<f64>() {
+                    json!(f)
+                } else {
+                    v.clone()
+                }
+            }
+            (ParamType::Boolean, Value::String(s)) => {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => json!(true),
+                    "false" | "0" | "no" => json!(false),
+                    _ => v.clone(),
+                }
+            }
+            _ => v.clone(),
+        }
+    }
 }
 
 /// A single tool parameter definition.
@@ -157,7 +187,14 @@ impl ToolSchema {
         let mut out = serde_json::Map::new();
         for (k, v) in obj {
             let canonical = alias_map.get(k.as_str()).copied().unwrap_or(k.as_str());
-            out.insert(canonical.to_string(), v.clone());
+            // Coerce string scalars to the declared numeric/boolean type.
+            let coerced = self
+                .parameters
+                .iter()
+                .find(|p| p.name == canonical)
+                .map(|p| p.ty.coerce(v))
+                .unwrap_or_else(|| v.clone());
+            out.insert(canonical.to_string(), coerced);
         }
         Value::Object(out)
     }
@@ -209,7 +246,10 @@ impl ToolSchema {
 
     /// Human-readable documentation for the tool (used in not-found/error hints).
     pub fn documentation(&self) -> String {
-        let mut doc = format!("## {}\n\n{}\n\n### Parameters\n", self.name, self.description);
+        let mut doc = format!(
+            "## {}\n\n{}\n\n### Parameters\n",
+            self.name, self.description
+        );
         for p in &self.parameters {
             let req = if p.required { "required" } else { "optional" };
             let aliases = if p.aliases.is_empty() {
@@ -246,7 +286,13 @@ mod tests {
                     "the command",
                     &["cmd", "shell", "script", "exec"],
                 ),
-                ToolParameter::new("timeout", ParamType::Integer, false, "seconds", &["time_limit"]),
+                ToolParameter::new(
+                    "timeout",
+                    ParamType::Integer,
+                    false,
+                    "seconds",
+                    &["time_limit"],
+                ),
             ],
         )
     }
@@ -256,7 +302,10 @@ mod tests {
         let t = sample().to_openai_tool();
         assert_eq!(t["type"], "function");
         assert_eq!(t["function"]["name"], "run_shell");
-        assert_eq!(t["function"]["parameters"]["properties"]["command"]["type"], "string");
+        assert_eq!(
+            t["function"]["parameters"]["properties"]["command"]["type"],
+            "string"
+        );
         assert_eq!(t["function"]["parameters"]["required"][0], "command");
     }
 
@@ -264,7 +313,10 @@ mod tests {
     fn anthropic_tool_shape() {
         let t = sample().to_anthropic_tool();
         assert_eq!(t["name"], "run_shell");
-        assert_eq!(t["input_schema"]["properties"]["timeout"]["type"], "integer");
+        assert_eq!(
+            t["input_schema"]["properties"]["timeout"]["type"],
+            "integer"
+        );
     }
 
     #[test]
@@ -295,5 +347,64 @@ mod tests {
         let s = sample();
         let n = s.normalize_params(&json!({"command": "ls", "timeout": 5}));
         assert!(s.validate(&n).is_ok());
+    }
+
+    #[test]
+    fn normalize_coerces_string_scalars_to_declared_types() {
+        let s = ToolSchema::new(
+            "t",
+            "d",
+            vec![
+                ToolParameter::new("n", ParamType::Integer, false, "", &[]),
+                ToolParameter::new("f", ParamType::Number, false, "", &[]),
+                ToolParameter::new("b", ParamType::Boolean, false, "", &[]),
+            ],
+        );
+        let out = s.normalize_params(&json!({"n": "3000", "f": "1.5", "b": "true"}));
+        assert_eq!(out["n"], json!(3000));
+        assert_eq!(out["f"], json!(1.5));
+        assert_eq!(out["b"], json!(true));
+        assert!(s.validate(&out).is_ok(), "coerced params must validate");
+        // Non-coercible strings are left as-is (validation then reports a clear error).
+        let out = s.normalize_params(&json!({"n": "abc"}));
+        assert_eq!(out["n"], json!("abc"));
+        assert!(s.validate(&out).is_err());
+    }
+
+    #[test]
+    fn coerce_handles_whitespace_and_word_booleans() {
+        assert_eq!(ParamType::Integer.coerce(&json!(" 42 ")), json!(42));
+        assert_eq!(ParamType::Number.coerce(&json!("42")), json!(42));
+        assert_eq!(ParamType::Number.coerce(&json!("2.5")), json!(2.5));
+        assert_eq!(ParamType::Boolean.coerce(&json!(" YES ")), json!(true));
+        assert_eq!(ParamType::Boolean.coerce(&json!("no")), json!(false));
+        assert_eq!(ParamType::Boolean.coerce(&json!("1")), json!(true));
+        // Non-coercible values are returned unchanged.
+        assert_eq!(ParamType::Boolean.coerce(&json!("maybe")), json!("maybe"));
+        assert_eq!(ParamType::Integer.coerce(&json!(3.5)), json!(3.5));
+    }
+
+    #[test]
+    fn normalize_passthrough_for_non_objects() {
+        let s = sample();
+        assert_eq!(s.normalize_params(&json!([1, 2])), json!([1, 2]));
+        assert_eq!(s.normalize_params(&json!("x")), json!("x"));
+        assert_eq!(s.normalize_params(&json!(null)), json!(null));
+    }
+
+    #[test]
+    fn validate_null_optional_is_ok() {
+        let s = sample();
+        let n = s.normalize_params(&json!({"command": "ls", "timeout": null}));
+        assert!(s.validate(&n).is_ok());
+    }
+
+    #[test]
+    fn documentation_lists_params_and_aliases() {
+        let doc = sample().documentation();
+        assert!(doc.contains("run_shell"));
+        assert!(doc.contains("command"));
+        assert!(doc.contains("aliases: cmd"));
+        assert!(doc.contains("required"));
     }
 }

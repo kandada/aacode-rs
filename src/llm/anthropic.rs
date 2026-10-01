@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Default, Clone)]
 struct BlockAcc {
-    kind: String,         // "text" | "thinking" | "tool_use"
+    kind: String, // "text" | "thinking" | "tool_use"
     id: String,
     name: String,
     text: String,         // for text/thinking
@@ -149,9 +149,7 @@ pub fn parse_anthropic_stream<R: std::io::Read>(
         ));
     }
 
-    if stop_reason.is_none()
-        && (!text.is_empty() || !reasoning.is_empty() || !blocks.is_empty())
-    {
+    if stop_reason.is_none() && (!text.is_empty() || !reasoning.is_empty() || !blocks.is_empty()) {
         stop_reason = Some("connection_closed".to_string());
     }
 

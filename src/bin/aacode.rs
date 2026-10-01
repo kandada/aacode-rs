@@ -122,11 +122,12 @@ fn main() {
         return;
     }
 
-    match tokio_rt.block_on(
-        agent_rt.run_task(&task, session_id.as_deref(), &sink, &cancel)
-    ) {
+    match tokio_rt.block_on(agent_rt.run_task(&task, session_id.as_deref(), &sink, &cancel)) {
         Ok(res) => {
-            println!("\n[status: {:?}, iterations: {}]", res.status, res.iterations);
+            println!(
+                "\n[status: {:?}, iterations: {}]",
+                res.status, res.iterations
+            );
         }
         Err(e) => {
             eprintln!("Task failed: {e}");
@@ -157,10 +158,11 @@ fn run_interactive(
             println!("bye");
             break;
         }
-        match tokio_rt.block_on(
-            agent_rt.run_task(task, None, sink, cancel)
-        ) {
-            Ok(res) => println!("\n[status: {:?}, iterations: {}]", res.status, res.iterations),
+        match tokio_rt.block_on(agent_rt.run_task(task, None, sink, cancel)) {
+            Ok(res) => println!(
+                "\n[status: {:?}, iterations: {}]",
+                res.status, res.iterations
+            ),
             Err(e) => eprintln!("error: {e}"),
         }
     }

@@ -347,11 +347,19 @@ pub type SharedFastshell = Arc<Mutex<Fastshell>>;
 /// Routes commands through the fastshell sandbox engine.
 pub struct FastshellBackend {
     fs: SharedFastshell,
+    /// Baseline working directory (VFS path), captured on first use. fastshell's
+    /// cwd is persistent across commands, so without this a `cd` in one
+    /// `run_shell` leaks into the next (the model assumes each call starts at
+    /// the project root). Each command runs from this baseline.
+    base_cwd: std::sync::Mutex<Option<String>>,
 }
 
 impl FastshellBackend {
     pub fn new(fs: SharedFastshell) -> Self {
-        FastshellBackend { fs }
+        FastshellBackend {
+            fs,
+            base_cwd: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -381,8 +389,8 @@ impl ShellBackend for FastshellBackend {
         let lock_timeout_secs = timeout_secs.max(5);
         let timeout_ms = timeout_secs.saturating_mul(1000);
         let fs_guard = {
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(lock_timeout_secs);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(lock_timeout_secs);
             loop {
                 match self.fs.try_lock() {
                     Ok(g) => break g,
@@ -403,10 +411,17 @@ impl ShellBackend for FastshellBackend {
             }
         };
 
-        let r = if timeout_ms > 0 {
-            fs_guard.execute_with_timeout(&effective, timeout_ms)
-        } else {
-            fs_guard.execute(&effective)
+        let r = {
+            // Capture the baseline cwd once (the project root the host set up).
+            let base = {
+                let mut b = self.base_cwd.lock().unwrap_or_else(|e| e.into_inner());
+                if b.is_none() {
+                    let pwd = fs_guard.execute("pwd").stdout.trim().to_string();
+                    *b = Some(if pwd.is_empty() { "/".to_string() } else { pwd });
+                }
+                b.clone().unwrap_or_else(|| "/".to_string())
+            };
+            fs_guard.execute_in_with_timeout(&base, &effective, timeout_ms)
         };
 
         CmdOutput {
@@ -462,7 +477,8 @@ mod tests {
 
     #[test]
     fn native_real_cwd_and_pipes() {
-        let dir = std::env::temp_dir().join(format!("native_cwd_{}", uuid::Uuid::new_v4().simple()));
+        let dir =
+            std::env::temp_dir().join(format!("native_cwd_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("data.txt"), "apple\nbanana\napple\n").unwrap();
         let sh = NativeShell::new();
@@ -474,7 +490,13 @@ mod tests {
     #[test]
     fn native_stdin_input() {
         let sh = NativeShell::new();
-        let out = sh.run("cat", Some("piped content"), 10, 0, std::path::Path::new("."));
+        let out = sh.run(
+            "cat",
+            Some("piped content"),
+            10,
+            0,
+            std::path::Path::new("."),
+        );
         assert_eq!(out.exit_code, 0);
         assert!(out.stdout.contains("piped content"));
     }
@@ -495,18 +517,62 @@ mod tests {
         // timeout DOES terminate within a reasonable window (guarded at 8s).
         let out = sh.run("sleep 10", None, 1, 0, std::path::Path::new("."));
         let elapsed = start.elapsed();
-        assert!(elapsed.as_secs() < 8, "timeout should have fired; elapsed={elapsed:?}");
+        assert!(
+            elapsed.as_secs() < 8,
+            "timeout should have fired; elapsed={elapsed:?}"
+        );
         // Exit 124 is the POSIX convention for command-killed-by-timeout.
-        assert_eq!(out.exit_code, 124, "unexpected exit code; stdout={}, stderr={}", out.stdout, out.stderr);
+        assert_eq!(
+            out.exit_code, 124,
+            "unexpected exit code; stdout={}, stderr={}",
+            out.stdout, out.stderr
+        );
     }
 
     #[test]
     fn native_python_real() {
         // If python3 exists (desktop), it runs via the real interpreter.
         let sh = NativeShell::new();
-        let out = sh.run("python3 -c \"print(6*7)\"", None, 10, 0, std::path::Path::new("."));
+        let out = sh.run(
+            "python3 -c \"print(6*7)\"",
+            None,
+            10,
+            0,
+            std::path::Path::new("."),
+        );
         if out.exit_code == 0 {
             assert!(out.stdout.contains("42"));
         }
+    }
+
+    /// fastshell's cwd is persistent, but each `run_shell` must start at the
+    /// project root (the model assumes statelessness; a `cd` must not leak).
+    #[test]
+    fn fastshell_backend_resets_cwd_between_calls() {
+        let dir =
+            std::env::temp_dir().join(format!("fs_backend_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut fs = Fastshell::new();
+        let mut cfg = fastshell::Config::default();
+        cfg.sandbox_path = dir.to_string_lossy().to_string();
+        cfg.command_timeout_ms = 5_000;
+        fs.init(cfg).unwrap();
+        let backend = FastshellBackend::new(Arc::new(Mutex::new(fs)));
+
+        let base = backend
+            .run("pwd", None, 5, 0, &dir)
+            .stdout
+            .trim()
+            .to_string();
+        assert!(!base.is_empty(), "pwd should return the baseline cwd");
+
+        // `cd ..` in one call must not leak into the next.
+        let _ = backend.run("cd ..", None, 5, 0, &dir);
+        let after = backend
+            .run("pwd", None, 5, 0, &dir)
+            .stdout
+            .trim()
+            .to_string();
+        assert_eq!(after, base, "cwd must reset to the baseline between calls");
     }
 }

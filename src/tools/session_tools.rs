@@ -20,20 +20,27 @@ use std::sync::{Arc, Mutex};
 
 pub struct ListSessionsTool {
     pub project_path: PathBuf,
+    pub active_session_id: Arc<Mutex<Option<String>>>,
 }
 #[async_trait::async_trait]
 impl Tool for ListSessionsTool {
     fn schema(&self) -> ToolSchema {
-        ToolSchema::new("list_sessions", "List all conversation sessions.", vec![])
+        ToolSchema::new(
+            "list_sessions",
+            "List all conversation sessions. The active (current) session is marked with `current: true`, and its id is returned as `current_session_id`.",
+            vec![],
+        )
     }
     async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
         let project_path = self.project_path.clone();
+        let current = self.active_session_id.lock().ok().and_then(|g| g.clone());
         tokio::task::spawn_blocking(move || -> Result<String> {
             let sm = SessionManager::new(&project_path);
             let sessions: Vec<Value> = sm
                 .list_sessions()
                 .into_iter()
                 .map(|s| {
+                    let is_current = current.as_deref() == Some(s.session_id.as_str());
                     json!({
                         "session_id": s.session_id,
                         "title": s.title,
@@ -41,10 +48,17 @@ impl Tool for ListSessionsTool {
                         "last_activity": s.last_activity,
                         "total_messages": s.total_messages,
                         "status": s.status,
+                        "current": is_current,
                     })
                 })
                 .collect();
-            Ok(json!({"success": true, "count": sessions.len(), "sessions": sessions}).to_string())
+            Ok(json!({
+                "success": true,
+                "count": sessions.len(),
+                "current_session_id": current,
+                "sessions": sessions,
+            })
+            .to_string())
         })
         .await
         .map_err(|e| AacodeError::Other(e.to_string()))?
@@ -70,10 +84,19 @@ impl Tool for GetConversationHistoryTool {
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let id = args.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let range_from = args.get("range_from").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let range_to = args.get("range_to").and_then(|v| v.as_u64()).map(|n| n as usize);
-        let max_chars = args.get("max_content_chars").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+        let range_to = args
+            .get("range_to")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let max_chars = args
+            .get("max_content_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100) as usize;
         let project_path = self.project_path.clone();
         let active_id = self.active_session_id.lock().unwrap().clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
@@ -100,11 +123,16 @@ impl Tool for GetConversationHistoryTool {
                         "timestamp": m.timestamp,
                     });
                     if let Some(ref tcs) = m.tool_calls {
-                        let calls: Vec<Value> = tcs.iter().map(|tc| json!({
-                            "id": tc.id,
-                            "name": tc.name,
-                            "arguments": truncate_str(&tc.arguments, max_chars),
-                        })).collect();
+                        let calls: Vec<Value> = tcs
+                            .iter()
+                            .map(|tc| {
+                                json!({
+                                    "id": tc.id,
+                                    "name": tc.name,
+                                    "arguments": truncate_str(&tc.arguments, max_chars),
+                                })
+                            })
+                            .collect();
                         obj["tool_calls"] = json!(calls);
                     }
                     if let Some(ref tci) = m.tool_call_id {
@@ -122,7 +150,8 @@ impl Tool for GetConversationHistoryTool {
                 "session_id": id,
                 "total_messages": total,
                 "history": history,
-            }).to_string())
+            })
+            .to_string())
         })
         .await
         .map_err(|e| AacodeError::Other(e.to_string()))?
@@ -176,11 +205,21 @@ impl Tool for DeleteSessionTool {
         ToolSchema::new(
             "delete_session",
             "Delete a conversation session by id.",
-            vec![ToolParameter::new("session_id", ParamType::String, true, "Session id", &["id"])],
+            vec![ToolParameter::new(
+                "session_id",
+                ParamType::String,
+                true,
+                "Session id",
+                &["id"],
+            )],
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let id = args.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let project_path = self.project_path.clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
             let mut sm = SessionManager::new(&project_path);
@@ -203,17 +242,33 @@ impl Tool for NewSessionTool {
         ToolSchema::new(
             "new_session",
             "Request a new conversation session for the next task.",
-            vec![ToolParameter::new("task", ParamType::String, false, "Initial task", &[])],
+            vec![ToolParameter::new(
+                "task",
+                ParamType::String,
+                false,
+                "Initial task",
+                &[],
+            )],
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("New task").to_string();
-        let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let task = args
+            .get("task")
+            .and_then(|v| v.as_str())
+            .unwrap_or("New task")
+            .to_string();
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let project_path = self.project_path.clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
             let mut sm = SessionManager::new(&project_path);
             match sm.create_session(&task, title.as_deref()) {
-                Ok(id) => Ok(json!({"success": true, "session_id": id, "message": "New session created"}).to_string()),
+                Ok(id) => Ok(
+                    json!({"success": true, "session_id": id, "message": "New session created"})
+                        .to_string(),
+                ),
                 Err(e) => Ok(json!({"success": false, "error": e.to_string()}).to_string()),
             }
         })
@@ -233,22 +288,38 @@ impl Tool for ContinueSessionTool {
             "Add a follow-up message to the current or specified session.",
             vec![
                 ToolParameter::new("message", ParamType::String, true, "Follow-up message", &[]),
-                ToolParameter::new("session_id", ParamType::String, false, "Target session id", &["id"]),
+                ToolParameter::new(
+                    "session_id",
+                    ParamType::String,
+                    false,
+                    "Target session id",
+                    &["id"],
+                ),
             ],
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let msg = args.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let msg = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if msg.is_empty() {
             return Ok(json!({"success": false, "error": "message required"}).to_string());
         }
-        let sid = args.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let sid = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let project_path = self.project_path.clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
             let mut sm = SessionManager::new(&project_path);
             if let Some(ref id) = sid {
                 if !sm.switch_session(id).unwrap_or(false) {
-                    return Ok(json!({"success": false, "error": format!("session {id} not found")}).to_string());
+                    return Ok(
+                        json!({"success": false, "error": format!("session {id} not found")})
+                            .to_string(),
+                    );
                 }
             }
             if sm.current_session_id.is_none() {
@@ -275,11 +346,21 @@ impl Tool for SwitchSessionTool {
         ToolSchema::new(
             "switch_session",
             "Switch to a specified conversation session.",
-            vec![ToolParameter::new("session_id", ParamType::String, true, "Session id", &["id"])],
+            vec![ToolParameter::new(
+                "session_id",
+                ParamType::String,
+                true,
+                "Session id",
+                &["id"],
+            )],
         )
     }
     async fn call(&self, args: &Value, _c: &AtomicBool) -> Result<String> {
-        let id = args.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let project_path = self.project_path.clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
             let mut sm = SessionManager::new(&project_path);
@@ -323,17 +404,23 @@ mod tests {
             sm.create_session("task one", None).unwrap();
         }
         let cancel = AtomicBool::new(false);
-        let out = ListSessionsTool { project_path: d.clone() }
-            .call(&json!({}), &cancel)
-            .await
-            .unwrap();
+        let out = ListSessionsTool {
+            project_path: d.clone(),
+            active_session_id: Arc::new(Mutex::new(None)),
+        }
+        .call(&json!({}), &cancel)
+        .await
+        .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v["count"].as_u64().unwrap() >= 1);
+        assert!(v.get("current_session_id").is_some());
 
-        let out = GetSessionStatsTool { project_path: d.clone() }
-            .call(&json!({}), &cancel)
-            .await
-            .unwrap();
+        let out = GetSessionStatsTool {
+            project_path: d.clone(),
+        }
+        .call(&json!({}), &cancel)
+        .await
+        .unwrap();
         assert!(serde_json::from_str::<Value>(&out).unwrap()["success"] == true);
     }
 
@@ -345,22 +432,27 @@ mod tests {
             sm.create_session("x", None).unwrap()
         };
         let cancel = AtomicBool::new(false);
-        let out = DeleteSessionTool { project_path: d.clone() }
-            .call(&json!({"session_id": id}), &cancel)
-            .await
-            .unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], true);
+        let out = DeleteSessionTool {
+            project_path: d.clone(),
+        }
+        .call(&json!({"session_id": id}), &cancel)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["success"],
+            true
+        );
     }
 
     #[tokio::test]
     async fn history_no_sessions() {
         let d = tmp();
         let cancel = AtomicBool::new(false);
-        let out = history_tool(d)
-            .call(&json!({}), &cancel)
-            .await
-            .unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["success"], false);
+        let out = history_tool(d).call(&json!({}), &cancel).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["success"],
+            false
+        );
     }
 
     #[tokio::test]
@@ -404,7 +496,10 @@ mod tests {
             .expect("assistant with tool_calls should be in history");
 
         assert_eq!(asst["content"], "I will run a command");
-        assert_eq!(asst["timestamp"].as_str().map(|s| !s.is_empty()), Some(true));
+        assert_eq!(
+            asst["timestamp"].as_str().map(|s| !s.is_empty()),
+            Some(true)
+        );
         let tcs = asst["tool_calls"].as_array().unwrap();
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0]["name"], "run_shell");
@@ -436,14 +531,21 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let out = history_tool(d.clone())
-            .call(&json!({"session_id": id, "max_content_chars": 100}), &cancel)
+            .call(
+                &json!({"session_id": id, "max_content_chars": 100}),
+                &cancel,
+            )
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let history = v["history"].as_array().unwrap();
         let asst = history.iter().find(|m| m["role"] == "assistant").unwrap();
         let content = asst["content"].as_str().unwrap();
-        assert!(content.contains("…(500 chars total)"), "should show truncation marker, got: {}", content);
+        assert!(
+            content.contains("…(500 chars total)"),
+            "should show truncation marker, got: {}",
+            content
+        );
         assert_eq!(content.chars().take(100).collect::<String>().len(), 100);
     }
 
@@ -470,7 +572,10 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let out = history_tool(d.clone())
-            .call(&json!({"session_id": id, "max_content_chars": 100}), &cancel)
+            .call(
+                &json!({"session_id": id, "max_content_chars": 100}),
+                &cancel,
+            )
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -481,7 +586,11 @@ mod tests {
             .expect("assistant with tool_calls should be in history");
         let tcs = asst["tool_calls"].as_array().unwrap();
         let args = tcs[0]["arguments"].as_str().unwrap();
-        assert!(args.contains("…("), "tool_calls arguments should be truncated, got: {}", args);
+        assert!(
+            args.contains("…("),
+            "tool_calls arguments should be truncated, got: {}",
+            args
+        );
     }
 
     #[tokio::test]
@@ -503,14 +612,21 @@ mod tests {
         let cancel = AtomicBool::new(false);
         // range_from=2, range_to=5 should return messages 2,3,4 (3 messages)
         let out = history_tool(d.clone())
-            .call(&json!({"session_id": id, "range_from": 2, "range_to": 5}), &cancel)
+            .call(
+                &json!({"session_id": id, "range_from": 2, "range_to": 5}),
+                &cancel,
+            )
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], true);
         assert_eq!(v["total_messages"], 11); // 1 user + 10 additions
         let history = v["history"].as_array().unwrap();
-        assert_eq!(history.len(), 3, "range_from=2, range_to=5 should return 3 messages");
+        assert_eq!(
+            history.len(),
+            3,
+            "range_from=2, range_to=5 should return 3 messages"
+        );
         assert_eq!(history[0]["content"], "msg 1");
         assert_eq!(history[2]["content"], "msg 3");
     }
@@ -539,18 +655,28 @@ mod tests {
         let history = v["history"].as_array().unwrap();
         let asst = history.iter().find(|m| m["role"] == "assistant").unwrap();
         let content = asst["content"].as_str().unwrap();
-        assert_eq!(content.len(), 500, "max_content_chars=0 should mean no truncation, got len {}", content.len());
+        assert_eq!(
+            content.len(),
+            500,
+            "max_content_chars=0 should mean no truncation, got len {}",
+            content.len()
+        );
     }
 
     #[tokio::test]
     async fn new_and_continue_ack() {
         let d = tmp();
         let cancel = AtomicBool::new(false);
-        let nt = NewSessionTool { project_path: d.clone() };
+        let nt = NewSessionTool {
+            project_path: d.clone(),
+        };
         let out = nt.call(&json!({"task": "test"}), &cancel).await.unwrap();
         assert!(out.contains("New session created"));
         let ct = ContinueSessionTool { project_path: d };
-        let out = ct.call(&json!({"message": "followup"}), &cancel).await.unwrap();
+        let out = ct
+            .call(&json!({"message": "followup"}), &cancel)
+            .await
+            .unwrap();
         assert!(out.contains("true"));
     }
 

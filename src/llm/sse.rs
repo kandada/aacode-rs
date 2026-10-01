@@ -125,7 +125,10 @@ mod tests {
     impl Read for ErrorAfter {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if self.0 == 0 {
-                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "simulated timeout"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "simulated timeout",
+                ))
             } else {
                 self.0 -= 1;
                 buf[0] = b'\n';
@@ -142,12 +145,21 @@ mod tests {
         let mut last = None;
         for _ in 0..20 {
             match r.next_data() {
-                Ok(None) => { last = Some("none".to_string()); break; }
-                Err(e) => { last = Some(format!("err: {e}")); break; }
+                Ok(None) => {
+                    last = Some("none".to_string());
+                    break;
+                }
+                Err(e) => {
+                    last = Some(format!("err: {e}"));
+                    break;
+                }
                 Ok(Some(_)) => continue,
             }
         }
-        assert!(last.unwrap().starts_with("err:"), "read error must propagate, not return None");
+        assert!(
+            last.unwrap().starts_with("err:"),
+            "read error must propagate, not return None"
+        );
     }
 
     /// Regression: partial stream that drops mid-response must not be treated
@@ -156,11 +168,16 @@ mod tests {
     #[test]
     fn mid_stream_disconnect_is_error_not_none() {
         // A stream that sends one valid data line, then the next read fails.
-        struct DropAfterOne { sent: bool }
+        struct DropAfterOne {
+            sent: bool,
+        }
         impl Read for DropAfterOne {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 if self.sent {
-                    Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset"))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "connection reset",
+                    ))
                 } else {
                     self.sent = true;
                     let data = b"data: hello\n\n";
@@ -172,7 +189,10 @@ mod tests {
         }
         let mut r = SseReader::new(DropAfterOne { sent: false });
         assert_eq!(r.next_data().unwrap().unwrap(), "hello");
-        assert!(r.next_data().is_err(), "second read must error after connection reset");
+        assert!(
+            r.next_data().is_err(),
+            "second read must error after connection reset"
+        );
     }
 
     /// UTF-8 BOM (0xEF 0xBB 0xBF) prepended by some proxies must be

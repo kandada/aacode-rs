@@ -259,4 +259,34 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].tool_call_id.as_deref(), Some("a"));
     }
+
+    #[test]
+    fn sanitize_is_idempotent_and_leaves_no_duplicate_results() {
+        // Duplicate result + dangling call together; one pass fixes both, and a
+        // second pass is a strict no-op (so repeated requests can't drift).
+        let mut m = vec![
+            ChatMessage::user("u"),
+            asst_with_tools(&["a", "b"]),
+            tool("a"),
+            tool("a"), // duplicate → dropped
+            ChatMessage::user("next"),
+        ];
+        let _ = sanitize_history(&mut m);
+        let after_first = m.clone();
+        let ids: Vec<String> = m
+            .iter()
+            .filter(|x| x.role == "tool")
+            .map(|x| x.tool_call_id.clone().unwrap())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len(), "no duplicate results: {ids:?}");
+        assert_eq!(ids, ["a", "b"], "missing result injected in order");
+
+        assert_eq!(sanitize_history(&mut m), 0, "second pass must be a no-op");
+        assert_eq!(m.len(), after_first.len(), "length stable across passes");
+        let roles = |v: &[ChatMessage]| v.iter().map(|x| x.role.clone()).collect::<Vec<_>>();
+        assert_eq!(roles(&m), roles(&after_first), "roles stable across passes");
+    }
 }
