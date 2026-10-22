@@ -79,6 +79,33 @@ impl ToolCall {
     }
 }
 
+/// Normalized provider token usage for one model call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+impl Usage {
+    /// Cache hit rate over the prompt (0.0 when the provider reports no cache
+    /// fields).
+    pub fn cache_hit_rate(&self) -> f64 {
+        let hit = self.cache_read_tokens as f64;
+        let miss = self.cache_miss_tokens as f64;
+        let denom = hit + miss;
+        if denom > 0.0 {
+            hit / denom
+        } else {
+            0.0
+        }
+    }
+}
+
 /// The result of one streamed model call.
 #[derive(Debug, Clone, Default)]
 pub struct LlmResponse {
@@ -87,6 +114,8 @@ pub struct LlmResponse {
     pub reasoning_content: Option<String>,
     /// "length"/"max_tokens" indicates truncation.
     pub finish_reason: Option<String>,
+    /// Provider-reported usage, when the gateway exposes it.
+    pub usage: Option<Usage>,
 }
 
 impl LlmResponse {

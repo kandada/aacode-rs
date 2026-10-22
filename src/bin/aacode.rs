@@ -43,11 +43,140 @@ fn load_dotenv(path: &std::path::Path) {
     }
 }
 
+#[cfg(all(feature = "pty", unix))]
+fn run_terminal(args: &[String]) {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let shell = args.first().map(String::as_str).unwrap_or("/bin/sh");
+    let (cols, rows) = term_size();
+    let mgr = Arc::new(Mutex::new(aacode_rs::terminal::TerminalManager::new(2)));
+    let id = match mgr
+        .lock()
+        .unwrap()
+        .start(shell, std::path::Path::new("."), &[], cols, rows)
+    {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("terminal: {e}");
+            return;
+        }
+    };
+    eprintln!("aacode terminal — {shell} ({cols}x{rows}). Type `exit` to leave.");
+    let _raw = RawMode::enable();
+
+    // stdin -> PTY
+    let writer = {
+        let mgr = mgr.clone();
+        let id = id.clone();
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if mgr.lock().unwrap().write(&id, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    // PTY -> stdout
+    let mut cursor = 0u64;
+    loop {
+        let read = mgr.lock().unwrap().read(&id, cursor, 8192);
+        match read {
+            Ok(r) => {
+                if !r.data.is_empty() {
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&r.data);
+                    let _ = out.flush();
+                    cursor = r.cursor;
+                }
+                if r.eof {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let _ = mgr.lock().unwrap().close(&id);
+    // Do not join the stdin reader: it may be blocked on read(0) and the
+    // process exits right after this function returns.
+    let _ = writer;
+}
+
+#[cfg(all(feature = "pty", unix))]
+struct RawMode {
+    orig: libc::termios,
+}
+
+#[cfg(all(feature = "pty", unix))]
+impl RawMode {
+    fn enable() -> Option<Self> {
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) != 0 {
+                return None;
+            }
+            let orig = t;
+            libc::cfmakeraw(&mut t);
+            if libc::tcsetattr(0, libc::TCSANOW, &t) != 0 {
+                return None;
+            }
+            Some(RawMode { orig })
+        }
+    }
+}
+
+#[cfg(all(feature = "pty", unix))]
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
+#[cfg(all(feature = "pty", unix))]
+fn term_size() -> (u16, u16) {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            (ws.ws_col, ws.ws_row)
+        } else {
+            (80, 24)
+        }
+    }
+}
+
 fn main() {
     let tokio_rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     let _args: Vec<String> = std::env::args().collect();
     let args: Vec<String> = std::env::args().collect();
+
+    // `aacode terminal [shell]` — interactive PTY (Unix, feature `pty`).
+    if args.get(1).map(String::as_str) == Some("terminal") {
+        #[cfg(all(feature = "pty", unix))]
+        {
+            run_terminal(&args[2..]);
+            return;
+        }
+        #[cfg(not(all(feature = "pty", unix)))]
+        {
+            eprintln!("terminal requires building aacode-rs with --features pty on Unix");
+            return;
+        }
+    }
+
     let mut project = ".".to_string();
     let mut session_id: Option<String> = None;
     let mut plan_first = false;

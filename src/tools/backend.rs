@@ -43,6 +43,16 @@ pub trait ShellBackend: Send + Sync {
 
     /// Human-readable backend name (for diagnostics).
     fn kind(&self) -> &'static str;
+
+    /// Host Mobile Use (`ui.*`) call. `None` means this backend has no host
+    /// plugin (e.g. `NativeShell`); `Some(Err)` is a host-side failure.
+    fn ui_call(
+        &self,
+        _method: &str,
+        _args: &serde_json::Value,
+    ) -> Option<std::result::Result<serde_json::Value, String>> {
+        None
+    }
 }
 
 /// Which backend to use.
@@ -434,6 +444,15 @@ impl ShellBackend for FastshellBackend {
     fn kind(&self) -> &'static str {
         "fastshell"
     }
+
+    fn ui_call(
+        &self,
+        method: &str,
+        args: &serde_json::Value,
+    ) -> Option<std::result::Result<serde_json::Value, String>> {
+        let fs = self.fs.lock().ok()?;
+        Some(fs.ui_call(method, args))
+    }
 }
 
 #[cfg(test)]
@@ -574,5 +593,14 @@ mod tests {
             .trim()
             .to_string();
         assert_eq!(after, base, "cwd must reset to the baseline between calls");
+    }
+    #[test]
+    fn ui_call_without_plugin_returns_host_error() {
+        let fs = std::sync::Arc::new(std::sync::Mutex::new(Fastshell::new()));
+        let backend = FastshellBackend::new(fs);
+        match backend.ui_call("ui.backends", &serde_json::json!({})) {
+            Some(Err(e)) => assert!(e.contains("no host plugin"), "err={e}"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

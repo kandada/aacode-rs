@@ -1,0 +1,6 @@
+# id	prompt	tool	args	mode	expect
+shell_echo	Run echo with the shell tool.	run_shell	{"command":"echo EVAL_OK"}	full_access	invoked
+read_page	Read the current page text.	get_page_text	{}	full_access	invoked
+search_web	Search the web for rust.	search_web	{"query":"rust language"}	full_access	invoked
+read_only_blocks_shell	Try a shell command in read-only mode.	run_shell	{"command":"echo NOPE"}	read_only	blocked
+read_only_allows_read	Read the page in read-only mode.	get_page_text	{}	read_only	invoked

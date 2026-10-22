@@ -10,6 +10,7 @@
 use crate::error::{AacodeError, Result};
 use crate::llm::types::{ChatMessage, ToolCall};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -116,6 +117,10 @@ struct SessionFile {
     #[serde(default)]
     created_at: String,
     messages: Vec<SessionMessage>,
+    /// Retrieval cutoff for the model view. The stored messages stay complete;
+    /// this only records where the model view starts. `None` = no cutoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_checkpoint: Option<Value>,
 }
 
 fn default_schema_version() -> u32 {
@@ -179,6 +184,8 @@ pub struct SessionManager {
     sessions_dir: PathBuf,
     pub current_session_id: Option<String>,
     pub messages: Vec<SessionMessage>,
+    /// Retrieval cutoff for the model view (optional; persisted per session).
+    pub context_checkpoint: Option<Value>,
     /// Flush cooldown: how many messages to batch before forcing a write.
     flush_batch_size: usize,
     /// Number of messages added since the last flush.
@@ -198,6 +205,7 @@ impl SessionManager {
             sessions_dir,
             current_session_id: None,
             messages: Vec::new(),
+            context_checkpoint: None,
             flush_batch_size: 10,
             dirty_count: 0,
             last_flush: None,
@@ -207,6 +215,15 @@ impl SessionManager {
 
     fn index_path(&self) -> PathBuf {
         self.sessions_dir.join("sessions_index.json")
+    }
+
+    /// Project root this session store belongs to (`<project>/.aacode/sessions`).
+    pub fn project_path(&self) -> PathBuf {
+        self.sessions_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default()
     }
 
     fn session_path(&self, id: &str) -> PathBuf {
@@ -254,6 +271,7 @@ impl SessionManager {
         };
         self.current_session_id = Some(id.clone());
         self.messages.clear();
+        self.context_checkpoint = None;
         if !task.trim().is_empty() {
             self.messages.push(SessionMessage {
                 role: "user".to_string(),
@@ -352,6 +370,7 @@ impl SessionManager {
                 session_id: id.clone(),
                 created_at,
                 messages: self.messages.clone(),
+                context_checkpoint: self.context_checkpoint.clone(),
             };
             atomic_write(&self.session_path(id), &serde_json::to_string(&file)?)?;
         }
@@ -368,7 +387,121 @@ impl SessionManager {
         let file: SessionFile = serde_json::from_str(&s)?;
         self.current_session_id = Some(id.to_string());
         self.messages = file.messages;
+        self.context_checkpoint = file.context_checkpoint;
         Ok(true)
+    }
+
+    /// Persisted retrieval checkpoint (model-view cutoff only).
+    pub fn context_checkpoint(&self) -> Option<Value> {
+        self.context_checkpoint.clone()
+    }
+
+    /// Persist a retrieval checkpoint. Messages themselves are never modified.
+    pub fn set_context_checkpoint(&mut self, checkpoint: Option<Value>) -> Result<()> {
+        self.context_checkpoint = checkpoint;
+        self.save_current()
+    }
+
+    /// Export one session as JSONL (user-triggered, read-only).
+    ///
+    /// Format: a `header` line, one `message` line per persisted message, and a
+    /// `footer` line. Stable IDs/fields; no execution replay. Tool output text
+    /// is exported verbatim — callers are responsible for not exporting
+    /// sessions that contain secrets.
+    pub fn export_jsonl(&self, id: &str) -> Result<String> {
+        let path = self.session_path(id);
+        let text = std::fs::read_to_string(&path)?;
+        let file: SessionFile = serde_json::from_str(&text)?;
+        let mut out = String::new();
+        out.push_str(
+            &serde_json::json!({
+                "type": "header",
+                "format": "aacode.session-export",
+                "formatVersion": 1,
+                "session_id": file.session_id,
+                "created_at": file.created_at,
+            })
+            .to_string(),
+        );
+        out.push('\n');
+        for (index, message) in file.messages.iter().enumerate() {
+            let mut line = serde_json::to_value(message)?;
+            line["type"] = Value::String("message".into());
+            line["index"] = Value::from(index);
+            out.push_str(&line.to_string());
+            out.push('\n');
+        }
+        out.push_str(
+            &serde_json::json!({
+                "type": "footer",
+                "messages": file.messages.len(),
+            })
+            .to_string(),
+        );
+        out.push('\n');
+        Ok(out)
+    }
+
+    /// Fork a session from a message prefix into a new session.
+    ///
+    /// The prefix is copied by value; the source session is untouched and the
+    /// new session is **not** made current. A boundary that would split an
+    /// `assistant(tool_calls)` from its `tool` results is moved back to before
+    /// the assistant so tool pairing is always intact. The retrieval checkpoint
+    /// is reset (it is recomputed safely for the new session).
+    pub fn fork_session(&mut self, source_id: &str, upto: Option<usize>) -> Result<String> {
+        let path = self.session_path(source_id);
+        let text = std::fs::read_to_string(&path)?;
+        let source: SessionFile = serde_json::from_str(&text)?;
+        let mut end = upto.unwrap_or(source.messages.len());
+        end = end.min(source.messages.len());
+        end = safe_prefix_end(&source.messages, end);
+        if end == 0 {
+            return Err(AacodeError::Tool(
+                "cannot fork before the first message".into(),
+            ));
+        }
+        if end > 8192 {
+            return Err(AacodeError::Tool(
+                "fork prefix exceeds 8192 messages".into(),
+            ));
+        }
+        let id = format!(
+            "session_{}_{}",
+            now_iso(),
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let prefix: Vec<SessionMessage> = source.messages[..end].to_vec();
+        let title = prefix
+            .iter()
+            .find(|m| m.role == "user" && !m.content.is_empty())
+            .map(|m| format!("Fork: {}", truncate_title(&m.content)))
+            .unwrap_or_else(|| format!("Fork of {source_id}"));
+        let now = now_iso();
+        let file = SessionFile {
+            schema_version: SCHEMA_VERSION,
+            session_id: id.clone(),
+            created_at: now.clone(),
+            messages: prefix,
+            context_checkpoint: None,
+        };
+        atomic_write(&self.session_path(&id), &serde_json::to_string(&file)?)?;
+
+        let mut index = self.load_index();
+        index.insert(
+            id.clone(),
+            SessionSummary {
+                session_id: id.clone(),
+                created_at: now.clone(),
+                last_activity: now,
+                total_messages: file.messages.len(),
+                total_tokens: file.messages.iter().map(|m| m.tokens).sum(),
+                title,
+                status: "active".to_string(),
+            },
+        );
+        self.save_index(&index)?;
+        Ok(id)
     }
 
     /// List all sessions, newest activity first.
@@ -481,6 +614,7 @@ impl SessionManager {
             session_id: sid.to_string(),
             created_at: now,
             messages: Vec::new(),
+            context_checkpoint: None,
         };
         atomic_write(&self.session_path(sid), &serde_json::to_string(&file)?)
     }
@@ -539,6 +673,7 @@ impl SessionManager {
             session_id: sid.to_string(),
             created_at,
             messages: existing,
+            context_checkpoint: None,
         };
         atomic_write(&path, &serde_json::to_string(&file)?)?;
 
@@ -591,6 +726,39 @@ fn truncate_title(task: &str) -> String {
     } else {
         t
     }
+}
+
+/// Move a fork boundary back so an `assistant(tool_calls)` block is never cut
+/// from its `tool` results (protocol integrity).
+fn safe_prefix_end(messages: &[SessionMessage], mut end: usize) -> usize {
+    end = end.min(messages.len());
+    loop {
+        let last = messages[..end].iter().enumerate().rev().find(|(_, m)| {
+            m.role == "assistant"
+                && m.tool_calls
+                    .as_ref()
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false)
+        });
+        let Some((idx, message)) = last else {
+            break;
+        };
+        let ids: Vec<&str> = message
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().map(|c| c.id.as_str()).collect())
+            .unwrap_or_default();
+        let all_present = ids.iter().all(|id| {
+            messages[..end]
+                .iter()
+                .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(*id))
+        });
+        if all_present {
+            break;
+        }
+        end = idx;
+    }
+    end
 }
 
 #[cfg(test)]
@@ -1161,5 +1329,91 @@ mod tests {
         // list_sessions fallback must rebuild the index from the old file.
         let sessions = sm.list_sessions();
         assert!(sessions.iter().any(|s| s.session_id == "s_old"));
+    }
+
+    #[test]
+    fn context_checkpoint_roundtrips() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        let sid = sm.create_session("t", None).unwrap();
+        sm.set_context_checkpoint(Some(serde_json::json!({
+            "cutoff_index": 3,
+            "stub": "STUB",
+            "session_id": &sid,
+            "created_at": "now",
+            "keep_tokens": 100
+        })))
+        .unwrap();
+
+        let mut sm2 = SessionManager::new(&proj);
+        assert!(sm2.switch_session(&sid).unwrap());
+        let cp = sm2.context_checkpoint().expect("checkpoint restored");
+        assert_eq!(cp["cutoff_index"], 3);
+        assert_eq!(cp["stub"], "STUB");
+    }
+
+    #[test]
+    fn export_jsonl_has_header_messages_footer() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        let sid = sm.create_session("hello", None).unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("hi")))
+            .unwrap();
+        sm.flush().unwrap();
+        let out = sm.export_jsonl(&sid).unwrap();
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["type"], "header");
+        assert_eq!(lines[0]["format"], "aacode.session-export");
+        assert_eq!(lines.last().unwrap()["type"], "footer");
+        assert_eq!(lines.last().unwrap()["messages"], 2);
+        assert!(lines
+            .iter()
+            .any(|l| l["type"] == "message" && l["content"] == "hi"));
+    }
+
+    #[test]
+    fn fork_moves_boundary_before_split_tool_group() {
+        let proj = tmp_project();
+        let mut sm = SessionManager::new(&proj);
+        let sid = sm.create_session("src", None).unwrap();
+        let asst = ChatMessage::assistant_with_tools(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "run_shell".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        sm.add_message(SessionMessage::from_chat(&asst)).unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::tool_result(
+            "c1", "ok",
+        )))
+        .unwrap();
+        sm.add_message(SessionMessage::from_chat(&ChatMessage::assistant("done")))
+            .unwrap();
+        sm.flush().unwrap();
+        // messages: 0 user, 1 assistant(tool_calls), 2 tool, 3 assistant
+        // A fork at 2 would keep the assistant but drop its tool result.
+        let new_sid = sm.fork_session(&sid, Some(2)).unwrap();
+        let sm2 = SessionManager::new(&proj);
+        let msgs = sm2.read_session_messages(&new_sid);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "boundary should move back before the split group"
+        );
+        assert_eq!(msgs[0].role, "user");
+        // Source untouched / not made current.
+        assert_eq!(sm.messages.len(), 4);
+        assert_eq!(sm.current_session_id.as_deref(), Some(sid.as_str()));
+
+        // A complete boundary keeps the whole group.
+        let kept = sm.fork_session(&sid, Some(3)).unwrap();
+        let msgs = sm2.read_session_messages(&kept);
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs.iter().any(|m| m.role == "tool"));
     }
 }

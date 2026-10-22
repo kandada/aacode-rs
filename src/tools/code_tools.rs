@@ -40,6 +40,9 @@ pub struct ExecutePythonTool {
 
 #[async_trait::async_trait]
 impl Tool for ExecutePythonTool {
+    fn lane(&self) -> Option<&'static str> {
+        Some("python")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "execute_python",

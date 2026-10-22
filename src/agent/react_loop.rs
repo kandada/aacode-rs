@@ -7,7 +7,8 @@
 //! detected exactly as in Python: the model returns no tool_calls → the final
 //! text is the summary and the loop ends.
 
-use crate::agent::compact::{build_compact_view_cached, estimate_messages_tokens, CompactCache};
+use crate::agent::compact::estimate_messages_tokens;
+use crate::agent::retrieval::RetrievalState;
 use crate::config::AgentConfig;
 use crate::error::{AacodeError, Result};
 use crate::llm::types::{ChatMessage, ToolCall};
@@ -96,10 +97,16 @@ impl<'a> ReactLoop<'a> {
     ) -> Result<RunResult> {
         let cancel_notify = Arc::new(Notify::new());
         let mut stale = StaleTracker::default();
-        // Frozen compaction state: keeps the request prefix byte-stable
-        // across iterations so the provider KV cache keeps hitting.
-        let mut compact_cache: Option<CompactCache> = None;
+        // Retrieval cutoff (replaces summary compaction): stored messages stay
+        // complete; only the model view is trimmed. The cutoff is frozen so the
+        // request prefix stays byte-stable for provider prompt caching.
+        let project_path = session.project_path();
+        let mut retrieval = RetrievalState::from_value(session.context_checkpoint());
         let session_id = session.current_session_id.clone().unwrap_or_default();
+        // Usage telemetry (token counts only; never prompt/response text).
+        let usage_tracker = crate::usage::UsageTracker::new(&session.project_path());
+        let run_uuid = uuid::Uuid::new_v4().simple().to_string();
+        let run_id = &run_uuid[..12.min(run_uuid.len())];
         // Track the last response text so MaxIterations can return it.
         let mut last_text = String::new();
 
@@ -113,9 +120,14 @@ impl<'a> ReactLoop<'a> {
                 });
             }
 
-            // Build compact view for the model call (does not mutate messages).
-            let (mut view, compacted, tokens) =
-                build_compact_view_cached(&messages, &self.config.context, &mut compact_cache);
+            // Build the model view (does not mutate stored messages). Older
+            // history is omitted at a frozen cutoff and stays retrievable via
+            // the history tools.
+            let (mut view, compacted, tokens, checkpoint_changed) =
+                retrieval.model_view(&messages, &self.config.context, &project_path, &session_id);
+            if checkpoint_changed {
+                let _ = session.set_context_checkpoint(retrieval.to_value());
+            }
             // Enforce hard context limit: if even the compacted view exceeds
             // max_context_tokens the request would be rejected or silently
             // truncated by the API — fail fast instead.
@@ -131,7 +143,7 @@ impl<'a> ReactLoop<'a> {
             // already sanitized in MainAgent (history repair) and the ReAct
             // loop never creates broken tool_calls/tool pairings on its own.
             if compacted {
-                crate::agent::sanitize::sanitize_history(view.to_mut());
+                crate::agent::sanitize::sanitize_history(&mut view);
             }
 
             let resp = match self
@@ -157,6 +169,57 @@ impl<'a> ReactLoop<'a> {
                     });
                 }
             };
+
+            // Record provider usage for this call (JSONL; no text). Missing
+            // usage (gateways that don't report it) is recorded too, so the
+            // estimator can be calibrated against real counts later.
+            {
+                let gateway = match self.config.model.gateway {
+                    crate::config::Gateway::Anthropic => "anthropic",
+                    crate::config::Gateway::Openai => "openai",
+                };
+                let mut event = crate::usage::usage_event(
+                    &session_id,
+                    run_id,
+                    iteration + 1,
+                    gateway,
+                    &self.config.model.name,
+                    tokens,
+                    view.len(),
+                    compacted,
+                    resp.usage.as_ref(),
+                );
+                // Request manifest (no prompt text): the actual exposed tool
+                // names plus the retrieval cutoff. Makes cache misses and tool
+                // drift diagnosable from the usage log alone.
+                let tools: Vec<String> = self
+                    .native_tools
+                    .iter()
+                    .filter_map(|t| {
+                        t.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                event["tools"] = serde_json::json!(tools);
+                if let Some(cp) = retrieval.checkpoint.as_ref() {
+                    event["retrieval_cutoff"] = serde_json::json!(cp.cutoff_index);
+                    event["retrieval_stub_chars"] = serde_json::json!(cp.stub.chars().count());
+                }
+                if usage_tracker.record(&event) && usage_tracker.verbose {
+                    if let Some(u) = &resp.usage {
+                        eprintln!(
+                            "📊 usage iter {}: input={} (cache {:.1}%) output={} reasoning={}",
+                            iteration + 1,
+                            u.input_tokens,
+                            u.cache_hit_rate() * 100.0,
+                            u.output_tokens,
+                            u.reasoning_tokens
+                        );
+                    }
+                }
+            }
 
             last_text = resp.text.clone();
 
@@ -217,9 +280,17 @@ impl<'a> ReactLoop<'a> {
             messages.push(assistant_msg.clone());
             let _ = session.add_message(SessionMessage::from_chat(&assistant_msg));
 
-            // Execute tool calls.
+            // Execute tool calls. A batch containing a non-reentrant lane
+            // (shell/browser/python/delegate) runs sequentially; otherwise
+            // independent calls run concurrently. `join_all` preserves input
+            // order, so tool results are always submitted in the model's
+            // original call order regardless of completion timing.
             let tool_count = resp.tool_calls.len();
-            if tool_count > 1 {
+            let has_lane = resp
+                .tool_calls
+                .iter()
+                .any(|tc| self.tools.lane_of(&tc.name).is_some());
+            if tool_count > 1 && !has_lane {
                 use futures::future::join_all;
                 let cancel_arc = Arc::new(AtomicBool::new(false));
                 let cancel_ref = cancel as &AtomicBool; // reference from outer scope
@@ -232,20 +303,31 @@ impl<'a> ReactLoop<'a> {
                         let args = tc.parsed_args();
                         let cancel = cancel_arc.clone();
                         async move {
+                            let started = std::time::Instant::now();
                             if cancel_ref.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
-                                return (tc.id.clone(), tc.name.clone(), "cancelled".to_string());
+                                return (
+                                    tc.id.clone(),
+                                    tc.name.clone(),
+                                    "cancelled".to_string(),
+                                    0u64,
+                                );
                             }
                             let obs = self
                                 .execute_with_retry(&name, args, emitter, cancel.as_ref())
                                 .await;
-                            (tc.id.clone(), tc.name.clone(), obs)
+                            (
+                                tc.id.clone(),
+                                tc.name.clone(),
+                                obs,
+                                started.elapsed().as_millis() as u64,
+                            )
                         }
                     })
                     .collect();
 
                 let results = join_all(futures).await;
 
-                for (tc_id, tc_name, observation) in results {
+                for (tc_id, tc_name, observation, duration_ms) in results {
                     if cancel.load(Ordering::SeqCst) {
                         emitter.error("cancelled");
                         return Ok(RunResult {
@@ -268,6 +350,19 @@ impl<'a> ReactLoop<'a> {
                             .unwrap_or_default();
                         stale.record_fetch(&url, &observation);
                     }
+                    let (status, code) = classify_tool_status(&observation);
+                    emitter.tool_status(
+                        &tc_id,
+                        &tc_name,
+                        status,
+                        duration_ms,
+                        code,
+                        if code.is_some() {
+                            Some(observation.as_str())
+                        } else {
+                            None
+                        },
+                    );
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
                     let tool_msg = ChatMessage::tool_result(tc_id, observation);
                     messages.push(tool_msg.clone());
@@ -285,9 +380,11 @@ impl<'a> ReactLoop<'a> {
                         });
                     }
                     let args = tc.parsed_args();
+                    let started = std::time::Instant::now();
                     let observation = self
                         .execute_with_retry(&tc.name, args, emitter, cancel)
                         .await;
+                    let duration_ms = started.elapsed().as_millis() as u64;
                     if tc.name == "fetch_url" {
                         let url = tc
                             .parsed_args()
@@ -297,6 +394,19 @@ impl<'a> ReactLoop<'a> {
                             .to_string();
                         stale.record_fetch(&url, &observation);
                     }
+                    let (status, code) = classify_tool_status(&observation);
+                    emitter.tool_status(
+                        &tc.id,
+                        &tc.name,
+                        status,
+                        duration_ms,
+                        code,
+                        if code.is_some() {
+                            Some(observation.as_str())
+                        } else {
+                            None
+                        },
+                    );
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
                     let tool_msg = ChatMessage::tool_result(tc.id.clone(), observation);
                     messages.push(tool_msg.clone());
@@ -422,6 +532,21 @@ impl<'a> ReactLoop<'a> {
         _emitter: &dyn EventSink,
         cancel: &AtomicBool,
     ) -> String {
+        // Read-only mode: block mutating/executing tools before any dispatch.
+        // The structured observation tells the model why (and is classified as
+        // a tool error by `tool_status`).
+        if self.config.safety.permission_mode == crate::config::PermissionMode::ReadOnly
+            && !crate::tools::registry::is_read_only(name)
+        {
+            return serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "read-only mode: tool '{name}' is not allowed (switch to full access to run it)"
+                ),
+                "tool": name,
+            })
+            .to_string();
+        }
         let max_retries = self.config.limits.max_retries.max(1);
         let mut last = String::new();
         for attempt in 0..max_retries {
@@ -450,6 +575,40 @@ impl<'a> ReactLoop<'a> {
             }
         }
         last
+    }
+}
+
+/// Classify a tool observation into a structured `(status, error_code)` pair
+/// for the additive `tool_status` event.
+fn classify_tool_status(observation: &str) -> (&'static str, Option<&'static str>) {
+    let l = observation.to_lowercase();
+    let failed = l.contains("parameter validation failed")
+        || l.contains("execution error")
+        || l.contains("execution cancelled")
+        || l.contains("unknown tool")
+        || observation.starts_with('❌')
+        || l.contains("\"success\":false")
+        || l.contains("\"success\": false")
+        || l.contains("command rejected by safety guard")
+        || l.contains("traceback");
+    if !failed {
+        return ("success", None);
+    }
+    if l.contains("safety guard") || l.contains("dangerous operation") {
+        ("error", Some("safety_guard"))
+    } else if l.contains("timed out") || l.contains("timeout") {
+        ("error", Some("timeout"))
+    } else if l.contains("parameter validation")
+        || l.contains("parameter parsing")
+        || l.contains("missing required")
+    {
+        ("error", Some("validation"))
+    } else if l.contains("unknown tool") || l.contains("not found") {
+        ("error", Some("not_found"))
+    } else if l.contains("cancel") {
+        ("error", Some("cancelled"))
+    } else {
+        ("error", Some("tool_error"))
     }
 }
 
@@ -617,6 +776,31 @@ mod tests {
         }
     }
 
+    struct SleepyTool {
+        name: &'static str,
+        delay_ms: u64,
+        lane: Option<&'static str>,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for SleepyTool {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(self.name, "sleep", vec![])
+        }
+        fn lane(&self) -> Option<&'static str> {
+            self.lane
+        }
+        async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", self.name));
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            self.log.lock().unwrap().push(format!("end:{}", self.name));
+            Ok(format!("{} done", self.name))
+        }
+    }
+
     fn tmp_proj() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
             "aacode_react_{}_{}",
@@ -633,6 +817,291 @@ mod tests {
             name: name.into(),
             arguments: args.into(),
         }
+    }
+
+    fn named_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    /// Same-lane tools must not overlap (deterministic event log, no timing).
+    #[tokio::test]
+    async fn lane_batch_runs_sequentially() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(SleepyTool {
+            name: "a",
+            delay_ms: 30,
+            lane: Some("x"),
+            log: log.clone(),
+        }));
+        reg.register(Box::new(SleepyTool {
+            name: "b",
+            delay_ms: 30,
+            lane: Some("x"),
+            log: log.clone(),
+        }));
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    tool_calls: vec![named_call("c1", "a"), named_call("c2", "b")],
+                    ..Default::default()
+                },
+                LlmResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut cfg = AgentConfig::default();
+        cfg.max_iterations = 3;
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        loop_
+            .run(
+                vec![ChatMessage::system("s"), ChatMessage::user("u")],
+                &mut sm,
+                &sink,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        let events = log.lock().unwrap().clone();
+        assert_eq!(events, vec!["start:a", "end:a", "start:b", "end:b"]);
+        let ids: Vec<String> = sm
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.tool_call_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["c1".to_string(), "c2".to_string()]);
+    }
+
+    /// Independent tools run concurrently, but results are still submitted in
+    /// the model's original call order.
+    #[tokio::test]
+    async fn concurrent_batch_submits_results_in_call_order() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(SleepyTool {
+            name: "slow",
+            delay_ms: 80,
+            lane: None,
+            log: log.clone(),
+        }));
+        reg.register(Box::new(SleepyTool {
+            name: "fast",
+            delay_ms: 5,
+            lane: None,
+            log: log.clone(),
+        }));
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    tool_calls: vec![named_call("c1", "slow"), named_call("c2", "fast")],
+                    ..Default::default()
+                },
+                LlmResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut cfg = AgentConfig::default();
+        cfg.max_iterations = 3;
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        loop_
+            .run(
+                vec![ChatMessage::system("s"), ChatMessage::user("u")],
+                &mut sm,
+                &sink,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = sm
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.tool_call_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["c1".to_string(), "c2".to_string()]);
+        let events = log.lock().unwrap().clone();
+        let end_fast = events.iter().position(|e| e == "end:fast");
+        let end_slow = events.iter().position(|e| e == "end:slow");
+        assert!(
+            end_fast < end_slow,
+            "independent tools should overlap: {events:?}"
+        );
+    }
+
+    /// Read-only mode blocks mutating tools before dispatch but allows reads.
+    #[tokio::test]
+    async fn read_only_mode_blocks_mutating_tools() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(SleepyTool {
+            name: "run_shell",
+            delay_ms: 1,
+            lane: None,
+            log: log.clone(),
+        }));
+        reg.register(Box::new(SleepyTool {
+            name: "get_page_title",
+            delay_ms: 1,
+            lane: None,
+            log: log.clone(),
+        }));
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    tool_calls: vec![
+                        named_call("c1", "run_shell"),
+                        named_call("c2", "get_page_title"),
+                    ],
+                    ..Default::default()
+                },
+                LlmResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut cfg = AgentConfig::default();
+        cfg.max_iterations = 3;
+        cfg.safety.permission_mode = crate::config::PermissionMode::ReadOnly;
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        loop_
+            .run(
+                vec![ChatMessage::system("s"), ChatMessage::user("u")],
+                &mut sm,
+                &sink,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        let events = log.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e == "start:run_shell"),
+            "mutating tool ran in read-only mode: {events:?}"
+        );
+        assert!(events.iter().any(|e| e == "start:get_page_title"));
+        let blocked = sm
+            .messages
+            .iter()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("c1"))
+            .expect("blocked tool result");
+        assert!(
+            blocked.content.contains("read-only mode"),
+            "{}",
+            blocked.content
+        );
+    }
+
+    #[test]
+    fn classifies_tool_status() {
+        assert_eq!(super::classify_tool_status("all good"), ("success", None));
+        assert_eq!(
+            super::classify_tool_status(
+                "{\"success\":false,\"hint\":\"command timed out — split it\"}"
+            ),
+            ("error", Some("timeout"))
+        );
+        assert_eq!(
+            super::classify_tool_status("Parameter validation failed\n\nmissing required"),
+            ("error", Some("validation"))
+        );
+        assert_eq!(
+            super::classify_tool_status("Execution error: boom"),
+            ("error", Some("tool_error"))
+        );
+        assert_eq!(
+            super::classify_tool_status("Error: Unknown tool 'x'"),
+            ("error", Some("not_found"))
+        );
+        assert_eq!(
+            super::classify_tool_status("Execution cancelled"),
+            ("error", Some("cancelled"))
+        );
+        assert_eq!(
+            super::classify_tool_status(
+                "{\"success\":false,\"error\":\"Command rejected by safety guard\"}"
+            ),
+            ("error", Some("safety_guard"))
+        );
+    }
+
+    /// End-to-end: the loop must send a compacted view and persist the
+    /// checkpoint, leaving the full message list untouched.
+    #[tokio::test]
+    async fn retrieval_compacts_view_and_persists_checkpoint() {
+        let mut cfg = AgentConfig::default();
+        cfg.max_iterations = 2;
+        cfg.context.max_context_tokens = 2_000_000;
+        cfg.context.retrieval_trigger_tokens = 50;
+        cfg.context.retrieval_keep_tokens = 40;
+        cfg.context.retrieval_keep_min_rounds = 1;
+        cfg.context.retrieval_keep_recent_user_messages = 1;
+
+        let llm = RecordingLlm {
+            responses: Mutex::new(vec![LlmResponse {
+                text: "done".into(),
+                ..Default::default()
+            }]),
+            seen: Mutex::new(vec![]),
+        };
+        let reg = ToolRegistry::new();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("seed", None).unwrap();
+
+        let mut msgs = vec![ChatMessage::system("SYS")];
+        for i in 0..20 {
+            msgs.push(ChatMessage::user(format!("task {i} {}", "x".repeat(120))));
+            msgs.push(ChatMessage::assistant("ok"));
+        }
+
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let res = loop_
+            .run(msgs.clone(), &mut sm, &sink, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(res.status, RunStatus::Completed);
+
+        let seen = llm.seen.lock().unwrap();
+        let first = &seen[0];
+        assert!(first.len() < msgs.len(), "view should be compacted");
+        assert_eq!(first[0].role, "system");
+        assert!(
+            first[1].content.starts_with("<conversation-checkpoint>"),
+            "checkpoint stub missing: {}",
+            first[1].content
+        );
+        let cp = sm.context_checkpoint().expect("checkpoint persisted");
+        assert!(cp["cutoff_index"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@
 use super::backend::ShellBackend;
 use super::registry::Tool;
 use super::schema::{ParamType, ToolParameter, ToolSchema};
-use crate::config::{DangerAction, SafetyConfig};
+use crate::config::{DangerAction, SafetyConfig, UnknownAction};
 use crate::error::{AacodeError, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
@@ -20,21 +20,31 @@ use std::sync::Arc;
 // Re-export the fastshell handle type for the rest of the crate.
 pub use super::backend::SharedFastshell as SharedShell;
 
+/// Default output caps for `run_shell` (aligned with the Python AACode
+/// defaults). `full_output=true` (or `max_output=0`) disables them.
+pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
+pub const DEFAULT_MAX_OUTPUT_LINES: usize = 500;
+
 pub struct ShellTool {
     backend: Arc<dyn ShellBackend>,
     /// Working directory / archive root for command execution.
     cwd: std::path::PathBuf,
+    /// Configured char cap. 0 = unset → [`DEFAULT_MAX_OUTPUT_CHARS`].
     max_output_chars: usize,
+    /// Configured line cap. 0 = unset → [`DEFAULT_MAX_OUTPUT_LINES`].
+    max_output_lines: usize,
     default_timeout_secs: u64,
     default_idle_timeout_secs: u64,
     safety: SafetyConfig,
 }
 
 impl ShellTool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: Arc<dyn ShellBackend>,
         cwd: std::path::PathBuf,
         max_output_chars: usize,
+        max_output_lines: usize,
         default_timeout_secs: u64,
         default_idle_timeout_secs: u64,
         safety: SafetyConfig,
@@ -44,6 +54,7 @@ impl ShellTool {
             backend,
             cwd,
             max_output_chars,
+            max_output_lines,
             default_timeout_secs,
             default_idle_timeout_secs,
             safety,
@@ -60,26 +71,177 @@ impl ShellTool {
         Some(path.to_string_lossy().to_string())
     }
 
-    /// Truncate a field, archiving the full content when too long.
-    fn maybe_truncate(&self, text: String, prefix: &str, limit: usize) -> String {
-        if limit == 0 || text.chars().count() <= limit {
-            return text;
+    /// Apply the line cap first, then the char cap. When either truncates, the
+    /// **full** output is archived once so the model can grep/read it later.
+    fn maybe_truncate(
+        &self,
+        text: &str,
+        prefix: &str,
+        char_limit: usize,
+        line_limit: usize,
+    ) -> String {
+        if text.is_empty() {
+            return String::new();
         }
-        let head: String = text.chars().take(limit).collect();
+        let mut truncated = false;
+        let mut body = text.to_string();
+
+        if line_limit > 0 {
+            let mut newlines = 0usize;
+            let mut cut = None;
+            for (i, ch) in body.char_indices() {
+                if ch == '\n' {
+                    newlines += 1;
+                    if newlines == line_limit {
+                        cut = Some(i + 1);
+                        break;
+                    }
+                }
+            }
+            if let Some(cut) = cut {
+                if cut < body.len() {
+                    body.truncate(cut);
+                    truncated = true;
+                }
+            }
+        }
+
+        if char_limit > 0 && body.chars().count() > char_limit {
+            body = body.chars().take(char_limit).collect();
+            truncated = true;
+        }
+
+        if !truncated {
+            return body;
+        }
+
         let total = text.chars().count();
-        match self.archive(&text, prefix) {
+        match self.archive(text, prefix) {
             Some(path) => format!(
-                "{head}\n\n[max_output={limit} truncated output ({total} chars total). Full output archived at {path}; raise max_output, or read the source file in chunks with head/tail/sed -n.]"
+                "{body}\n\n[output truncated: max_output={char_limit} chars / {line_limit} lines ({total} chars total). Full output archived at {path}; raise max_output, pass full_output=true, or read it in chunks with head/tail/sed -n.]"
             ),
             None => format!(
-                "{head}\n\n[max_output={limit} truncated output ({total} chars total); raise max_output or read in chunks.]"
+                "{body}\n\n[output truncated: max_output={char_limit} chars / {line_limit} lines ({total} chars total); raise max_output or pass full_output=true.]"
             ),
         }
     }
 
+    /// First executable word, skipping leading `VAR=value` assignments.
+    fn first_command(command: &str) -> String {
+        for raw in command.split_whitespace() {
+            let token = raw.trim_matches(|c| {
+                matches!(
+                    c,
+                    '"' | '\'' | '(' | ')' | '{' | '}' | '[' | ']' | ';' | '&' | '|'
+                )
+            });
+            if token.is_empty() {
+                continue;
+            }
+            if let Some((key, _)) = token.split_once('=') {
+                if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+            }
+            return token.to_string();
+        }
+        String::new()
+    }
+
+    /// Commands whose arguments are data, not commands (avoid false positives
+    /// like `grep "rm -rf /" file`). `find` only counts when it doesn't run or
+    /// delete anything.
+    fn is_data_command(name: &str, command: &str) -> bool {
+        const DATA: &[&str] = &[
+            "echo", "printf", "rg", "ripgrep", "grep", "egrep", "fgrep", "git", "sed", "awk",
+            "cat", "head", "tail", "ls", "find",
+        ];
+        if !DATA.contains(&name) {
+            return false;
+        }
+        if name == "find"
+            && ["-exec", "-execdir", "-delete"]
+                .iter()
+                .any(|f| command.contains(f))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Shell wrappers execute their arguments, so quoted/heredoc content must
+    /// still be scanned.
+    fn is_wrapper(name: &str) -> bool {
+        const WRAPPERS: &[&str] = &[
+            "bash",
+            "sh",
+            "zsh",
+            "dash",
+            "ksh",
+            "fish",
+            "csh",
+            "tcsh",
+            "pwsh",
+            "powershell",
+            "cmd",
+            "eval",
+            "exec",
+            "env",
+            "nohup",
+            "time",
+            "command",
+            "xargs",
+            "sudo",
+        ];
+        WRAPPERS.contains(&name)
+    }
+
+    /// Drop heredoc bodies so script text is not mistaken for commands.
+    fn strip_heredoc_bodies(command: &str) -> String {
+        let mut out = Vec::new();
+        let mut delimiter: Option<String> = None;
+        for line in command.lines() {
+            if let Some(delim) = &delimiter {
+                if line.trim() == delim {
+                    delimiter = None;
+                }
+                continue;
+            }
+            out.push(line);
+            if let Some(pos) = line.find("<<") {
+                let rest = line[pos + 2..].trim_start_matches('-').trim();
+                let token = rest.split_whitespace().next().unwrap_or("");
+                let token = token.trim_matches(|c| c == '"' || c == '\'');
+                if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    delimiter = Some(token.to_string());
+                }
+            }
+        }
+        out.join("\n")
+    }
+
+    /// Text the dangerous patterns should inspect.
+    fn dangerous_scan_text(command: &str) -> String {
+        let name = Self::first_command(command);
+        if name.is_empty() {
+            return String::new();
+        }
+        if Self::is_data_command(&name, command) {
+            return String::new();
+        }
+        if Self::is_wrapper(&name) {
+            return command.to_string();
+        }
+        Self::strip_heredoc_bodies(command)
+    }
+
     /// Detect blatantly dangerous commands (used only in `reject` mode).
     fn is_dangerous(command: &str) -> bool {
-        let c = command.to_lowercase();
+        let c = Self::dangerous_scan_text(command).to_lowercase();
+        if c.is_empty() {
+            return false;
+        }
         let patterns = [
             "rm -rf /",
             "rm -rf /*",
@@ -91,10 +253,39 @@ impl ShellTool {
         ];
         patterns.iter().any(|p| c.contains(p))
     }
+
+    /// Resolve a command name on PATH / as a shell builtin (native backend).
+    fn command_exists(name: &str) -> bool {
+        if name.is_empty() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            matches!(
+                std::process::Command::new("where").arg(name).output(),
+                Ok(out) if out.status.success()
+            )
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            matches!(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("command -v \"$1\" >/dev/null 2>&1")
+                    .arg("sh")
+                    .arg(name)
+                    .status(),
+                Ok(status) if status.success()
+            )
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for ShellTool {
+    fn lane(&self) -> Option<&'static str> {
+        Some("shell")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "run_shell",
@@ -132,8 +323,22 @@ impl Tool for ShellTool {
                     "max_output",
                     ParamType::Integer,
                     false,
-                    "Cap returned output characters. Omit (0) = NO truncation — the full output is returned, so read large files in chunks (head/tail, sed -n 'A,Bp', grep -n) or cap explicitly with this param.",
+                    "Cap returned output characters (default 20000). Pass 0 to disable the cap, or a larger number for more. Truncated output is archived under .aacode/extracts.",
                     &["max_chars", "limit", "output_limit"],
+                ),
+                ToolParameter::new(
+                    "max_output_lines",
+                    ParamType::Integer,
+                    false,
+                    "Cap returned output lines (default 500). Use full_output=true to disable.",
+                    &["output_lines", "max_result_lines"],
+                ),
+                ToolParameter::new(
+                    "full_output",
+                    ParamType::Boolean,
+                    false,
+                    "Disable the default output caps and return the full stdout/stderr. Only use when you truly need everything — large outputs cost many tokens.",
+                    &["full", "unlimited"],
                 ),
             ],
         )
@@ -157,6 +362,27 @@ impl Tool for ShellTool {
                 "command": command,
             })
             .to_string());
+        }
+
+        // Unknown-command policy. Default is `allow` (no-op); when set to
+        // `reject`, only a native shell can be checked reliably (fastshell's
+        // builtins are not on PATH).
+        if self.safety.unknown_command_action == UnknownAction::Reject
+            && self.backend.kind() == "native"
+        {
+            let name = Self::first_command(&command);
+            let looks_like_command = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'));
+            if looks_like_command && !Self::command_exists(&name) {
+                return Ok(json!({
+                    "success": false,
+                    "error": format!("Command rejected by safety guard (unknown command '{name}')."),
+                    "command": command,
+                })
+                .to_string());
+            }
         }
 
         let stdin_input = args.get("stdin_input").and_then(|v| v.as_str());
@@ -185,12 +411,48 @@ impl Tool for ShellTool {
         .await
         .map_err(|e| AacodeError::Other(format!("shell spawn: {e}")))?;
 
-        // Per-call max_output override; else the tool's configured cap.
-        let limit = args
+        // Output budget: default caps keep huge outputs out of the context; the
+        // full text is archived. `full_output=true` / `max_output=0` opts out.
+        let wants_full = args
+            .get("full_output")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || match args.get("max_output") {
+                Some(Value::String(s)) => {
+                    matches!(
+                        s.to_ascii_lowercase().as_str(),
+                        "full" | "none" | "null" | ""
+                    )
+                }
+                Some(Value::Number(n)) => n.as_u64() == Some(0),
+                _ => false,
+            };
+        let per_call_chars = args
             .get("max_output")
             .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(self.max_output_chars);
+            .filter(|n| *n > 0)
+            .map(|n| n as usize);
+
+        let (char_limit, line_limit) = if wants_full {
+            (0usize, 0usize)
+        } else {
+            let chars = per_call_chars.unwrap_or(if self.max_output_chars == 0 {
+                DEFAULT_MAX_OUTPUT_CHARS
+            } else {
+                self.max_output_chars
+            });
+            let lines = args
+                .get("max_output_lines")
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .map(|n| n as usize)
+                .unwrap_or(if self.max_output_lines == 0 {
+                    DEFAULT_MAX_OUTPUT_LINES
+                } else {
+                    self.max_output_lines
+                });
+            (chars, lines)
+        };
 
         // Binary stdout must never be lossily pasted into the context. Detect
         // it, persist it as an artifact, and return only a bounded preview.
@@ -198,9 +460,9 @@ impl Tool for ShellTool {
             let store = crate::artifacts::ArtifactStore::new(&self.cwd);
             binary_output_json(&store, "stdout", &result.stdout)
         } else {
-            json!(self.maybe_truncate(result.stdout, "stdout", limit))
+            json!(self.maybe_truncate(&result.stdout, "stdout", char_limit, line_limit))
         };
-        let stderr = self.maybe_truncate(result.stderr, "stderr", limit);
+        let stderr = self.maybe_truncate(&result.stderr, "stderr", char_limit, line_limit);
 
         // `success` must reflect the exit code: a timed-out (124) or failing
         // command is not a success (the model otherwise treats 124 as OK).
@@ -291,6 +553,7 @@ mod tests {
             Arc::new(NativeShell::new()),
             cwd,
             24000,
+            500,
             30,
             30,
             SafetyConfig::default(),
@@ -360,30 +623,79 @@ mod tests {
         assert!(v["stdout"].as_str().unwrap().len() < 5000);
     }
 
-    /// Default (max_output_chars = 0) must NOT truncate plain text — the model
-    /// reads its own files at full length.
     #[tokio::test]
-    async fn unlimited_output_by_default() {
+    async fn max_output_lines_caps_lines() {
         let dir = tmp();
-        let t = ShellTool::new(
-            Arc::new(NativeShell::new()),
-            dir,
-            0,
-            30,
-            30,
-            SafetyConfig::default(),
-        );
+        let t = native_tool(dir);
         let cancel = AtomicBool::new(false);
         let out = t
             .call(
-                &json!({"command": "for i in $(seq 1 5000); do echo linelineline; done"}),
+                &json!({
+                    "command": "for i in $(seq 1 200); do echo l$i; done",
+                    "max_output": 100000,
+                    "max_output_lines": 10
+                }),
                 &cancel,
             )
             .await
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let s = v["stdout"].as_str().unwrap();
-        assert!(s.len() > 50_000, "unexpected truncation, len={}", s.len());
+        let content = s.split("\n\n[output truncated").next().unwrap();
+        assert!(
+            content.lines().count() <= 10,
+            "expected <=10 lines, got {}: {content}",
+            content.lines().count()
+        );
+        assert!(s.contains("truncated"));
+    }
+
+    /// With no configured cap (0 = unset) `run_shell` now applies the default
+    /// 20k-char / 500-line budget and archives the full output; `full_output`
+    /// opts out.
+    #[tokio::test]
+    async fn default_output_is_capped_and_full_output_opts_out() {
+        let dir = tmp();
+        let t = ShellTool::new(
+            Arc::new(NativeShell::new()),
+            dir,
+            0,
+            0,
+            30,
+            30,
+            SafetyConfig::default(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        let capped = t
+            .call(
+                &json!({"command": "for i in $(seq 1 5000); do echo linelineline; done"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&capped).unwrap();
+        let s = v["stdout"].as_str().unwrap();
+        assert!(s.contains("truncated"), "default cap should truncate: {s}");
+        assert!(s.len() <= 20_000 + 500, "unexpected size {}", s.len());
+
+        let full = t
+            .call(
+                &json!({
+                    "command": "for i in $(seq 1 5000); do echo linelineline; done",
+                    "full_output": true
+                }),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&full).unwrap();
+        let s = v["stdout"].as_str().unwrap();
+        assert!(
+            s.len() > 50_000,
+            "full_output should keep everything, len={}",
+            s.len()
+        );
         assert!(!s.contains("truncated"));
     }
 
@@ -392,7 +704,15 @@ mod tests {
         let dir = tmp();
         let mut safety = SafetyConfig::default();
         safety.dangerous_command_action = DangerAction::Reject;
-        let t = ShellTool::new(Arc::new(NativeShell::new()), dir, 24000, 30, 30, safety);
+        let t = ShellTool::new(
+            Arc::new(NativeShell::new()),
+            dir,
+            24000,
+            500,
+            30,
+            30,
+            safety,
+        );
         let cancel = AtomicBool::new(false);
         let out = t
             .call(&json!({"command": "rm -rf /"}), &cancel)
@@ -400,6 +720,33 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], false);
+    }
+
+    #[tokio::test]
+    async fn unknown_command_reject_mode() {
+        let dir = tmp();
+        let mut safety = SafetyConfig::default();
+        safety.unknown_command_action = crate::config::UnknownAction::Reject;
+        let t = ShellTool::new(
+            Arc::new(NativeShell::new()),
+            dir,
+            24000,
+            500,
+            30,
+            30,
+            safety,
+        );
+        let cancel = AtomicBool::new(false);
+        let out = t
+            .call(
+                &json!({"command": "definitely_not_a_command_zzz --flag"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["success"], false);
+        assert!(v["error"].as_str().unwrap().contains("unknown command"));
     }
 
     #[tokio::test]
@@ -411,7 +758,7 @@ mod tests {
         cfg.python_enabled = false;
         fs.init(cfg).unwrap();
         let backend = Arc::new(FastshellBackend::new(Arc::new(Mutex::new(fs))));
-        let t = ShellTool::new(backend, dir, 24000, 30, 30, SafetyConfig::default());
+        let t = ShellTool::new(backend, dir, 24000, 500, 30, 30, SafetyConfig::default());
         let cancel = AtomicBool::new(false);
         let out = t
             .call(&json!({"command": "echo sandboxed"}), &cancel)
@@ -425,6 +772,18 @@ mod tests {
     #[test]
     fn is_dangerous_detects() {
         assert!(ShellTool::is_dangerous("rm -rf /"));
+        assert!(ShellTool::is_dangerous("sudo rm -rf /"));
+        assert!(ShellTool::is_dangerous("bash -c \"rm -rf /\""));
+        assert!(ShellTool::is_dangerous("bash <<'EOF'\nrm -rf /\nEOF"));
+        assert!(ShellTool::is_dangerous("find . -exec rm -rf / \\;"));
         assert!(!ShellTool::is_dangerous("ls -la"));
+        // Data commands: quoted arguments are not commands.
+        assert!(!ShellTool::is_dangerous("echo \"rm -rf /\""));
+        assert!(!ShellTool::is_dangerous("grep \"rm -rf /\" file.txt"));
+        // A heredoc body written to a file is data, not an executed command.
+        assert!(!ShellTool::is_dangerous(
+            "cat > x.sh <<'EOF'\nrm -rf /\nEOF"
+        ));
+        assert!(!ShellTool::is_dangerous("find . -name 'rm -rf /'"));
     }
 }

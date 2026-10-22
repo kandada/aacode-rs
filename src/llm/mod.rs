@@ -8,8 +8,9 @@ pub mod parse;
 pub mod sse;
 pub mod thinking;
 pub mod types;
+pub mod usage;
 
-pub use types::{ChatMessage, LlmResponse, ToolCall};
+pub use types::{ChatMessage, LlmResponse, ToolCall, Usage};
 
 use crate::config::ModelConfig;
 use crate::error::Result;

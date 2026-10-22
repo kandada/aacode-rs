@@ -3,12 +3,14 @@
 
 //! Context compaction — round-aware compact view.
 //!
-//! Ported (simplified) from Python `utils/message_utils.py` +
-//! `react_loop._compact_context`. A "round" starts at a user message and runs
-//! until the next user message. When token budget is exceeded we keep the
-//! protected first rounds + the last rounds, and replace the middle with a
-//! single summary system message. tool_calls/tool pairs are never split
-//! because they always live inside one round.
+//! **Legacy**: production now uses retrieval-style context control
+//! (`agent::retrieval`): the full history is kept and the model view starts at
+//! a frozen cutoff, with omitted messages retrievable via the history tools.
+//! No summary is generated anymore.
+//!
+//! This module is kept for the shared [`estimate_messages_tokens`] helper and
+//! for the old summary-based tests; `react_loop` no longer calls
+//! `build_compact_view_cached`.
 
 use crate::config::ContextConfig;
 use crate::llm::types::ChatMessage;

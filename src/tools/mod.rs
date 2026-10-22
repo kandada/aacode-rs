@@ -10,7 +10,10 @@ pub mod shell;
 
 pub mod code_tools;
 pub mod delegate;
+pub mod history;
+pub mod jobs;
 pub mod mcp;
+pub mod mobile;
 pub mod multimodal;
 pub mod session_tools;
 pub mod skills;
@@ -114,16 +117,62 @@ fn register_core_tools(
 ) -> Arc<Mutex<Option<String>>> {
     // Clone backend before ShellTool consumes it — needed by ExecutePythonTool later.
     let backend_for_python = backend.clone();
+    let backend_for_jobs = backend.clone();
+    let backend_for_mobile = backend.clone();
 
     // run_shell (native OS shell on desktop, fastshell sandbox on mobile)
     reg.register(Box::new(ShellTool::new(
         backend,
         project_path.clone(),
         config.limits.tool_output_chars,
+        config.limits.tool_output_lines,
         config.timeouts.shell_command,
         config.timeouts.shell_idle,
         config.safety.clone(),
     )));
+
+    // Background jobs (same backend; process-local, best-effort cancel).
+    let job_store = Arc::new(jobs::JobStore::new(jobs::MAX_JOBS));
+    reg.register(Box::new(jobs::JobStartTool {
+        backend: backend_for_jobs,
+        project_path: project_path.clone(),
+        timeout_secs: config.timeouts.shell_command,
+        idle_timeout_secs: config.timeouts.shell_idle,
+        store: job_store.clone(),
+    }));
+    reg.register(Box::new(jobs::JobStatusTool {
+        store: job_store.clone(),
+    }));
+    reg.register(Box::new(jobs::JobCollectTool {
+        store: job_store.clone(),
+        project_path: project_path.clone(),
+    }));
+    reg.register(Box::new(jobs::JobCancelTool {
+        store: job_store.clone(),
+    }));
+    reg.register(Box::new(jobs::JobListTool { store: job_store }));
+
+    // Read-only Mobile Use observation tools (ui snapshot/find/list/wait).
+    // Mutating ui_* stay host-only until per-call approval exists.
+    for tool in [
+        Box::new(mobile::UiBackendsTool {
+            backend: backend_for_mobile.clone(),
+        }) as Box<dyn Tool>,
+        Box::new(mobile::UiListWindowsTool {
+            backend: backend_for_mobile.clone(),
+        }),
+        Box::new(mobile::UiSnapshotTool {
+            backend: backend_for_mobile.clone(),
+        }),
+        Box::new(mobile::UiFindTool {
+            backend: backend_for_mobile.clone(),
+        }),
+        Box::new(mobile::UiWaitTool {
+            backend: backend_for_mobile.clone(),
+        }),
+    ] {
+        reg.register(tool);
+    }
 
     // Todo tools (shared store + session-id resolver)
     let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -196,6 +245,17 @@ fn register_core_tools(
     }));
     reg.register(Box::new(session_tools::ContinueSessionTool {
         project_path: project_path.clone(),
+    }));
+
+    // Read-only history retrieval (for messages omitted by the retrieval
+    // cutoff). Never switches the active session.
+    reg.register(Box::new(history::SearchHistoryTool {
+        project_path: project_path.clone(),
+        active_session_id: session_id_holder.clone(),
+    }));
+    reg.register(Box::new(history::ReadHistoryTool {
+        project_path: project_path.clone(),
+        active_session_id: session_id_holder.clone(),
     }));
 
     // Code tools (execute_python, run_tests, debug_code, analyze_code)

@@ -7,6 +7,7 @@ pub mod compact;
 pub mod main_agent;
 pub mod prompts;
 pub mod react_loop;
+pub mod retrieval;
 pub mod sanitize;
 pub mod sub_agent;
 

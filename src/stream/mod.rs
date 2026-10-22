@@ -33,7 +33,7 @@
 //!     return `false` and never see them; new hosts opt in to patch live
 //!     segments in place (stable identity, no full-array rebuild).
 
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::Write;
 use std::sync::Mutex;
 
@@ -178,6 +178,61 @@ pub trait EventSink: Send + Sync {
             &json!({"type": "tool_progress", "state": state, "name": name, "chars": chars})
                 .to_string(),
         );
+    }
+
+    /// Startup identity (additive): makes a stale bundled/source binary visible
+    /// in host logs. Skipped on a terminal.
+    fn runtime_info(&self) {
+        if self.is_tty() {
+            return;
+        }
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        let mut ev = json!({
+            "type": "runtime_info",
+            "name": "aacode-rs",
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        });
+        if let Some(exe) = exe {
+            ev["file"] = Value::String(exe);
+        }
+        self.emit_line(&ev.to_string());
+    }
+
+    /// Structured tool outcome (additive, backward compatible). Legacy hosts
+    /// ignore unknown event types; new hosts can distinguish failure / cancel /
+    /// timeout / validation from ordinary output without parsing text.
+    fn tool_status(
+        &self,
+        call_id: &str,
+        tool: &str,
+        status: &str,
+        duration_ms: u64,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) {
+        // Terminal UI already shows the raw observation; keep it unchanged.
+        if self.is_tty() {
+            return;
+        }
+        let mut event = json!({
+            "type": "tool_status",
+            "call_id": call_id,
+            "tool": tool,
+            "status": status,
+            "duration_ms": duration_ms,
+        });
+        if let Some(code) = error_code {
+            event["error_code"] = Value::String(code.to_string());
+        }
+        if let Some(msg) = error_message {
+            let clipped: String = msg.chars().take(500).collect();
+            event["error_message"] = Value::String(clipped);
+        }
+        self.emit_line(&event.to_string());
     }
 
     /// Action declaration. Pipe mode: typed JSONL event carrying the tool
@@ -639,6 +694,30 @@ mod tests {
         assert!(l[4].contains(r#""chars":42"#));
         assert!(l[5].contains(r#""type":"done""#));
         assert!(l[6].contains(r#""type":"error""#));
+    }
+
+    #[test]
+    fn tool_status_and_runtime_info_events() {
+        let s = CollectingSink::new(false);
+        s.runtime_info();
+        s.tool_status(
+            "c1",
+            "run_shell",
+            "error",
+            12,
+            Some("timeout"),
+            Some("boom"),
+        );
+        let lines = s.lines();
+        let rt: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(rt["type"], "runtime_info");
+        assert_eq!(rt["version"], env!("CARGO_PKG_VERSION"));
+        let ts: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(ts["type"], "tool_status");
+        assert_eq!(ts["status"], "error");
+        assert_eq!(ts["error_code"], "timeout");
+        assert_eq!(ts["duration_ms"], 12);
+        assert_eq!(ts["error_message"], "boom");
     }
 
     #[test]

@@ -197,6 +197,7 @@ pub fn parse_anthropic_stream<R: std::io::Read>(
             Some(reasoning)
         },
         finish_reason: stop_reason,
+        usage: None,
     })
 }
 

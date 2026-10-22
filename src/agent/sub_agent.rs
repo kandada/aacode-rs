@@ -40,12 +40,10 @@ pub async fn run_sub_agent(
     let mut sub_session = SessionManager::new(project_path);
     sub_session.create_session(task, Some(&format!("sub:{agent_type}")))?;
 
-    let messages = vec![
-        ChatMessage::system(system_prompt),
-        ChatMessage::user(format!(
-            "Task: {task}\n\nFocus on completing this specific task. Output a final text summary (no tool calls) when done."
-        )),
-    ];
+    // Send the raw task: no per-request prefix/suffix (see `sub_agent_prompt`
+    // for the static focus/summary guidance). This keeps the request identical
+    // to the persisted session content.
+    let messages = vec![ChatMessage::system(system_prompt), ChatMessage::user(task)];
 
     // Sub-agents use fewer iterations by default.
     let mut sub_cfg = config.clone();

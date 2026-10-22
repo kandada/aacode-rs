@@ -16,6 +16,60 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str {
         ""
     }
+    /// Non-reentrant resource lane (e.g. `"shell"`, `"browser"`, `"python"`).
+    ///
+    /// Tools sharing a lane must not run concurrently. A batch that contains
+    /// any lane tool is executed sequentially (safe and simple); batches with
+    /// no lane still run concurrently.
+    fn lane(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Conservative operation classification for the read-only gate.
+///
+/// **Fail-closed**: anything not listed here is treated as mutating/executing.
+/// New read-only tools must be added explicitly; unknown tools are blocked in
+/// `read_only` mode rather than silently allowed.
+pub fn is_read_only(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "snapshot",
+        "screenshot",
+        "fetch_url",
+        "fetch_rendered",
+        "browser_tools",
+        "mcp_status",
+        "run_skills",
+        "find_elements",
+        "navigate",
+        "open",
+        "back",
+        "forward",
+        "reload",
+        "stop",
+        "scroll",
+        "session_export",
+        "job_status",
+        "job_collect",
+        "job_list",
+        "ui_backends",
+        "ui_list_windows",
+        "ui_snapshot",
+        "ui_find",
+        "ui_wait",
+    ];
+    const PREFIXES: &[&str] = &[
+        "get_",
+        "list_",
+        "search_",
+        "read_",
+        "extract_",
+        "wait_",
+        "assert_",
+        "understand_",
+        "analyze_",
+    ];
+    EXACT.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 #[derive(Default)]
@@ -69,6 +123,11 @@ impl ToolRegistry {
     }
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
+    }
+
+    /// The non-reentrant lane for a tool, if any.
+    pub fn lane_of(&self, name: &str) -> Option<&'static str> {
+        self.tools.get(name).and_then(|t| t.lane())
     }
     pub fn names(&self) -> Vec<String> {
         let mut v: Vec<String> = self.tools.keys().cloned().collect();
@@ -180,6 +239,27 @@ mod tests {
     use super::super::schema::{ParamType, ToolParameter};
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn read_only_classification_is_fail_closed() {
+        assert!(is_read_only("get_page_text"));
+        assert!(is_read_only("list_tabs"));
+        assert!(is_read_only("wait_for_element"));
+        assert!(is_read_only("search_history"));
+        assert!(is_read_only("navigate"));
+        assert!(is_read_only("snapshot"));
+        assert!(is_read_only("job_status"));
+        assert!(is_read_only("job_collect"));
+        assert!(!is_read_only("job_start"));
+        assert!(!is_read_only("job_cancel"));
+        assert!(!is_read_only("run_shell"));
+        assert!(!is_read_only("execute_python"));
+        assert!(!is_read_only("browser_call"));
+        assert!(!is_read_only("click"));
+        assert!(!is_read_only("delegate_task"));
+        // Unknown tools are blocked in read-only mode (fail-closed).
+        assert!(!is_read_only("some_future_mutating_tool"));
+    }
 
     struct BlobTool;
     #[async_trait::async_trait]

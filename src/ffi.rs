@@ -960,6 +960,197 @@ pub extern "C" fn aacode_free_string(ptr: *mut c_char) {
     }
 }
 
+// ── Interactive terminal (feature `pty`; Unix only) ─────────────────────────
+//
+// Host/user API — the model gets no terminal tools. Each function returns a
+// JSON string (free with `aacode_free_string`).
+
+#[cfg(feature = "pty")]
+static TERMINALS: OnceLock<Mutex<crate::terminal::TerminalManager>> = OnceLock::new();
+
+#[cfg(feature = "pty")]
+fn terminals() -> &'static Mutex<crate::terminal::TerminalManager> {
+    TERMINALS.get_or_init(|| {
+        Mutex::new(crate::terminal::TerminalManager::new(
+            crate::terminal::MAX_SESSIONS,
+        ))
+    })
+}
+
+/// Open a PTY session. `shell`/`cwd` may be null (defaults: `/bin/sh`, `.`).
+#[cfg(feature = "pty")]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_open(
+    shell: *const c_char,
+    cwd: *const c_char,
+    cols: u16,
+    rows: u16,
+) -> *mut c_char {
+    let shell = unsafe { cstr(shell) }.unwrap_or("/bin/sh");
+    let cwd = unsafe { cstr(cwd) }.unwrap_or(".");
+    let res = terminals()
+        .lock()
+        .unwrap()
+        .start(shell, std::path::Path::new(cwd), &[], cols, rows);
+    match res {
+        Ok(id) => to_c_string(json!({"ok": true, "id": id}).to_string()),
+        Err(e) => to_c_string(json!({"ok": false, "error": e}).to_string()),
+    }
+}
+
+/// Write raw bytes to the session.
+#[cfg(feature = "pty")]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_write(
+    id: *const c_char,
+    data: *const u8,
+    len: usize,
+) -> *mut c_char {
+    let Some(id) = (unsafe { cstr(id) }) else {
+        return to_c_string(json!({"ok": false, "error": "null id"}).to_string());
+    };
+    if data.is_null() {
+        return to_c_string(json!({"ok": false, "error": "null data"}).to_string());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    match terminals().lock().unwrap().write(id, bytes) {
+        Ok(()) => to_c_string(json!({"ok": true}).to_string()),
+        Err(e) => to_c_string(json!({"ok": false, "error": e}).to_string()),
+    }
+}
+
+/// Read output from `cursor`. Returns base64 data + cursor/eof/exit/truncated.
+#[cfg(feature = "pty")]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_read(
+    id: *const c_char,
+    cursor: u64,
+    max_bytes: usize,
+) -> *mut c_char {
+    use base64::Engine as _;
+    let Some(id) = (unsafe { cstr(id) }) else {
+        return to_c_string(json!({"ok": false, "error": "null id"}).to_string());
+    };
+    match terminals().lock().unwrap().read(id, cursor, max_bytes) {
+        Ok(r) => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&r.data);
+            to_c_string(
+                json!({
+                    "ok": true,
+                    "data_b64": b64,
+                    "cursor": r.cursor,
+                    "eof": r.eof,
+                    "exit_code": r.exit_code,
+                    "truncated": r.truncated,
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => to_c_string(json!({"ok": false, "error": e}).to_string()),
+    }
+}
+
+/// Resize the PTY.
+#[cfg(feature = "pty")]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_resize(id: *const c_char, cols: u16, rows: u16) -> *mut c_char {
+    let Some(id) = (unsafe { cstr(id) }) else {
+        return to_c_string(json!({"ok": false, "error": "null id"}).to_string());
+    };
+    match terminals().lock().unwrap().resize(id, cols, rows) {
+        Ok(()) => to_c_string(json!({"ok": true}).to_string()),
+        Err(e) => to_c_string(json!({"ok": false, "error": e}).to_string()),
+    }
+}
+
+/// Close a session (kills the process group).
+#[cfg(feature = "pty")]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_close(id: *const c_char) -> *mut c_char {
+    let Some(id) = (unsafe { cstr(id) }) else {
+        return to_c_string(json!({"ok": false, "error": "null id"}).to_string());
+    };
+    match terminals().lock().unwrap().close(id) {
+        Ok(()) => to_c_string(json!({"ok": true}).to_string()),
+        Err(e) => to_c_string(json!({"ok": false, "error": e}).to_string()),
+    }
+}
+
+/// List active sessions.
+#[cfg(feature = "pty")]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_list() -> *mut c_char {
+    let list = terminals().lock().unwrap().list();
+    let sessions: Vec<serde_json::Value> = list
+        .into_iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "elapsed_ms": s.elapsed_ms,
+                "eof": s.eof,
+                "exit_code": s.exit_code,
+                "buffered": s.buffered,
+            })
+        })
+        .collect();
+    to_c_string(json!({"ok": true, "sessions": sessions}).to_string())
+}
+
+// Stubs so hosts can always link the symbols; they fail clearly when the
+// feature is not compiled in.
+#[cfg(not(feature = "pty"))]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_open(
+    _shell: *const c_char,
+    _cwd: *const c_char,
+    _cols: u16,
+    _rows: u16,
+) -> *mut c_char {
+    to_c_string(json!({"ok": false, "error": "pty feature not enabled"}).to_string())
+}
+
+#[cfg(not(feature = "pty"))]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_write(
+    _id: *const c_char,
+    _data: *const u8,
+    _len: usize,
+) -> *mut c_char {
+    to_c_string(json!({"ok": false, "error": "pty feature not enabled"}).to_string())
+}
+
+#[cfg(not(feature = "pty"))]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_read(
+    _id: *const c_char,
+    _cursor: u64,
+    _max_bytes: usize,
+) -> *mut c_char {
+    to_c_string(json!({"ok": false, "error": "pty feature not enabled"}).to_string())
+}
+
+#[cfg(not(feature = "pty"))]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_resize(
+    _id: *const c_char,
+    _cols: u16,
+    _rows: u16,
+) -> *mut c_char {
+    to_c_string(json!({"ok": false, "error": "pty feature not enabled"}).to_string())
+}
+
+#[cfg(not(feature = "pty"))]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_close(_id: *const c_char) -> *mut c_char {
+    to_c_string(json!({"ok": false, "error": "pty feature not enabled"}).to_string())
+}
+
+#[cfg(not(feature = "pty"))]
+#[no_mangle]
+pub extern "C" fn aacode_terminal_list() -> *mut c_char {
+    to_c_string(json!({"ok": false, "error": "pty feature not enabled"}).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1551,5 +1742,65 @@ mod surface_ffi_tests {
             unsafe { aacode_browser_register_surface_ops(std::ptr::null()) },
             -1
         );
+    }
+}
+
+#[cfg(all(test, feature = "pty", unix))]
+mod pty_ffi_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn take(ptr: *mut c_char) -> serde_json::Value {
+        assert!(!ptr.is_null());
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
+        aacode_free_string(ptr);
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn terminal_ffi_open_write_read_list_close() {
+        let shell = CString::new("/bin/sh").unwrap();
+        let cwd = CString::new(".").unwrap();
+        let open = take(aacode_terminal_open(shell.as_ptr(), cwd.as_ptr(), 80, 24));
+        assert_eq!(open["ok"], true, "{open:?}");
+        let id = open["id"].as_str().unwrap().to_string();
+        let idc = CString::new(id.clone()).unwrap();
+
+        let cmd = b"printf 'FFI_OK\\n'\n";
+        let w = take(aacode_terminal_write(idc.as_ptr(), cmd.as_ptr(), cmd.len()));
+        assert_eq!(w["ok"], true, "{w:?}");
+
+        let mut cursor = 0u64;
+        let mut all = String::new();
+        for _ in 0..200 {
+            let r = take(aacode_terminal_read(idc.as_ptr(), cursor, 4096));
+            if !r["ok"].as_bool().unwrap_or(false) {
+                break;
+            }
+            cursor = r["cursor"].as_u64().unwrap_or(cursor);
+            if let Some(b64) = r["data_b64"].as_str() {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .unwrap();
+                all.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            if all.contains("FFI_OK") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(all.contains("FFI_OK"), "output: {all:?}");
+
+        let list = take(aacode_terminal_list());
+        assert!(list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"].as_str() == Some(id.as_str())));
+
+        let resized = take(aacode_terminal_resize(idc.as_ptr(), 100, 40));
+        assert_eq!(resized["ok"], true);
+        let closed = take(aacode_terminal_close(idc.as_ptr()));
+        assert_eq!(closed["ok"], true);
     }
 }

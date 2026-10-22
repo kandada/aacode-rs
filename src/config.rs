@@ -198,19 +198,26 @@ impl Default for Timeouts {
 /// Output / truncation limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Limits {
+    /// Observation-layer cap. 0 = no truncation for plain text (only binary is
+    /// externalized). `run_shell` has its own default cap (see `ShellTool`).
     #[serde(default = "d_tool_output")]
     pub tool_output_chars: usize,
+    /// `run_shell` line cap. 0 = unset → `ShellTool` default (500).
+    #[serde(default = "d_tool_output_lines")]
+    pub tool_output_lines: usize,
     #[serde(default = "d_display_preview")]
     pub display_preview_chars: usize,
     #[serde(default = "d_max_retries")]
     pub max_retries: u32,
 }
 fn d_tool_output() -> usize {
-    // 0 = unlimited. `run_shell` truncation is the caller's choice via its
-    // `max_output` param; the observation layer does NOT truncate plain text
-    // (only binary/base64 is externalized). Set a number here to impose a hard
-    // accident ceiling.
+    // 0 = unlimited for the observation layer. `run_shell` truncation defaults
+    // to `ShellTool::DEFAULT_MAX_OUTPUT_CHARS` (20000) unless
+    // `tool_output_chars` is set; `full_output=true` opts out per call.
     0
+}
+fn d_tool_output_lines() -> usize {
+    500
 }
 fn d_display_preview() -> usize {
     3000
@@ -222,6 +229,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             tool_output_chars: d_tool_output(),
+            tool_output_lines: d_tool_output_lines(),
             display_preview_chars: d_display_preview(),
             max_retries: d_max_retries(),
         }
@@ -242,16 +250,58 @@ impl Default for DangerAction {
     }
 }
 
+/// Policy for commands that are not on PATH (native shell only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnknownAction {
+    /// Allow (default): an unknown command simply fails in the shell.
+    Allow,
+    /// Ask: no interactive channel exists in aacode-rs; treated as allow.
+    Ask,
+    /// Reject before execution.
+    Reject,
+}
+impl Default for UnknownAction {
+    fn default() -> Self {
+        UnknownAction::Allow
+    }
+}
+
+/// Agent permission mode.
+///
+/// `full_access` is the default and keeps existing behaviour. `read_only`
+/// blocks any tool that mutates files/state or executes code; browsing,
+/// reading, searching and waiting remain available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    FullAccess,
+    ReadOnly,
+}
+impl Default for PermissionMode {
+    fn default() -> Self {
+        PermissionMode::FullAccess
+    }
+}
+
 /// Safety configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyConfig {
     #[serde(default)]
     pub dangerous_command_action: DangerAction,
+    /// Unknown-command policy (native shell only; `allow` by default).
+    #[serde(default)]
+    pub unknown_command_action: UnknownAction,
+    /// `full_access` (default) or `read_only`.
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
 }
 impl Default for SafetyConfig {
     fn default() -> Self {
         SafetyConfig {
             dangerous_command_action: DangerAction::Log,
+            unknown_command_action: UnknownAction::default(),
+            permission_mode: PermissionMode::default(),
         }
     }
 }
@@ -269,9 +319,34 @@ pub struct ContextConfig {
     pub keep_last_rounds: usize,
     #[serde(default = "d_protect_user")]
     pub protect_last_user_rounds: usize,
+    /// Retrieval-style context control (no summary). Advance a frozen cutoff
+    /// when the model view exceeds this many tokens.
+    #[serde(default = "d_retrieval_trigger")]
+    pub retrieval_trigger_tokens: usize,
+    /// Budget of recent verbatim history kept after the cutoff.
+    #[serde(default = "d_retrieval_keep")]
+    pub retrieval_keep_tokens: usize,
+    /// Always try to keep the newest N real user messages.
+    #[serde(default = "d_retrieval_recent")]
+    pub retrieval_keep_recent_user_messages: usize,
+    /// Always try to keep at least this many recent rounds.
+    #[serde(default = "d_retrieval_rounds")]
+    pub retrieval_keep_min_rounds: usize,
 }
 fn d_max_ctx() -> usize {
     262144
+}
+fn d_retrieval_trigger() -> usize {
+    100000
+}
+fn d_retrieval_keep() -> usize {
+    20000
+}
+fn d_retrieval_recent() -> usize {
+    2
+}
+fn d_retrieval_rounds() -> usize {
+    4
 }
 // Aligned with the Python aacode default (config.py: compact_trigger_tokens).
 fn d_trigger() -> usize {
@@ -294,6 +369,10 @@ impl Default for ContextConfig {
             protect_first_rounds: d_protect_first(),
             keep_last_rounds: d_keep_last(),
             protect_last_user_rounds: d_protect_user(),
+            retrieval_trigger_tokens: d_retrieval_trigger(),
+            retrieval_keep_tokens: d_retrieval_keep(),
+            retrieval_keep_recent_user_messages: d_retrieval_recent(),
+            retrieval_keep_min_rounds: d_retrieval_rounds(),
         }
     }
 }

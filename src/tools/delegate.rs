@@ -33,6 +33,9 @@ pub struct DelegateTaskTool {
 
 #[async_trait::async_trait]
 impl Tool for DelegateTaskTool {
+    fn lane(&self) -> Option<&'static str> {
+        Some("delegate")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "delegate_task",

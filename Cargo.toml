@@ -3,7 +3,7 @@
 
 [package]
 name = "aacode-rs"
-version = "1.8.13"
+version = "1.8.15"
 edition = "2021"
 description = "Rust port of the AACode ReAct coding agent, built on fastshell for mobile AI agents"
 license = "GPL-3.0-only"
@@ -29,10 +29,13 @@ default = []
 # The host app must register an offscreen native WebView via
 # `aacode_browser_register_webview_ops` (see src/tools/browser.rs).
 browser = ["dep:fastbrowser"]
+# Interactive terminal sessions (real PTY on Unix). Opt-in; never exposes a
+# model tool — the terminal is a user/host entry point.
+pty = ["dep:nix"]
 
 [dependencies]
 fastshell = { path = "../fastshell", version = "0.3.4", features = ["git", "python-rustpython", "js-oxc"] }
-fastbrowser = { version = "0.1.9", path = "../../fastbrowser_local/fastbrowser", features = ["engine-webview"], optional = true }
+fastbrowser = { version = "0.1.10", path = "../../fastbrowser_local/fastbrowser", features = ["engine-webview"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
@@ -42,6 +45,7 @@ base64 = "0.22"
 sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
+nix = { version = "0.30", features = ["term", "process"], optional = true }
 reqwest = { version = "0.12", features = ["json", "stream", "blocking", "rustls-tls", "cookies"], default-features = false }
 futures = "0.3"
 bytes = "1"
@@ -57,4 +61,4 @@ tokio = { version = "1", features = ["full"] }
 # 注意：同名依赖在 target 段会覆盖基础特性，故这里重复 engine-webview。
 # 必须放在所有普通依赖之后，否则会把它上面的依赖划成仅该目标。
 [target.'cfg(target_os = "android")'.dependencies]
-fastbrowser = { version = "0.1.9", path = "../../fastbrowser_local/fastbrowser", features = ["engine-webview", "surface-android"], optional = true }
+fastbrowser = { version = "0.1.10", path = "../../fastbrowser_local/fastbrowser", features = ["engine-webview", "surface-android"], optional = true }

@@ -142,6 +142,9 @@ output (large results archived under `.aacode/extracts/`).",
         cancel: &AtomicBool,
     ) -> Result<RunResult> {
         emitter.started(task);
+        // Startup identity (additive event): lets hosts log the exact binary
+        // version/path, so stale bundled copies are obvious.
+        emitter.runtime_info();
         // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
 
         // Session: reuse current or create new.
@@ -237,10 +240,13 @@ output (large results archived under `.aacode/extracts/`).",
             )));
         }
 
-        // Current task as the final user turn.
-        messages.push(ChatMessage::user(format!(
-            "Task: {task}\n\nUse native function calls to execute tools. Output a final text summary (no tool calls) when done."
-        )));
+        // Current task as the final user turn. Send the raw task **exactly** as
+        // it was persisted: any per-request rewrite (a "Task:" prefix or a
+        // fixed suffix) would make the replayed history differ from the prefix
+        // cached by the provider, breaking the KV/prefix cache at every task
+        // boundary. The equivalent guidance already lives in the system
+        // prompt (see `prompts::SYSTEM_PROMPT_FOR_MAIN_AGENT`).
+        messages.push(ChatMessage::user(task));
 
         let loop_ = ReactLoop::new(self.llm.as_ref(), &registry, &self.config, native);
         let result = loop_.run(messages, session, emitter, cancel).await;

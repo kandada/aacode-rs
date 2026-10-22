@@ -588,6 +588,9 @@ pub struct FetchRenderedTool;
 
 #[async_trait::async_trait]
 impl Tool for FetchRenderedTool {
+    fn lane(&self) -> Option<&'static str> {
+        Some("browser")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "fetch_rendered",
@@ -794,6 +797,9 @@ pub struct BrowserCallTool {
 
 #[async_trait::async_trait]
 impl Tool for BrowserCallTool {
+    fn lane(&self) -> Option<&'static str> {
+        Some("browser")
+    }
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "browser_call",

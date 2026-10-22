@@ -608,6 +608,72 @@ fn oai_empty_content_skipped() {
     assert_eq!(r.text, "");
 }
 
+#[test]
+fn oai_captures_usage_from_choicesless_final_chunk() {
+    use aacode_rs::llm::parse::{finalize_openai, parse_openai_chunk, OpenAiParseState};
+    use aacode_rs::stream::CollectingSink;
+    let sink = CollectingSink::new(false);
+    let mut st = OpenAiParseState::default();
+    parse_openai_chunk(
+        r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+        &mut st,
+        &sink,
+    )
+    .unwrap();
+    // `include_usage` sends the usage chunk with an empty choices array.
+    parse_openai_chunk(
+        r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20}}"#,
+        &mut st,
+        &sink,
+    )
+    .unwrap();
+    let r = finalize_openai(st, &sink).unwrap();
+    let u = r.usage.expect("usage");
+    assert_eq!(u.input_tokens, 100);
+    assert_eq!(u.output_tokens, 10);
+    assert_eq!(u.cache_read_tokens, 80);
+    assert_eq!(u.cache_miss_tokens, 20);
+}
+
+#[test]
+fn anthropic_usage_merges_message_start_and_delta() {
+    use aacode_rs::llm::parse::{finalize_anthropic, parse_anthropic_chunk, AnthropicParseState};
+    use aacode_rs::stream::CollectingSink;
+    let sink = CollectingSink::new(false);
+    let mut st = AnthropicParseState::default();
+    parse_anthropic_chunk(
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":20,"cache_read_input_tokens":700,"cache_creation_input_tokens":30,"output_tokens":1}}}"#,
+        &mut st,
+        &sink,
+    )
+    .unwrap();
+    parse_anthropic_chunk(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+        &mut st,
+        &sink,
+    )
+    .unwrap();
+    parse_anthropic_chunk(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        &mut st,
+        &sink,
+    )
+    .unwrap();
+    parse_anthropic_chunk(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12}}"#,
+        &mut st,
+        &sink,
+    )
+    .unwrap();
+    let r = finalize_anthropic(st, &sink).unwrap();
+    let u = r.usage.expect("usage");
+    assert_eq!(u.input_tokens, 750);
+    assert_eq!(u.cache_read_tokens, 700);
+    assert_eq!(u.cache_write_tokens, 30);
+    assert_eq!(u.cache_miss_tokens, 20);
+    assert_eq!(u.output_tokens, 12);
+}
+
 // (anthropic wire-format tests are in aacode-rs/src/llm/anthropic.rs)
 
 #[test]

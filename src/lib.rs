@@ -19,7 +19,10 @@ pub mod llm;
 pub mod mcp;
 pub mod observation;
 pub mod session;
+#[cfg(feature = "pty")]
+pub mod terminal;
 pub mod tools;
+pub mod usage;
 
 pub mod ffi;
 pub mod runtime;

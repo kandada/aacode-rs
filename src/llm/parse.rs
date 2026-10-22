@@ -61,6 +61,9 @@ pub struct OpenAiParseState {
     pub first_think_pending: bool,
     /// Same as `first_think_pending`, for the `thought` channel.
     pub first_content_pending: bool,
+    /// Provider-reported `usage` (usually on the final chunk; those chunks may
+    /// carry an empty `choices` array).
+    pub usage: Option<Value>,
 }
 
 impl Default for OpenAiParseState {
@@ -76,6 +79,7 @@ impl Default for OpenAiParseState {
             in_think: false,
             first_think_pending: true,
             first_content_pending: true,
+            usage: None,
         }
     }
 }
@@ -112,6 +116,13 @@ pub fn parse_openai_chunk(
             .map(|s| s.to_string())
             .unwrap_or_else(|| err.to_string());
         return Err(AacodeError::Api(format!("stream error: {msg}")));
+    }
+    // `include_usage` puts usage on a final chunk that often has no `choices`
+    // at all, so capture it before the empty-choices early return.
+    if let Some(u) = chunk.get("usage") {
+        if !u.is_null() {
+            state.usage = Some(u.clone());
+        }
     }
     let choice = match chunk.get("choices").and_then(|c| c.get(0)) {
         Some(c) => c,
@@ -384,6 +395,12 @@ pub fn finalize_openai(
         state.text.push_str(&tail_content);
     }
 
+    // Capture usage before the fields below are moved out of `state`.
+    let usage = state
+        .usage
+        .as_ref()
+        .and_then(super::usage::normalize_openai_usage);
+
     let mut text = state.text;
     let reasoning = state.reasoning;
 
@@ -426,6 +443,7 @@ pub fn finalize_openai(
             Some(reasoning)
         },
         finish_reason: state.finish_reason,
+        usage,
     })
 }
 
@@ -449,6 +467,9 @@ pub struct AnthropicParseState {
     pub stop_reason: Option<String>,
     pub valid_chunks: usize,
     pub total_payloads: usize,
+    /// Merged `usage` from `message_start` (input/cache) + `message_delta`
+    /// (output).
+    pub usage: Option<Value>,
 }
 
 impl Default for AnthropicParseState {
@@ -460,6 +481,23 @@ impl Default for AnthropicParseState {
             stop_reason: None,
             valid_chunks: 0,
             total_payloads: 0,
+            usage: None,
+        }
+    }
+}
+
+/// Merge an Anthropic usage object into the accumulator (later keys win).
+fn merge_usage(dst: &mut Option<Value>, src: &Value) {
+    let Some(src_obj) = src.as_object() else {
+        return;
+    };
+    if src_obj.is_empty() {
+        return;
+    }
+    let dst_val = dst.get_or_insert_with(|| Value::Object(Default::default()));
+    if let Some(dst_obj) = dst_val.as_object_mut() {
+        for (k, v) in src_obj {
+            dst_obj.insert(k.clone(), v.clone());
         }
     }
 }
@@ -487,6 +525,11 @@ pub fn parse_anthropic_chunk(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| ev.to_string());
             return Err(AacodeError::Api(format!("stream error: {msg}")));
+        }
+        "message_start" => {
+            if let Some(u) = ev.get("message").and_then(|m| m.get("usage")) {
+                merge_usage(&mut state.usage, u);
+            }
         }
         "content_block_start" => {
             let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -558,6 +601,9 @@ pub fn parse_anthropic_chunk(
             {
                 state.stop_reason = Some(sr.to_string());
             }
+            if let Some(u) = ev.get("usage") {
+                merge_usage(&mut state.usage, u);
+            }
         }
         _ => {}
     }
@@ -573,6 +619,11 @@ pub fn finalize_anthropic(
             "stream returned no parseable data (all chunks malformed)".into(),
         ));
     }
+
+    let usage = state
+        .usage
+        .as_ref()
+        .and_then(super::usage::normalize_anthropic_usage);
 
     if state.stop_reason.is_none()
         && (!state.text.is_empty() || !state.reasoning.is_empty() || !state.blocks.is_empty())
@@ -624,6 +675,7 @@ pub fn finalize_anthropic(
             Some(state.reasoning)
         },
         finish_reason: state.stop_reason,
+        usage,
     })
 }
 

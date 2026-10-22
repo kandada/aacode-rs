@@ -210,6 +210,11 @@ impl OpenAiAsyncClient {
             body["tools"] = Value::Array(tools.to_vec());
             body["tool_choice"] = Value::String("auto".into());
         }
+        if stream {
+            // Ask OpenAI-compatible gateways for a final usage chunk. Gateways
+            // that reject this are retried without it (see `chat_stream`).
+            body["stream_options"] = json!({"include_usage": true});
+        }
         body
     }
 
@@ -255,8 +260,19 @@ impl LlmClient for OpenAiAsyncClient {
         emitter: &dyn EventSink,
         cancel: &AtomicBool,
     ) -> Result<LlmResponse> {
-        let body = self.build_body(messages, tools, true);
-        let stream = self.post_stream(&body).await?;
+        let mut body = self.build_body(messages, tools, true);
+        let stream = match self.post_stream(&body).await {
+            Ok(s) => s,
+            // Some OpenAI-compatible gateways reject `stream_options`. Retry
+            // once without it; usage is simply unavailable for those.
+            Err(e) if is_stream_options_unsupported(&e) => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("stream_options");
+                }
+                self.post_stream(&body).await?
+            }
+            Err(e) => return Err(e),
+        };
         let mut sse = AsyncSseStream::new(stream);
         let mut state = parse::OpenAiParseState::default();
 
@@ -512,6 +528,22 @@ impl LlmClient for AnthropicAsyncClient {
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────────────
+
+/// Does this API error mean the gateway rejected `stream_options`?
+fn is_stream_options_unsupported(e: &AacodeError) -> bool {
+    let s = format!("{e}").to_lowercase();
+    [
+        "stream_options",
+        "include_usage",
+        "unexpected keyword",
+        "extra inputs",
+        "unknown field",
+        "unrecognized field",
+        "not supported",
+    ]
+    .iter()
+    .any(|term| s.contains(term))
+}
 
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {

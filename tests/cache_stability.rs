@@ -17,6 +17,7 @@ use aacode_rs::runtime::AgentRuntime;
 use aacode_rs::session::SessionManager;
 use aacode_rs::stream::CollectingSink;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 // ───────── helpers ─────────
@@ -39,9 +40,12 @@ fn sse_content(text: &str, finish: &str) -> String {
     )
 }
 
-/// A simple mock LLM server returning scripted SSE responses.
+/// A simple mock LLM server returning scripted SSE responses. It also records
+/// the raw request bodies so tests can assert what was actually sent to the
+/// provider (e.g. that the user message is not rewritten).
 struct MockLlm {
     addr: String,
+    requests: Arc<Mutex<Vec<String>>>,
     _handle: thread::JoinHandle<()>,
 }
 
@@ -49,11 +53,14 @@ impl MockLlm {
     fn start(responses: Vec<String>) -> Self {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = format!("http://{}", server.server_addr());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let reqs = requests.clone();
         let handle = thread::spawn(move || {
             let mut queue = responses.into_iter();
             for mut request in server.incoming_requests() {
                 let mut buf = String::new();
                 let _ = request.as_reader().read_to_string(&mut buf);
+                reqs.lock().unwrap().push(buf);
                 let body = queue
                     .next()
                     .unwrap_or_else(|| "data: [DONE]\n\n".to_string());
@@ -69,9 +76,29 @@ impl MockLlm {
         });
         MockLlm {
             addr,
+            requests,
             _handle: handle,
         }
     }
+
+    /// Raw JSON request bodies received so far (in order).
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// The content of the last `user` message in an OpenAI-style request body.
+fn last_user_content(body: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn config_for(addr: &str) -> AgentConfig {
@@ -199,6 +226,54 @@ async fn consecutive_tasks_preserve_history() {
         last_task1_user < last_task2_user,
         "task 1 messages must precede task 2 messages"
     );
+}
+
+/// Regression: the user task must be sent **verbatim** (no "Task:" prefix or
+/// fixed suffix), so that replaying it as history on the next task produces a
+/// byte-identical prefix and the provider KV cache stays hot at task
+/// boundaries.
+#[tokio::test]
+async fn sent_user_message_is_raw_and_stable_across_tasks() {
+    let mock = MockLlm::start(vec![
+        sse_content("First task done.", "stop"),
+        sse_content("Second task done.", "stop"),
+    ]);
+    let cfg = config_for(&mock.addr);
+    let proj = tmp_project();
+    let rt = AgentRuntime::init(cfg, proj.clone()).unwrap();
+    let cancel = AtomicBool::new(false);
+
+    let sink1 = CollectingSink::new(false);
+    rt.run_task("task one", None, &sink1, &cancel)
+        .await
+        .unwrap();
+    let sid = extract_session_id(&sink1);
+
+    let sink2 = CollectingSink::new(false);
+    rt.run_task("task two", Some(&sid), &sink2, &cancel)
+        .await
+        .unwrap();
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2, "expected one LLM request per task");
+
+    // 1) Current task is sent verbatim — no "Task:" prefix, no fixed suffix.
+    assert_eq!(last_user_content(&reqs[0]), "task one");
+    assert_eq!(last_user_content(&reqs[1]), "task two");
+    assert!(
+        !reqs[0].contains("Use native function calls to execute tools"),
+        "per-request suffix must not be sent"
+    );
+
+    // 2) Task two replays task one's user message exactly as it was sent, so
+    //    the prefix matches the provider cache (no boundary cache miss).
+    let body2: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
+    let replayed = body2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "user" && m["content"] == "task one");
+    assert!(replayed, "task one must be replayed verbatim in task two");
 }
 
 #[test]
