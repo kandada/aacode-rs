@@ -63,17 +63,21 @@ impl Tool for DelegateTaskTool {
         // Sub-agent output is collected but not streamed to the main sink to
         // avoid confusing the UI; the returned summary is what matters.
         let sink = CollectingSink::new(false);
-        let summary = run_sub_agent(
-            agent_type,
-            task,
-            self.llm.as_ref(),
-            &registry,
-            &self.config,
-            &self.project_path,
-            &sink,
-            cancel,
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(self.config.timeouts.subagent.max(1)),
+            run_sub_agent(
+                agent_type,
+                task,
+                self.llm.as_ref(),
+                &registry,
+                &self.config,
+                &self.project_path,
+                &sink,
+                cancel,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| crate::error::AacodeError::Tool("sub-agent timed out".into()))??;
         Ok(json!({
             "success": true,
             "agent_type": agent_type,

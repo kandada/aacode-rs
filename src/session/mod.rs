@@ -32,7 +32,7 @@ pub struct SessionMessage {
     pub content: String,
     #[serde(default)]
     pub timestamp: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_usize_lenient")]
     pub tokens: usize,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -86,13 +86,43 @@ impl SessionMessage {
 /// One entry in the sessions index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
+    #[serde(default)]
     pub session_id: String,
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     pub created_at: String,
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     pub last_activity: String,
     #[serde(default)]
     pub total_messages: usize,
     #[serde(default)]
     pub total_tokens: usize,
+    /// Provider-reported total usage (prompt + output). Unlike `total_tokens`
+    /// (a local message estimate), this is suitable for displaying real usage.
+    #[serde(default)]
+    pub total_usage_tokens: u64,
+    /// Current model-view context estimate and the next cutoff pressure.
+    #[serde(default)]
+    pub context_tokens: u64,
+    #[serde(default)]
+    pub context_window: u64,
+    #[serde(default)]
+    pub context_trigger_tokens: u64,
+    #[serde(default)]
+    pub uncached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_rate: f64,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub cost: f64,
     #[serde(default)]
     pub title: String,
     #[serde(default = "default_status")]
@@ -113,18 +143,81 @@ fn default_status() -> String {
 struct SessionFile {
     #[serde(default = "default_schema_version")]
     schema_version: u32,
+    #[serde(default, deserialize_with = "deserialize_string_lenient")]
     session_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     created_at: String,
+    #[serde(default, deserialize_with = "deserialize_messages_lenient")]
     messages: Vec<SessionMessage>,
     /// Retrieval cutoff for the model view. The stored messages stay complete;
     /// this only records where the model view starts. `None` = no cutoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_checkpoint: Option<Value>,
+    /// Frozen session bootstrap (system prompt/hash/skills snapshot). Keeping
+    /// this stable across tasks preserves the provider prefix cache even when
+    /// init.md or the skills list changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bootstrap: Option<Value>,
 }
 
 fn default_schema_version() -> u32 {
     SCHEMA_VERSION
+}
+
+/// Accept old numeric epoch timestamps as well as the canonical string form.
+fn deserialize_timestamp<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    })
+}
+
+/// Accept null/string numeric values found in old session files.
+fn deserialize_usize_lenient<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+        Value::String(s) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    })
+}
+
+fn deserialize_string_lenient<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    })
+}
+
+/// Drop individually malformed legacy messages instead of discarding the
+/// entire session file.
+fn deserialize_messages_lenient<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<SessionMessage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Value::Array(items) = value else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<SessionMessage>(item).ok())
+        .collect())
 }
 
 /// Current on-disk session schema version (see SESSION_FFI.md §6). Bump on any
@@ -141,9 +234,36 @@ pub fn valid_session_id(sid: &str) -> bool {
         && !sid.contains('\0')
 }
 
-/// Rough token estimate (4 chars ≈ 1 token). tiktoken is not ported.
+/// CJK/kana/hangul ranges whose token density is much higher than ASCII.
+fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF |
+        0x3040..=0x30FF | 0xAC00..=0xD7AF | 0x20000..=0x2FA1F)
+}
+
+/// CJK-aware token estimate (no tiktoken dependency).
+///
+/// ASCII/code ≈ 4 chars/token, CJK ≈ 1.6 chars/token. The old fixed 4:1
+/// heuristic undercounted Chinese/Japanese/Korean by ~2-3x and fired
+/// compaction far too late.
 pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / 4
+    if text.is_empty() {
+        return 0;
+    }
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in text.chars() {
+        if is_cjk_char(c) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    let mut tokens = (cjk as f64 / 1.6).ceil() as usize + (other as f64 / 4.0).ceil() as usize;
+    if tokens == 0 && !text.is_empty() {
+        tokens = 1;
+    }
+    tokens
 }
 
 /// Current time as a compact ISO-ish string (no external chrono dependency).
@@ -186,6 +306,8 @@ pub struct SessionManager {
     pub messages: Vec<SessionMessage>,
     /// Retrieval cutoff for the model view (optional; persisted per session).
     pub context_checkpoint: Option<Value>,
+    /// Frozen session bootstrap (see `SessionFile::bootstrap`).
+    pub bootstrap: Option<Value>,
     /// Flush cooldown: how many messages to batch before forcing a write.
     flush_batch_size: usize,
     /// Number of messages added since the last flush.
@@ -206,6 +328,7 @@ impl SessionManager {
             current_session_id: None,
             messages: Vec::new(),
             context_checkpoint: None,
+            bootstrap: None,
             flush_batch_size: 10,
             dirty_count: 0,
             last_flush: None,
@@ -232,12 +355,81 @@ impl SessionManager {
 
     fn load_index(&self) -> std::collections::BTreeMap<String, SessionSummary> {
         let path = self.index_path();
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            if let Ok(m) = serde_json::from_str(&s) {
-                return m;
+        let mut out = std::collections::BTreeMap::new();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return out;
+        };
+        let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(&text) else {
+            return out;
+        };
+        for (id, mut entry) in entries {
+            if let Value::Object(map) = &mut entry {
+                // Coerce legacy string/null counters; a single malformed entry
+                // must not discard the whole session index.
+                for key in [
+                    "total_messages",
+                    "total_tokens",
+                    "total_usage_tokens",
+                    "uncached_input_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "calls",
+                ] {
+                    match map.get(key) {
+                        Some(Value::String(_)) | Some(Value::Null) | None => {
+                            let n = map
+                                .get(key)
+                                .and_then(|v| v.as_str())
+                                .and_then(|v| v.trim().parse::<u64>().ok())
+                                .unwrap_or(0);
+                            map.insert(key.to_string(), Value::Number(n.into()));
+                        }
+                        _ => {}
+                    }
+                }
+                for key in ["cache_hit_rate", "cost"] {
+                    match map.get(key) {
+                        Some(Value::String(s)) => {
+                            if let Ok(n) = s.trim().parse::<f64>() {
+                                map.insert(key.to_string(), serde_json::json!(n));
+                            }
+                        }
+                        Some(Value::Null) | None => {
+                            map.insert(key.to_string(), serde_json::json!(0.0));
+                        }
+                        _ => {}
+                    }
+                }
+                if map.get("title").map(|v| v.is_null()).unwrap_or(true) {
+                    map.insert("title".to_string(), Value::String(String::new()));
+                }
+                if map.get("status").map(|v| v.is_null()).unwrap_or(true) {
+                    map.insert("status".to_string(), Value::String("active".to_string()));
+                }
+                if map
+                    .get("session_id")
+                    .map(|v| v.is_null() || v.as_str().unwrap_or("").is_empty())
+                    .unwrap_or(true)
+                {
+                    map.insert("session_id".to_string(), Value::String(id.clone()));
+                }
+            }
+            match serde_json::from_value::<SessionSummary>(entry) {
+                Ok(mut summary) => {
+                    if summary.session_id.is_empty() {
+                        summary.session_id = id.clone();
+                    }
+                    out.insert(id, summary);
+                }
+                Err(_) => {
+                    // Keep other sessions usable; a malformed legacy entry is
+                    // ignored (the session file scanner may recover it later).
+                }
             }
         }
-        std::collections::BTreeMap::new()
+        out
     }
 
     fn save_index(&self, index: &std::collections::BTreeMap<String, SessionSummary>) -> Result<()> {
@@ -266,12 +458,25 @@ impl SessionManager {
             last_activity: now,
             total_messages: 0,
             total_tokens: 0,
+            total_usage_tokens: 0,
+            context_tokens: 0,
+            context_window: 0,
+            context_trigger_tokens: 0,
+            uncached_input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cache_hit_rate: 0.0,
+            calls: 0,
+            cost: 0.0,
             title,
             status: "active".to_string(),
         };
         self.current_session_id = Some(id.clone());
         self.messages.clear();
         self.context_checkpoint = None;
+        self.bootstrap = None;
         if !task.trim().is_empty() {
             self.messages.push(SessionMessage {
                 role: "user".to_string(),
@@ -371,6 +576,7 @@ impl SessionManager {
                 created_at,
                 messages: self.messages.clone(),
                 context_checkpoint: self.context_checkpoint.clone(),
+                bootstrap: self.bootstrap.clone(),
             };
             atomic_write(&self.session_path(id), &serde_json::to_string(&file)?)?;
         }
@@ -388,6 +594,7 @@ impl SessionManager {
         self.current_session_id = Some(id.to_string());
         self.messages = file.messages;
         self.context_checkpoint = file.context_checkpoint;
+        self.bootstrap = file.bootstrap;
         Ok(true)
     }
 
@@ -399,6 +606,24 @@ impl SessionManager {
     /// Persist a retrieval checkpoint. Messages themselves are never modified.
     pub fn set_context_checkpoint(&mut self, checkpoint: Option<Value>) -> Result<()> {
         self.context_checkpoint = checkpoint;
+        self.save_current()
+    }
+
+    /// Frozen system-prompt bootstrap for this session (hash + snapshot).
+    pub fn bootstrap(&self) -> Option<Value> {
+        self.bootstrap.clone()
+    }
+
+    /// Current session summary after the latest persisted usage update.
+    pub fn current_summary(&self) -> Option<SessionSummary> {
+        let id = self.current_session_id.as_ref()?;
+        self.load_index().get(id).cloned()
+    }
+
+    /// Persist the session bootstrap. This is intentionally write-once in
+    /// normal use; callers may update metadata but should keep the prompt.
+    pub fn set_bootstrap(&mut self, bootstrap: Option<Value>) -> Result<()> {
+        self.bootstrap = bootstrap;
         self.save_current()
     }
 
@@ -484,6 +709,7 @@ impl SessionManager {
             created_at: now.clone(),
             messages: prefix,
             context_checkpoint: None,
+            bootstrap: None,
         };
         atomic_write(&self.session_path(&id), &serde_json::to_string(&file)?)?;
 
@@ -496,6 +722,18 @@ impl SessionManager {
                 last_activity: now,
                 total_messages: file.messages.len(),
                 total_tokens: file.messages.iter().map(|m| m.tokens).sum(),
+                total_usage_tokens: 0,
+                context_tokens: 0,
+                context_window: 0,
+                context_trigger_tokens: 0,
+                uncached_input_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cache_hit_rate: 0.0,
+                calls: 0,
+                cost: 0.0,
                 title,
                 status: "active".to_string(),
             },
@@ -521,13 +759,18 @@ impl SessionManager {
                     }
                     if let Ok(s) = std::fs::read_to_string(&path) {
                         if let Ok(file) = serde_json::from_str::<SessionFile>(&s) {
+                            let file_sid = if file.session_id.is_empty() {
+                                stem.to_string()
+                            } else {
+                                file.session_id.clone()
+                            };
                             let title = file
                                 .messages
                                 .first()
                                 .map(|m| truncate_title(&m.content))
                                 .unwrap_or_default();
                             let summary = SessionSummary {
-                                session_id: file.session_id.clone(),
+                                session_id: file_sid.clone(),
                                 created_at: file.created_at.clone(),
                                 last_activity: file
                                     .messages
@@ -536,10 +779,22 @@ impl SessionManager {
                                     .unwrap_or_default(),
                                 total_messages: file.messages.len(),
                                 total_tokens: file.messages.iter().map(|m| m.tokens).sum(),
+                                total_usage_tokens: 0,
+                                context_tokens: 0,
+                                context_window: 0,
+                                context_trigger_tokens: 0,
+                                uncached_input_tokens: 0,
+                                cache_read_tokens: 0,
+                                cache_write_tokens: 0,
+                                output_tokens: 0,
+                                reasoning_tokens: 0,
+                                cache_hit_rate: 0.0,
+                                calls: 0,
+                                cost: 0.0,
                                 title,
                                 status: "active".to_string(),
                             };
-                            index.entry(file.session_id).or_insert(summary);
+                            index.entry(file_sid).or_insert(summary);
                         }
                     }
                 }
@@ -604,6 +859,18 @@ impl SessionManager {
             last_activity: now.clone(),
             total_messages: 0,
             total_tokens: 0,
+            total_usage_tokens: 0,
+            context_tokens: 0,
+            context_window: 0,
+            context_trigger_tokens: 0,
+            uncached_input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cache_hit_rate: 0.0,
+            calls: 0,
+            cost: 0.0,
             title: title.to_string(),
             status: "active".to_string(),
         };
@@ -615,6 +882,7 @@ impl SessionManager {
             created_at: now,
             messages: Vec::new(),
             context_checkpoint: None,
+            bootstrap: None,
         };
         atomic_write(&self.session_path(sid), &serde_json::to_string(&file)?)
     }
@@ -624,6 +892,45 @@ impl SessionManager {
         let mut index = self.load_index();
         if let Some(s) = index.get_mut(sid) {
             s.title = title.to_string();
+            self.save_index(&index)?;
+        }
+        Ok(())
+    }
+
+    /// Accumulate provider usage for the current session from a usage event.
+    pub fn record_usage(&mut self, event: &Value) -> Result<()> {
+        let Some(id) = self.current_session_id.clone() else {
+            return Ok(());
+        };
+        let mut index = self.load_index();
+        if let Some(s) = index.get_mut(&id) {
+            let as_u64 = |key: &str| event.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+            let as_f64 = |key: &str| event.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            s.calls = s.calls.saturating_add(1);
+            s.uncached_input_tokens = s
+                .uncached_input_tokens
+                .saturating_add(as_u64("uncached_input"));
+            s.cache_read_tokens = s.cache_read_tokens.saturating_add(as_u64("cache_read"));
+            s.cache_write_tokens = s.cache_write_tokens.saturating_add(as_u64("cache_write"));
+            s.output_tokens = s.output_tokens.saturating_add(as_u64("output"));
+            s.reasoning_tokens = s.reasoning_tokens.saturating_add(as_u64("reasoning"));
+            s.cost += as_f64("cost");
+            s.total_usage_tokens = s.uncached_input_tokens
+                + s.cache_read_tokens
+                + s.cache_write_tokens
+                + s.output_tokens;
+            s.context_tokens = as_u64("context_tokens").max(as_u64("context_tokens_estimate"));
+            s.context_window = as_u64("context_window");
+            s.context_trigger_tokens = as_u64("context_trigger_tokens");
+            // Match Usage::cache_hit_rate: cache writes are not cache hits and
+            // must not dilute the hit-rate denominator.
+            let denom = s.cache_read_tokens + s.uncached_input_tokens;
+            s.cache_hit_rate = if denom > 0 {
+                s.cache_read_tokens as f64 / denom as f64
+            } else {
+                0.0
+            };
+            s.last_activity = now_iso();
             self.save_index(&index)?;
         }
         Ok(())
@@ -643,15 +950,18 @@ impl SessionManager {
     /// then refresh the index entry (counts + last_activity + title fallback).
     pub fn append_session_messages(&mut self, sid: &str, msgs: Vec<SessionMessage>) -> Result<()> {
         let path = self.session_path(sid);
-        let mut existing: Vec<SessionMessage> = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<SessionFile>(&s).ok())
-                .map(|f| f.messages)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let existing_file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<SessionFile>(&s).ok());
+        let mut existing: Vec<SessionMessage> = existing_file
+            .as_ref()
+            .map(|f| f.messages.clone())
+            .unwrap_or_default();
+        let existing_bootstrap = existing_file.as_ref().and_then(|f| f.bootstrap.clone());
+        let existing_checkpoint = existing_file
+            .as_ref()
+            .and_then(|f| f.context_checkpoint.clone());
+        let existing_created_at = existing_file.as_ref().map(|f| f.created_at.clone());
         existing.extend(msgs);
 
         let total_messages = existing.len();
@@ -666,6 +976,7 @@ impl SessionManager {
             .load_index()
             .get(sid)
             .map(|s| s.created_at.clone())
+            .or(existing_created_at)
             .unwrap_or_else(now_iso);
 
         let file = SessionFile {
@@ -673,7 +984,10 @@ impl SessionManager {
             session_id: sid.to_string(),
             created_at,
             messages: existing,
-            context_checkpoint: None,
+            // Appending extends the conversation; keep the frozen bootstrap and
+            // retrieval checkpoint so prefix caching is not silently reset.
+            context_checkpoint: existing_checkpoint,
+            bootstrap: existing_bootstrap,
         };
         atomic_write(&path, &serde_json::to_string(&file)?)?;
 
@@ -694,6 +1008,18 @@ impl SessionManager {
                     last_activity: now_iso(),
                     total_messages,
                     total_tokens,
+                    total_usage_tokens: 0,
+                    context_tokens: 0,
+                    context_window: 0,
+                    context_trigger_tokens: 0,
+                    uncached_input_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_tokens: 0,
+                    cache_hit_rate: 0.0,
+                    calls: 0,
+                    cost: 0.0,
                     title: fallback_title,
                     status: "active".to_string(),
                 },
@@ -1415,5 +1741,302 @@ mod tests {
         let msgs = sm2.read_session_messages(&kept);
         assert_eq!(msgs.len(), 3);
         assert!(msgs.iter().any(|m| m.role == "tool"));
+    }
+    #[test]
+    fn cjk_text_estimate_is_not_four_chars_per_token() {
+        let ascii = estimate_tokens("abcdefgh");
+        let cjk = estimate_tokens("你好世界");
+        assert!(
+            cjk > ascii,
+            "CJK must not be priced like ASCII: {cjk} <= {ascii}"
+        );
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[test]
+    fn bootstrap_roundtrips_through_session_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "aacode_bootstrap_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sm = SessionManager::new(&dir);
+        let sid = sm.create_session("task", None).unwrap();
+        sm.set_bootstrap(Some(serde_json::json!({
+            "version": 1,
+            "system_prompt": "frozen",
+            "system_hash": "abc"
+        })))
+        .unwrap();
+        let mut loaded = SessionManager::new(&dir);
+        assert!(loaded.switch_session(&sid).unwrap());
+        let b = loaded.bootstrap().expect("bootstrap restored");
+        assert_eq!(b["system_prompt"], "frozen");
+        assert_eq!(b["system_hash"], "abc");
+    }
+    #[test]
+    fn session_usage_summary_accumulates_provider_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "aacode_usage_sum_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sm = SessionManager::new(&dir);
+        sm.create_session("task", None).unwrap();
+        sm.record_usage(&serde_json::json!({
+            "uncached_input": 100,
+            "cache_read": 900,
+            "cache_write": 0,
+            "output": 50,
+            "reasoning": 5,
+            "cost": 0.001,
+            "context_tokens": 650000,
+            "context_window": 1000000,
+            "context_trigger_tokens": 800000
+        }))
+        .unwrap();
+        let s = sm.list_sessions().into_iter().next().unwrap();
+        assert_eq!(s.calls, 1);
+        assert_eq!(s.uncached_input_tokens, 100);
+        assert_eq!(s.cache_read_tokens, 900);
+        assert_eq!(s.output_tokens, 50);
+        assert!((s.cache_hit_rate - 0.9).abs() < 1e-9);
+        assert!((s.cost - 0.001).abs() < 1e-12);
+        assert_eq!(s.total_usage_tokens, 1050);
+        assert_eq!(s.context_tokens, 650000);
+        assert_eq!(s.context_window, 1000000);
+        assert_eq!(s.context_trigger_tokens, 800000);
+    }
+
+    #[test]
+    fn session_usage_accumulates_and_persists_across_reload() {
+        let dir = tmp_project();
+        let mut sm = SessionManager::new(&dir);
+        let sid = sm.create_session("task", None).unwrap();
+        sm.record_usage(&serde_json::json!({
+            "uncached_input": 100, "cache_read": 900, "output": 10, "cost": 0.01
+        }))
+        .unwrap();
+        sm.record_usage(&serde_json::json!({
+            "uncached_input": 100, "cache_read": 100, "cache_write": 50,
+            "output": 20, "reasoning": 3, "cost": 0.02
+        }))
+        .unwrap();
+        let loaded = SessionManager::new(&dir);
+        let s = loaded
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.session_id == sid)
+            .unwrap();
+        assert_eq!(s.calls, 2);
+        assert_eq!(s.uncached_input_tokens, 200);
+        assert_eq!(s.cache_read_tokens, 1000);
+        assert_eq!(s.cache_write_tokens, 50);
+        assert_eq!(s.output_tokens, 30);
+        assert_eq!(s.reasoning_tokens, 3);
+        assert_eq!(s.total_usage_tokens, 1280);
+        assert!((s.cost - 0.03).abs() < 1e-12);
+        assert!((s.cache_hit_rate - (1000.0 / 1200.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_usage_without_session_is_noop() {
+        let dir = tmp_project();
+        let mut sm = SessionManager::new(&dir);
+        assert!(sm
+            .record_usage(&serde_json::json!({"cache_read": 1}))
+            .is_ok());
+        assert!(sm.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn record_usage_tolerates_missing_and_nonnumeric_fields() {
+        let dir = tmp_project();
+        let mut sm = SessionManager::new(&dir);
+        sm.create_session("task", None).unwrap();
+        sm.record_usage(&serde_json::json!({
+            "cache_read": "not-a-number",
+            "cost": null
+        }))
+        .unwrap();
+        let s = sm.list_sessions().into_iter().next().unwrap();
+        assert_eq!(s.calls, 1, "a call is counted even with missing usage");
+        assert_eq!(s.cache_read_tokens, 0);
+        assert_eq!(s.cost, 0.0);
+        assert_eq!(s.cache_hit_rate, 0.0);
+    }
+
+    #[test]
+    fn estimator_handles_mixed_cjk_and_punctuation() {
+        assert_eq!(estimate_tokens(""), 0);
+        let ascii = estimate_tokens("hello world");
+        let cjk = estimate_tokens("你好，世界");
+        let mixed = estimate_tokens("hello 你好");
+        assert!(ascii > 0 && cjk > ascii && mixed >= ascii);
+        assert!(cjk <= estimate_tokens("你好世界你好世界"));
+    }
+
+    #[test]
+    fn host_append_preserves_bootstrap_and_checkpoint() {
+        let dir = tmp_project();
+        let mut sm = SessionManager::new(&dir);
+        let sid = sm.create_session("task", None).unwrap();
+        sm.set_bootstrap(Some(serde_json::json!({
+            "system_prompt": "frozen",
+            "system_hash": "hash"
+        })))
+        .unwrap();
+        sm.set_context_checkpoint(Some(serde_json::json!({
+            "cutoff_index": 1,
+            "stub": "STUB",
+            "session_id": sid,
+            "created_at": "now",
+            "keep_tokens": 100
+        })))
+        .unwrap();
+        sm.append_session_messages(
+            &sid,
+            vec![SessionMessage::from_chat(&ChatMessage::assistant(
+                "appended",
+            ))],
+        )
+        .unwrap();
+
+        let mut loaded = SessionManager::new(&dir);
+        assert!(loaded.switch_session(&sid).unwrap());
+        assert_eq!(loaded.bootstrap().unwrap()["system_prompt"], "frozen");
+        let cp = loaded.context_checkpoint().expect("checkpoint preserved");
+        assert_eq!(cp["cutoff_index"], 1);
+        assert!(loaded.messages.iter().any(|m| m.content == "appended"));
+    }
+
+    #[test]
+    fn old_index_missing_required_summary_fields_still_loads() {
+        let dir = tmp_project();
+        let sessions = dir.join(".aacode").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("sessions_index.json"),
+            r#"{"s1":{"total_messages":1,"total_tokens":2}}"#,
+        )
+        .unwrap();
+        let sm = SessionManager::new(&dir);
+        let s = sm
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.session_id == "s1")
+            .expect("legacy index entry must survive");
+        assert_eq!(s.total_messages, 1);
+        assert_eq!(s.status, "active");
+    }
+
+    #[test]
+    fn old_index_string_and_null_counters_and_bad_entries_do_not_drop_index() {
+        let dir = tmp_project();
+        let sessions = dir.join(".aacode").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("sessions_index.json"),
+            r#"{"good":{"session_id":"good","created_at":1700000000,"last_activity":1700000001,"total_messages":"3","total_tokens":null,"calls":"2"},"bad":"not-an-object"}"#,
+        )
+        .unwrap();
+        let sm = SessionManager::new(&dir);
+        let sessions = sm.list_sessions();
+        let good = sessions
+            .iter()
+            .find(|s| s.session_id == "good")
+            .expect("good entry must survive a malformed sibling");
+        assert_eq!(good.total_messages, 3);
+        assert_eq!(good.total_tokens, 0);
+        assert_eq!(good.calls, 2);
+        assert!(sessions.iter().all(|s| s.session_id != "bad"));
+    }
+
+    #[test]
+    fn malformed_legacy_messages_are_skipped_individually() {
+        let dir = tmp_project();
+        let sessions = dir.join(".aacode").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("legacy.json"),
+            r#"{"session_id":"legacy","messages":[{"content":"no role"},{"role":"user","content":"hi"},{"role":"assistant","content":42},{"role":"assistant","content":"ok"}]}"#,
+        )
+        .unwrap();
+        let mut sm = SessionManager::new(&dir);
+        assert!(sm.switch_session("legacy").unwrap());
+        assert_eq!(sm.messages.len(), 2);
+        assert_eq!(sm.messages[0].content, "hi");
+        assert_eq!(sm.messages[1].content, "ok");
+    }
+
+    #[test]
+    fn old_null_message_tokens_load_as_zero() {
+        let dir = tmp_project();
+        let sessions = dir.join(".aacode").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("legacy.json"),
+            r#"{"session_id":"legacy","messages":[{"role":"user","content":"hi","tokens":null}]}"#,
+        )
+        .unwrap();
+        let mut sm = SessionManager::new(&dir);
+        assert!(sm.switch_session("legacy").unwrap());
+        assert_eq!(sm.messages[0].tokens, 0);
+    }
+
+    #[test]
+    fn old_numeric_session_timestamps_still_load() {
+        let dir = tmp_project();
+        let sessions = dir.join(".aacode").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("sessions_index.json"),
+            r#"{"s1":{"session_id":"s1","created_at":1700000000,"last_activity":1700000100,"total_messages":1}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join("s1.json"),
+            r#"{"session_id":"s1","created_at":1700000000,"messages":[]}"#,
+        )
+        .unwrap();
+        let sm = SessionManager::new(&dir);
+        let s = sm.list_sessions().into_iter().next().unwrap();
+        assert_eq!(s.created_at, "1700000000");
+        assert_eq!(s.last_activity, "1700000100");
+        let mut loaded = SessionManager::new(&dir);
+        assert!(loaded.switch_session("s1").unwrap());
+    }
+
+    #[test]
+    fn old_session_file_missing_optional_fields_still_loads() {
+        let dir = tmp_project();
+        let sessions = dir.join(".aacode").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("legacy.json"),
+            r#"{"session_id":"legacy","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        let mut sm = SessionManager::new(&dir);
+        assert!(sm.switch_session("legacy").unwrap());
+        assert_eq!(sm.messages.len(), 1);
+        assert_eq!(sm.messages[0].content, "hi");
+    }
+
+    #[test]
+    fn bootstrap_can_be_cleared() {
+        let dir = tmp_project();
+        let mut sm = SessionManager::new(&dir);
+        let sid = sm.create_session("task", None).unwrap();
+        sm.set_bootstrap(Some(serde_json::json!({"system_prompt": "frozen"})))
+            .unwrap();
+        assert!(sm.bootstrap().is_some());
+        sm.set_bootstrap(None).unwrap();
+        assert!(sm.bootstrap().is_none());
+        let mut loaded = SessionManager::new(&dir);
+        assert!(loaded.switch_session(&sid).unwrap());
+        assert!(loaded.bootstrap().is_none());
     }
 }

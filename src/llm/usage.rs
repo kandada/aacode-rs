@@ -148,6 +148,37 @@ mod tests {
     }
 
     #[test]
+    fn openai_null_and_string_cache_fields_are_safe() {
+        let u = normalize_openai_usage(&json!({
+            "prompt_tokens": "100",
+            "completion_tokens": null,
+            "prompt_cache_hit_tokens": "70",
+            "prompt_cache_miss_tokens": null
+        }))
+        .unwrap();
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.cache_read_tokens, 70);
+        assert_eq!(u.cache_miss_tokens, 30);
+        assert!((u.cache_hit_rate() - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn anthropic_cache_write_only_is_accounted_for() {
+        let u = normalize_anthropic_usage(&json!({
+            "input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 40,
+            "output_tokens": 5
+        }))
+        .unwrap();
+        assert_eq!(u.input_tokens, 40);
+        assert_eq!(u.cache_write_tokens, 40);
+        assert_eq!(u.cache_hit_rate(), 0.0);
+        assert_eq!(u.total_tokens, 45);
+    }
+
+    #[test]
     fn empty_usage_is_none() {
         assert!(normalize_openai_usage(&json!({})).is_none());
         assert!(normalize_anthropic_usage(&json!({})).is_none());

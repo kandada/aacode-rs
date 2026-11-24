@@ -80,6 +80,17 @@ pub trait EventSink: Send + Sync {
         self.emit_line(&json!({"type": "start", "task": task}).to_string());
     }
 
+    /// Emit a usage/context snapshot after each model call. Additive event:
+    /// old hosts ignore unknown types; new hosts can refresh the live usage
+    /// pill without waiting for the task to finish.
+    fn usage(&self, event: &Value) {
+        let mut snapshot = event.clone();
+        if let Some(obj) = snapshot.as_object_mut() {
+            obj.insert("type".into(), Value::String("usage".into()));
+        }
+        self.emit_line(&snapshot.to_string());
+    }
+
     fn session(&self, event: &str, session_id: &str) {
         self.emit_line(&json!({"type": event, "session_id": session_id}).to_string());
     }
@@ -396,6 +407,14 @@ impl EventSink for CliSink {
         } else {
             self.inner
                 .emit_line(&json!({"type": "start", "task": task}).to_string());
+        }
+    }
+
+    fn usage(&self, event: &Value) {
+        // TTY mode is human-facing; live usage is already visible in hosts
+        // that opt into the pipe protocol. Do not print raw JSON to CLI.
+        if !self.tty {
+            self.inner.usage(event);
         }
     }
 

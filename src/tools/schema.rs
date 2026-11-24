@@ -270,6 +270,34 @@ impl ToolSchema {
     }
 }
 
+/// Profile-stable tool discovery / proxy schemas. They are always advertised,
+/// independent of the selected tool profile.
+pub fn meta_schemas() -> Vec<ToolSchema> {
+    vec![
+        ToolSchema::new(
+            "list_tool_schemas",
+            "List tools in this session, including tools hidden by the current tool profile.",
+            vec![
+                ToolParameter::new("query", ParamType::String, false, "Filter on name/description.", &[]),
+                ToolParameter::new("active_only", ParamType::Boolean, false, "Only list active schemas.", &[]),
+            ],
+        ),
+        ToolSchema::new(
+            "get_tool_schema",
+            "Return the full JSON schema for any registered tool, including profile-hidden tools.",
+            vec![ToolParameter::new("name", ParamType::String, true, "Exact tool name.", &[])],
+        ),
+        ToolSchema::new(
+            "call_tool",
+            "Invoke a registered tool by name without changing the advertised tool schema set. Validate with get_tool_schema first.",
+            vec![
+                ToolParameter::new("name", ParamType::String, true, "Exact tool name.", &[]),
+                ToolParameter::new("arguments", ParamType::Object, false, "Arguments object.", &[]),
+            ],
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +425,33 @@ mod tests {
         let s = sample();
         let n = s.normalize_params(&json!({"command": "ls", "timeout": null}));
         assert!(s.validate(&n).is_ok());
+    }
+
+    #[test]
+    fn meta_schemas_cover_discovery_and_proxy_contract() {
+        let metas = meta_schemas();
+        let names: Vec<&str> = metas.iter().map(|m| m.name).collect();
+        assert_eq!(
+            names,
+            vec!["list_tool_schemas", "get_tool_schema", "call_tool"]
+        );
+        let get = metas.iter().find(|m| m.name == "get_tool_schema").unwrap();
+        assert!(get
+            .parameters
+            .iter()
+            .any(|p| p.name == "name" && p.required));
+        let call = metas.iter().find(|m| m.name == "call_tool").unwrap();
+        let args = call
+            .parameters
+            .iter()
+            .find(|p| p.name == "arguments")
+            .unwrap();
+        assert_eq!(args.ty, ParamType::Object);
+        assert!(!args.required);
+        assert!(call.validate(&json!({"name": "run_shell"})).is_ok());
+        assert!(call
+            .validate(&json!({"name": "run_shell", "arguments": {"command": "ls"}}))
+            .is_ok());
     }
 
     #[test]

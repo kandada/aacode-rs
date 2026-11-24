@@ -3,7 +3,7 @@
 
 [package]
 name = "aacode-rs"
-version = "1.8.15"
+version = "1.8.17"
 edition = "2021"
 description = "Rust port of the AACode ReAct coding agent, built on fastshell for mobile AI agents"
 license = "GPL-3.0-only"
@@ -34,7 +34,7 @@ browser = ["dep:fastbrowser"]
 pty = ["dep:nix"]
 
 [dependencies]
-fastshell = { path = "../fastshell", version = "0.3.4", features = ["git", "python-rustpython", "js-oxc"] }
+fastshell = { path = "../fastshell", version = "0.3.8", features = ["git", "python-rustpython", "js-oxc"] }
 fastbrowser = { version = "0.1.10", path = "../../fastbrowser_local/fastbrowser", features = ["engine-webview"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -188,6 +188,9 @@ pub fn render_retrieval_view(
     stub: &str,
 ) -> Vec<ChatMessage> {
     let mut cutoff = cutoff.min(messages.len());
+    if cutoff == 0 {
+        return messages.to_vec();
+    }
     // Never start a view with an orphaned tool result.
     while cutoff < messages.len() && messages[cutoff].role == "tool" {
         cutoff += 1;
@@ -350,19 +353,34 @@ impl RetrievalState {
         session_id: &str,
     ) -> (Vec<ChatMessage>, bool, usize, bool) {
         let trigger = cfg.retrieval_trigger_tokens.max(1);
-        let keep = cfg.retrieval_keep_tokens.max(1);
+        // A retained tail >= trigger cannot reduce the view; cap it below the
+        // trigger so cutoff advancement always makes progress.
+        let keep = cfg
+            .retrieval_keep_tokens
+            .min(trigger.saturating_sub(1))
+            .max(1);
         let recent = cfg.retrieval_keep_recent_user_messages.max(1);
         let min_rounds = cfg.retrieval_keep_min_rounds.max(1);
         let count = messages.len();
 
-        let cutoff = self
+        let stored_cutoff = self
             .checkpoint
             .as_ref()
             .map(|c| c.cutoff_index)
-            .unwrap_or(0)
-            .min(count);
+            .unwrap_or(0);
         let latest_user = real_user_indices(messages).last().copied();
         let mut changed = false;
+
+        // A restored/truncated session may have fewer messages than its old
+        // checkpoint. Never let a stale cutoff hide newly appended messages:
+        // reset it and rebuild the full view once.
+        let cutoff = if stored_cutoff > count {
+            self.checkpoint = None;
+            changed = true;
+            0
+        } else {
+            stored_cutoff
+        };
 
         // A restored checkpoint without a stub (e.g. legacy file) is rebuilt
         // once; it stays byte-stable afterwards until the cutoff advances.
@@ -469,6 +487,67 @@ mod tests {
     }
 
     #[test]
+    fn cutoff_at_tool_result_is_advanced_past_orphan() {
+        let messages = vec![
+            msg("system", "SYS"),
+            msg("user", "task"),
+            ChatMessage::assistant_with_tools(
+                "",
+                vec![crate::llm::types::ToolCall {
+                    id: "c1".into(),
+                    name: "run_shell".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("c1", "obs"),
+            msg("assistant", "answer"),
+        ];
+        let view = render_retrieval_view(&messages, 3, None, "STUB");
+        assert_eq!(view[0].role, "system");
+        assert_eq!(view[1].content, "STUB");
+        assert_eq!(view[2].role, "assistant");
+        assert_eq!(view[2].content, "answer");
+    }
+
+    #[test]
+    fn zero_cutoff_returns_original_messages_without_stub() {
+        let messages = vec![msg("system", "SYS"), msg("user", "task")];
+        assert_eq!(render_retrieval_view(&messages, 0, None, "STUB").len(), 2);
+        assert_eq!(
+            render_retrieval_view(&messages, 0, None, "STUB")[1].content,
+            "task"
+        );
+    }
+
+    #[test]
+    fn cutoff_keeps_original_system_and_latest_continuation() {
+        let messages = vec![
+            msg("system", "ORIGINAL SYSTEM"),
+            msg("user", "old task"),
+            ChatMessage::assistant_with_tools(
+                "",
+                vec![crate::llm::types::ToolCall {
+                    id: "c1".into(),
+                    name: "run_shell".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("c1", "old observation"),
+            ChatMessage::assistant("old answer"),
+            msg("user", "latest task"),
+            ChatMessage::tool_result("c2", "latest observation"),
+        ];
+        let view = render_retrieval_view(&messages, 4, Some(5), "CHECKPOINT");
+        assert_eq!(view[0].role, "system");
+        assert_eq!(view[0].content, "ORIGINAL SYSTEM");
+        assert_eq!(view[1].role, "user");
+        assert!(view[1].content.contains("CHECKPOINT"));
+        assert!(view.iter().any(|m| m.content == "latest task"));
+        assert!(view.iter().any(|m| m.content == "latest observation"));
+        assert_eq!(messages[0].content, "ORIGINAL SYSTEM");
+    }
+
+    #[test]
     fn view_starts_with_system_and_stub_no_orphan_tool() {
         let mut messages = vec![msg("system", "SYS")];
         for i in 0..10 {
@@ -543,6 +622,121 @@ mod tests {
         // No reduction → never.
         assert!(!should_advance(1000, 1000, 100_000));
         assert!(!should_advance(1000, 1200, 100_000));
+    }
+
+    #[test]
+    fn compacted_view_prefix_is_stable_when_history_is_appended() {
+        let project = std::env::temp_dir();
+        let mut messages = vec![msg("system", "SYS")];
+        for i in 0..40 {
+            messages.push(msg("user", &format!("task {i} {}", "x".repeat(500))));
+            messages.push(msg("assistant", "ok"));
+        }
+        let mut state = RetrievalState::default();
+        let (first, compacted, _, changed) =
+            state.model_view(&messages, &cfg(1000, 500), &project, "s1");
+        assert!(compacted && changed);
+        assert!(first.iter().any(|m| m.content.starts_with("task 39")));
+
+        messages.push(msg("user", "follow-up"));
+        messages.push(msg("assistant", "answer"));
+        let (second, _, _, changed2) = state.model_view(&messages, &cfg(1000, 500), &project, "s1");
+        assert!(!changed2);
+        assert!(second.len() >= first.len());
+        let sig = |m: &ChatMessage| {
+            (
+                m.role.clone(),
+                m.content.clone(),
+                m.tool_call_id.clone(),
+                m.tool_calls.as_ref().map(|t| t.len()),
+            )
+        };
+        let first_sig: Vec<_> = first.iter().map(sig).collect();
+        let second_sig: Vec<_> = second[..first.len()].iter().map(sig).collect();
+        assert_eq!(first_sig, second_sig, "prefix must be byte-stable");
+    }
+
+    #[test]
+    fn stale_checkpoint_beyond_message_count_resets_without_hiding_new_messages() {
+        let project = std::env::temp_dir();
+        let mut state = RetrievalState {
+            checkpoint: Some(ContextCheckpoint {
+                cutoff_index: 99,
+                stub: "OLD STUB".into(),
+                session_id: "s1".into(),
+                created_at: "old".into(),
+                keep_tokens: 10,
+            }),
+        };
+        let mut messages = vec![msg("system", "SYS"), msg("user", "first")];
+        let (view, compacted, _, changed) =
+            state.model_view(&messages, &cfg(100_000, 1000), &project, "s1");
+        assert!(changed, "stale checkpoint must be repaired");
+        assert!(!compacted || view.len() == messages.len());
+        assert!(view.iter().any(|m| m.content == "first"));
+        assert!(state.checkpoint.is_none());
+
+        // New history must be visible immediately, not hidden until 99 msgs.
+        messages.push(msg("user", "second"));
+        let (view2, _, _, _) = state.model_view(&messages, &cfg(100_000, 1000), &project, "s1");
+        assert!(view2.iter().any(|m| m.content == "second"));
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_stub_is_rebuilt_only_once() {
+        let project = std::env::temp_dir();
+        let mut state = RetrievalState {
+            checkpoint: Some(ContextCheckpoint {
+                cutoff_index: 2,
+                stub: String::new(),
+                session_id: "s1".into(),
+                created_at: "old".into(),
+                keep_tokens: 10,
+            }),
+        };
+        let messages = vec![
+            msg("system", "SYS"),
+            msg("user", "old"),
+            msg("assistant", "ok"),
+            msg("user", "new"),
+        ];
+        let (_, _, _, changed1) = state.model_view(&messages, &cfg(100_000, 1000), &project, "s1");
+        assert!(changed1);
+        assert!(!state.checkpoint.as_ref().unwrap().stub.is_empty());
+        let stub = state.checkpoint.as_ref().unwrap().stub.clone();
+        let (_, _, _, changed2) = state.model_view(&messages, &cfg(100_000, 1000), &project, "s1");
+        assert!(!changed2);
+        assert_eq!(state.checkpoint.as_ref().unwrap().stub, stub);
+    }
+
+    #[test]
+    fn cutoff_view_keeps_latest_user_and_tool_pairs() {
+        let mut messages = vec![msg("system", "SYS")];
+        for i in 0..8 {
+            messages.push(msg("user", &format!("task {i} {}", "x".repeat(200))));
+            messages.push(ChatMessage::tool_result(format!("c{i}"), "obs"));
+            messages.push(ChatMessage::assistant("ok"));
+        }
+        let (cutoff, latest) = compute_retrieval_cutoff(&messages, 0, 300, 1, 1);
+        assert!(latest.is_some());
+        let view = render_retrieval_view(&messages, cutoff, latest, "STUB");
+        assert_eq!(view[1].content, "STUB");
+        assert!(view.iter().any(|m| m.content.starts_with("task 7")));
+        assert_ne!(view[2].role, "tool");
+    }
+
+    #[test]
+    fn empty_and_system_only_histories_are_safe() {
+        let project = std::env::temp_dir();
+        let mut state = RetrievalState::default();
+        let (empty, _, tokens, changed) = state.model_view(&[], &cfg(10, 10), &project, "s1");
+        assert!(empty.is_empty());
+        assert_eq!(tokens, 0);
+        assert!(!changed);
+
+        let system_only = vec![msg("system", "SYS")];
+        let (view, _, _, _) = state.model_view(&system_only, &cfg(10, 10), &project, "s1");
+        assert_eq!(view.len(), 1);
     }
 
     #[test]

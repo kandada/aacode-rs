@@ -81,6 +81,7 @@ fn openai_cfg(key: &str, url: &str, model: &str) -> AgentConfig {
             temperature: 0.1,
             multimodal: false,
             request_timeout_secs: Some(120),
+            ..Default::default()
         },
         max_iterations: 10,
         ..Default::default()
@@ -98,6 +99,7 @@ fn anthropic_cfg(key: &str, url: &str, model: &str) -> AgentConfig {
             temperature: 0.1,
             multimodal: false,
             request_timeout_secs: Some(120),
+            ..Default::default()
         },
         max_iterations: 10,
         ..Default::default()
@@ -887,6 +889,7 @@ async fn moonshot_understand_image_single() {
         temperature: 0.1,
         multimodal: true,
         request_timeout_secs: Some(60),
+        ..Default::default()
     });
 
     let rt = AgentRuntime::init(cfg, proj).expect("init");
@@ -936,6 +939,7 @@ async fn moonshot_understand_image_multiple() {
         temperature: 0.1,
         multimodal: true,
         request_timeout_secs: Some(60),
+        ..Default::default()
     });
 
     let rt = AgentRuntime::init(cfg, proj).expect("init");
@@ -1010,6 +1014,7 @@ async fn minimax_understand_image_via_anthropic_gateway() {
         temperature: 0.1,
         multimodal: true,
         request_timeout_secs: Some(60),
+        ..Default::default()
     });
 
     let rt = AgentRuntime::init(cfg, proj).expect("init");

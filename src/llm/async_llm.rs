@@ -260,6 +260,9 @@ impl LlmClient for OpenAiAsyncClient {
         emitter: &dyn EventSink,
         cancel: &AtomicBool,
     ) -> Result<LlmResponse> {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AacodeError::Cancelled);
+        }
         let mut body = self.build_body(messages, tools, true);
         let stream = match self.post_stream(&body).await {
             Ok(s) => s,
@@ -348,7 +351,9 @@ impl AnthropicAsyncClient {
             }
         }
         for m in messages {
-            if m.role != "tool" {
+            // System messages live in the top-level `system` field and must
+            // not split a tool_use -> tool_result group.
+            if m.role != "tool" && m.role != "system" {
                 flush(&mut out, &mut pending);
             }
             match m.role.as_str() {
@@ -439,6 +444,9 @@ impl LlmClient for AnthropicAsyncClient {
         emitter: &dyn EventSink,
         cancel: &AtomicBool,
     ) -> Result<LlmResponse> {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AacodeError::Cancelled);
+        }
         // ── thinking 模式状态机 ──
         // 乐观尝试 adaptive（无 budget_tokens），失败则降级到 enabled（带 budget_tokens），
         // 再失败则不带 thinking。命中后该模型会话内不再尝试更高优先级模式。
@@ -580,6 +588,7 @@ pub fn build_client_async(model: &ModelConfig) -> Box<dyn LlmClient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::types::ToolCall;
 
     fn model_config(name: &str, gateway: Gateway) -> ModelConfig {
         ModelConfig {
@@ -646,6 +655,44 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async { client.validate().await });
         assert!(result.is_err() || result.is_ok());
+    }
+
+    #[test]
+    fn anthropic_build_messages_groups_parallel_tool_results() {
+        let msgs = vec![
+            ChatMessage::system("SYS1"),
+            ChatMessage::system("SYS2"),
+            ChatMessage::user("run both"),
+            ChatMessage::assistant_with_tools(
+                "",
+                vec![
+                    ToolCall {
+                        id: "call_a".into(),
+                        name: "tool_a".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "call_b".into(),
+                        name: "tool_b".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            ),
+            ChatMessage::tool_result("call_a", "A"),
+            ChatMessage::system("NOTICE"),
+            ChatMessage::tool_result("call_b", "B"),
+        ];
+        let (system, out) = AnthropicAsyncClient::build_messages(&msgs);
+        assert_eq!(system, "SYS1\n\nSYS2\n\nNOTICE");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "user");
+        let results = out[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["type"], "tool_result");
+        assert_eq!(results[0]["tool_use_id"], "call_a");
+        assert_eq!(results[1]["tool_use_id"], "call_b");
     }
 
     #[tokio::test]

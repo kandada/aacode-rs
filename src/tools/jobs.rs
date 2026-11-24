@@ -22,9 +22,9 @@ use super::schema::{ParamType, ToolParameter, ToolSchema};
 use crate::error::{AacodeError, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 /// Collect cap (chars per stream) unless `full_output` is set.
@@ -32,12 +32,37 @@ pub const DEFAULT_COLLECT_CHARS: usize = 20_000;
 /// Maximum number of retained jobs (running + recently finished).
 pub const MAX_JOBS: usize = 8;
 
+/// Shared per-project registries. The agent builds a fresh tool registry for
+/// each execute(), so jobs must outlive one registry; host FFI reads the same
+/// map for job panels and cancellation.
+static SHARED_STORES: OnceLock<Mutex<HashMap<String, Arc<JobStore>>>> = OnceLock::new();
+
+pub fn store_for_project(project: &Path) -> Arc<JobStore> {
+    let stores = SHARED_STORES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = std::fs::canonicalize(project)
+        .unwrap_or_else(|_| project.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let mut map = stores.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key)
+        .or_insert_with(|| {
+            Arc::new(JobStore::with_root(
+                MAX_JOBS,
+                project.join(".aacode").join("jobs"),
+            ))
+        })
+        .clone()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
     Running,
     Completed,
     Failed,
     Cancelled,
+    /// The host process disappeared before this job settled (common on mobile
+    /// when the OS suspends or kills the app). The command is not reattached.
+    Interrupted,
 }
 
 impl JobStatus {
@@ -47,17 +72,23 @@ impl JobStatus {
             JobStatus::Completed => "completed",
             JobStatus::Failed => "failed",
             JobStatus::Cancelled => "cancelled",
+            JobStatus::Interrupted => "interrupted",
         }
     }
 }
 
 struct JobRecord {
     status: JobStatus,
+    command: String,
+    cwd: String,
     stdout: String,
     stderr: String,
     exit_code: i32,
     started: Instant,
+    started_at: String,
     finished: Option<Instant>,
+    finished_at: Option<String>,
+    log_path: Option<String>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -65,9 +96,14 @@ struct JobRecord {
 pub struct JobSnapshot {
     pub id: String,
     pub status: &'static str,
+    pub command: String,
+    pub cwd: String,
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub log_path: Option<String>,
     pub elapsed_ms: u128,
     pub cancel_requested: bool,
 }
@@ -76,6 +112,7 @@ pub struct JobSnapshot {
 pub struct JobStore {
     inner: Arc<Mutex<HashMap<String, JobRecord>>>,
     max_jobs: usize,
+    persist_dir: Option<PathBuf>,
 }
 
 impl JobStore {
@@ -83,6 +120,148 @@ impl JobStore {
         JobStore {
             inner: Arc::new(Mutex::new(HashMap::new())),
             max_jobs: max_jobs.max(1),
+            persist_dir: None,
+        }
+    }
+
+    /// Process-local registry plus a durable index/output directory. Finished
+    /// jobs survive a restart; a job that was running at shutdown is marked
+    /// failed because cargo cannot reattach to an unsupervised process.
+    pub fn with_root(max_jobs: usize, root: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&root);
+        let store = JobStore {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            max_jobs: max_jobs.max(1),
+            persist_dir: Some(root.clone()),
+        };
+        store.load_persisted(&root);
+        store
+    }
+
+    fn load_persisted(&self, root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        let mut jobs = self.inner.lock().unwrap();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let Some(id) = value.get("job_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let status = value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed");
+            let (status, exit_code) = if status == "running" {
+                (JobStatus::Interrupted, -1)
+            } else {
+                (
+                    match status {
+                        "completed" => JobStatus::Completed,
+                        "cancelled" => JobStatus::Cancelled,
+                        "interrupted" => JobStatus::Interrupted,
+                        _ => JobStatus::Failed,
+                    },
+                    value
+                        .get("exit_code")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1) as i32,
+                )
+            };
+            jobs.insert(
+                id.to_string(),
+                JobRecord {
+                    status,
+                    command: value
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    cwd: value
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    stdout: value
+                        .get("stdout")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    stderr: value
+                        .get("stderr")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    exit_code,
+                    started: Instant::now(),
+                    started_at: value
+                        .get("started_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    finished: Some(Instant::now()),
+                    finished_at: value
+                        .get("finished_at")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    log_path: value
+                        .get("log_path")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+    }
+
+    fn persist(&self, id: &str, record: &JobRecord) {
+        let Some(root) = self.persist_dir.as_ref() else {
+            return;
+        };
+        let value = json!({
+            "job_id": id,
+            "status": record.status.as_str(),
+            "command": record.command,
+            "cwd": record.cwd,
+            "stdout": record.stdout,
+            "stderr": record.stderr,
+            "exit_code": record.exit_code,
+            "started_at": record.started_at,
+            "finished_at": record.finished_at,
+            "log_path": record.log_path,
+        });
+        let _ = std::fs::write(root.join(format!("{id}.json")), value.to_string());
+    }
+
+    fn emit_event(&self, kind: &str, id: &str, status: &str) {
+        let Some(root) = self.persist_dir.as_ref() else {
+            return;
+        };
+        let path = root.join("events.jsonl");
+        let line = json!({
+            "type": kind,
+            "job_id": id,
+            "status": status,
+            "ts": crate::session::now_iso(),
+        })
+        .to_string();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.write_all(b"\n");
         }
     }
 
@@ -117,23 +296,44 @@ impl JobStore {
                 id.clone(),
                 JobRecord {
                     status: JobStatus::Running,
+                    command: command.clone(),
+                    cwd: cwd.to_string_lossy().to_string(),
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: i32::MIN,
                     started: Instant::now(),
+                    started_at: crate::session::now_iso(),
                     finished: None,
+                    finished_at: None,
+                    log_path: self
+                        .persist_dir
+                        .as_ref()
+                        .map(|root| root.join(format!("{id}.log")).to_string_lossy().to_string()),
                     cancel: cancel.clone(),
                 },
             );
+            if let Some(record) = jobs.get(&id) {
+                self.persist(&id, record);
+            }
+            self.emit_event("job_started", &id, "running");
         }
 
         let store = self.inner.clone();
+        let persist_dir = self.persist_dir.clone();
+        let cancel_for_run = cancel.clone();
         let id2 = id.clone();
         tokio::spawn(async move {
             let cmd2 = command.clone();
             let cwd2 = cwd.clone();
             let res = tokio::task::spawn_blocking(move || {
-                backend.run(&cmd2, None, timeout_secs, idle_timeout_secs, &cwd2)
+                backend.run_cancellable(
+                    &cmd2,
+                    None,
+                    timeout_secs,
+                    idle_timeout_secs,
+                    &cwd2,
+                    cancel_for_run,
+                )
             })
             .await;
             let mut jobs = store.lock().unwrap();
@@ -162,6 +362,49 @@ impl JobStore {
                     }
                 }
                 record.finished = Some(Instant::now());
+                record.finished_at = Some(crate::session::now_iso());
+                if let Some(root) = persist_dir.as_ref() {
+                    let value = json!({
+                        "job_id": id2,
+                        "status": record.status.as_str(),
+                        "command": record.command,
+                        "cwd": record.cwd,
+                        "stdout": record.stdout,
+                        "stderr": record.stderr,
+                        "exit_code": record.exit_code,
+                        "started_at": record.started_at,
+                        "finished_at": record.finished_at,
+                        "log_path": record.log_path,
+                    });
+                    let _ = std::fs::write(root.join(format!("{id2}.json")), value.to_string());
+                    if let Some(log) = record.log_path.as_ref() {
+                        let _ = std::fs::write(log, format!("{}{}", record.stdout, record.stderr));
+                    }
+                    let kind = match record.status {
+                        JobStatus::Completed => "job_finished",
+                        JobStatus::Failed => "job_failed",
+                        JobStatus::Cancelled => "job_cancelled",
+                        JobStatus::Interrupted => "job_interrupted",
+                        JobStatus::Running => "job_updated",
+                    };
+                    let status = record.status.as_str();
+                    let event = json!({
+                        "type": kind, "job_id": id2, "status": status,
+                        "ts": crate::session::now_iso(),
+                    })
+                    .to_string();
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(root.join("events.jsonl"))
+                    {
+                        use std::io::Write;
+                        let _ = file.write_all(event.as_bytes());
+                        let _ = file.write_all(b"\n");
+                    }
+                    drop(jobs);
+                    return;
+                }
             }
         });
         Ok(id)
@@ -174,12 +417,40 @@ impl JobStore {
 
     pub fn cancel(&self, id: &str) -> bool {
         let jobs = self.inner.lock().unwrap();
-        match jobs.get(id) {
+        let found = match jobs.get(id) {
             Some(r) => {
                 r.cancel.store(true, Ordering::SeqCst);
                 true
             }
             None => false,
+        };
+        drop(jobs);
+        if found {
+            self.emit_event("job_cancel_requested", id, "running");
+        }
+        found
+    }
+
+    /// Drop a finished job from the registry (used when a foreground call
+    /// consumed the result and no job handle was returned to the model).
+    pub fn remove(&self, id: &str) {
+        let mut jobs = self.inner.lock().unwrap();
+        jobs.remove(id);
+        if let Some(root) = self.persist_dir.as_ref() {
+            let _ = std::fs::remove_file(root.join(format!("{id}.json")));
+        }
+    }
+
+    /// Wait for a job to settle, polling at a short interval. Returns the
+    /// latest snapshot when the deadline expires.
+    pub async fn wait_for(&self, id: &str, wait_secs: u64) -> Option<JobSnapshot> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(wait_secs.max(1));
+        loop {
+            let snapshot = self.status(id)?;
+            if snapshot.status != "running" || Instant::now() >= deadline {
+                return Some(snapshot);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -194,9 +465,14 @@ impl JobStore {
         JobSnapshot {
             id: id.to_string(),
             status: r.status.as_str(),
+            command: r.command.clone(),
+            cwd: r.cwd.clone(),
             stdout: r.stdout.clone(),
             stderr: r.stderr.clone(),
             exit_code: r.exit_code,
+            started_at: r.started_at.clone(),
+            finished_at: r.finished_at.clone(),
+            log_path: r.log_path.clone(),
             elapsed_ms: r
                 .finished
                 .unwrap_or_else(Instant::now)
@@ -312,7 +588,12 @@ impl Tool for JobStatusTool {
             Some(s) => Ok(json!({
                 "job_id": s.id,
                 "status": s.status,
+                "command": s.command,
+                "cwd": s.cwd,
                 "exit_code": if s.exit_code == i32::MIN { Value::Null } else { json!(s.exit_code) },
+                "started_at": s.started_at,
+                "finished_at": s.finished_at,
+                "log_path": s.log_path,
                 "elapsed_ms": s.elapsed_ms,
                 "cancel_requested": s.cancel_requested,
             })
@@ -351,6 +632,20 @@ impl Tool for JobCollectTool {
                     &["max_output"],
                 ),
                 ToolParameter::new(
+                    "wait",
+                    ParamType::Boolean,
+                    false,
+                    "Wait for a running job instead of returning immediately.",
+                    &["block"],
+                ),
+                ToolParameter::new(
+                    "wait_timeout",
+                    ParamType::Integer,
+                    false,
+                    "Seconds to wait when wait=true (default 30, max 600).",
+                    &["timeout", "timeout_ms"],
+                ),
+                ToolParameter::new(
                     "full_output",
                     ParamType::Boolean,
                     false,
@@ -372,7 +667,19 @@ impl Tool for JobCollectTool {
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_COLLECT_CHARS);
-        let Some(s) = self.store.status(id) else {
+        let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+        let wait_secs = args
+            .get("wait_timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .min(600)
+            .max(1);
+        let snapshot = if wait {
+            self.store.wait_for(id, wait_secs).await
+        } else {
+            self.store.status(id)
+        };
+        let Some(s) = snapshot else {
             return Err(AacodeError::Tool(format!("unknown job '{id}'")));
         };
         if s.status == "running" {
@@ -398,7 +705,12 @@ impl Tool for JobCollectTool {
         let mut out = json!({
             "job_id": s.id,
             "status": s.status,
+            "command": s.command,
+            "cwd": s.cwd,
             "exit_code": if s.exit_code == i32::MIN { Value::Null } else { json!(s.exit_code) },
+            "started_at": s.started_at,
+            "finished_at": s.finished_at,
+            "log_path": s.log_path,
             "elapsed_ms": s.elapsed_ms,
             "stdout": stdout,
             "stderr": stderr,
@@ -435,8 +747,8 @@ impl Tool for JobCancelTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "job_cancel",
-            "Request cancellation of a background job. This records intent; the process \
-             may keep running until it exits (no forced kill), so effects are not rolled back.",
+            "Cancel a background job. Native processes are killed cooperatively; \
+             backends without a kill handle can only record the request.",
             vec![ToolParameter::new(
                 "job_id",
                 ParamType::String,
@@ -480,7 +792,12 @@ impl Tool for JobListTool {
                 json!({
                     "job_id": s.id,
                     "status": s.status,
+                    "command": s.command,
+                    "cwd": s.cwd,
                     "exit_code": if s.exit_code == i32::MIN { Value::Null } else { json!(s.exit_code) },
+                    "started_at": s.started_at,
+                    "finished_at": s.finished_at,
+                    "log_path": s.log_path,
                     "elapsed_ms": s.elapsed_ms,
                     "cancel_requested": s.cancel_requested,
                 })
@@ -552,6 +869,153 @@ mod tests {
         assert_eq!(v["status"], "completed");
         assert!(v["stdout"].as_str().unwrap().contains("job-ok"));
         assert_eq!(v["available"], true);
+    }
+
+    #[tokio::test]
+    async fn completed_job_survives_restart() {
+        let dir = tmp();
+        let root = dir.join(".aacode").join("jobs");
+        let store = Arc::new(JobStore::with_root(MAX_JOBS, root.clone()));
+        let tool = JobStartTool {
+            backend: Arc::new(NativeShell::new()),
+            project_path: dir.clone(),
+            timeout_secs: 30,
+            idle_timeout_secs: 30,
+            store: store.clone(),
+        };
+        let out = tool
+            .call(
+                &json!({"command": "printf restart-ok"}),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        let id = serde_json::from_str::<Value>(&out).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_done(&store, &id).await;
+        drop(tool);
+        drop(store);
+
+        let restored = JobStore::with_root(MAX_JOBS, root);
+        let snapshot = restored.status(&id).expect("persisted job missing");
+        assert_eq!(snapshot.status, "completed");
+        assert!(snapshot.stdout.contains("restart-ok"));
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_native_job() {
+        let dir = tmp();
+        let store = Arc::new(JobStore::new(MAX_JOBS));
+        let tool = JobStartTool {
+            backend: Arc::new(NativeShell::new()),
+            project_path: dir,
+            timeout_secs: 30,
+            idle_timeout_secs: 0,
+            store: store.clone(),
+        };
+        let out = tool
+            .call(&json!({"command": "sleep 30"}), &AtomicBool::new(false))
+            .await
+            .unwrap();
+        let id = serde_json::from_str::<Value>(&out).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(store.cancel(&id));
+        let done = wait_done(&store, &id).await;
+        assert_eq!(done.status, "cancelled", "{done:?}");
+        assert_eq!(done.exit_code, 130);
+    }
+
+    #[test]
+    fn running_job_is_interrupted_after_host_restart() {
+        let dir = tmp();
+        let root = dir.join(".aacode").join("jobs");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("job_mobile.json"),
+            json!({
+                "job_id": "job_mobile",
+                "status": "running",
+                "command": "sleep 999",
+                "cwd": dir.to_string_lossy(),
+                "exit_code": -1,
+                "started_at": "100",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let restored = JobStore::with_root(MAX_JOBS, root);
+        let snapshot = restored.status("job_mobile").unwrap();
+        assert_eq!(snapshot.status, "interrupted");
+        assert_eq!(snapshot.command, "sleep 999");
+    }
+
+    #[tokio::test]
+    async fn job_events_and_log_are_persisted() {
+        let dir = tmp();
+        let root = dir.join(".aacode").join("jobs");
+        let store = Arc::new(JobStore::with_root(MAX_JOBS, root.clone()));
+        let tool = JobStartTool {
+            backend: Arc::new(NativeShell::new()),
+            project_path: dir,
+            timeout_secs: 30,
+            idle_timeout_secs: 0,
+            store: store.clone(),
+        };
+        let out = tool
+            .call(
+                &json!({"command": "printf event-ok"}),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        let id = serde_json::from_str::<Value>(&out).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let snapshot = wait_done(&store, &id).await;
+        assert_eq!(snapshot.status, "completed");
+        let log = snapshot.log_path.expect("log path");
+        assert!(std::fs::read_to_string(&log).unwrap().contains("event-ok"));
+        let events = std::fs::read_to_string(root.join("events.jsonl")).unwrap();
+        assert!(events.contains("job_started"));
+        assert!(events.contains("job_finished"));
+        let meta = root.join(format!("{id}.json"));
+        assert!(meta.exists());
+        store.remove(&id);
+        assert!(!meta.exists());
+    }
+
+    #[tokio::test]
+    async fn job_store_caps_and_unknown_cancel() {
+        let dir = tmp();
+        let store = Arc::new(JobStore::new(1));
+        let tool = JobStartTool {
+            backend: Arc::new(NativeShell::new()),
+            project_path: dir,
+            timeout_secs: 30,
+            idle_timeout_secs: 0,
+            store: store.clone(),
+        };
+        let first = tool
+            .call(&json!({"command": "sleep 30"}), &AtomicBool::new(false))
+            .await
+            .unwrap();
+        let id = serde_json::from_str::<Value>(&first).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = tool
+            .call(&json!({"command": "printf no"}), &AtomicBool::new(false))
+            .await;
+        assert!(second.is_err(), "max_jobs must reject a second job");
+        assert!(!store.cancel("job_does_not_exist"));
+        assert!(store.cancel(&id));
+        let done = wait_done(&store, &id).await;
+        assert_eq!(done.status, "cancelled");
     }
 
     #[tokio::test]

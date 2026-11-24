@@ -9,6 +9,7 @@
 //! stderr, command}`. Oversized output is archived under `.aacode/extracts/`.
 
 use super::backend::ShellBackend;
+use super::jobs::{JobSnapshot, JobStore};
 use super::registry::Tool;
 use super::schema::{ParamType, ToolParameter, ToolSchema};
 use crate::config::{DangerAction, SafetyConfig, UnknownAction};
@@ -36,6 +37,9 @@ pub struct ShellTool {
     default_timeout_secs: u64,
     default_idle_timeout_secs: u64,
     safety: SafetyConfig,
+    jobs: Option<Arc<JobStore>>,
+    background_timeout_secs: u64,
+    foreground_max_secs: u64,
 }
 
 impl ShellTool {
@@ -58,7 +62,24 @@ impl ShellTool {
             default_timeout_secs,
             default_idle_timeout_secs,
             safety,
+            jobs: None,
+            background_timeout_secs: 1_800,
+            foreground_max_secs: 600,
         }
+    }
+
+    /// Share the registry used by `job_*` tools so `run_shell` can return a
+    /// job id on foreground timeout and support explicit background runs.
+    pub fn with_jobs(
+        mut self,
+        jobs: Arc<JobStore>,
+        background_timeout_secs: u64,
+        foreground_max_secs: u64,
+    ) -> Self {
+        self.jobs = Some(jobs);
+        self.background_timeout_secs = background_timeout_secs.max(1);
+        self.foreground_max_secs = foreground_max_secs.max(1);
+        self
     }
 
     /// Archive a large string to `.aacode/extracts/` and return the path.
@@ -281,6 +302,14 @@ impl ShellTool {
     }
 }
 
+fn snapshot_to_cmd_output(s: JobSnapshot) -> super::backend::CmdOutput {
+    super::backend::CmdOutput {
+        stdout: s.stdout,
+        stderr: s.stderr,
+        exit_code: s.exit_code,
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for ShellTool {
     fn lane(&self) -> Option<&'static str> {
@@ -309,8 +338,15 @@ impl Tool for ShellTool {
                     "idle_timeout",
                     ParamType::Integer,
                     false,
-                    "Max seconds with no output before killing (idle timeout). Default: 30.",
+                    "Max seconds with no output before escalating (idle timeout). Default: 120.",
                     &["idle_time", "no_output_timeout"],
+                ),
+                ToolParameter::new(
+                    "background",
+                    ParamType::Boolean,
+                    false,
+                    "Run in the background and return a job id immediately. Use for builds, tests, downloads, or servers.",
+                    &["run_in_background", "async"],
                 ),
                 ToolParameter::new(
                     "stdin_input",
@@ -395,21 +431,73 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(self.default_idle_timeout_secs);
 
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let foreground_timeout = timeout.min(self.foreground_max_secs).max(1);
         let stdin_owned = stdin_input.map(|s| s.to_string());
         let backend = self.backend.clone();
         let cwd = self.cwd.clone();
         let command2 = command.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            backend.run(
-                &command2,
-                stdin_owned.as_deref(),
-                timeout,
-                idle_timeout,
-                &cwd,
-            )
-        })
-        .await
-        .map_err(|e| AacodeError::Other(format!("shell spawn: {e}")))?;
+        let use_jobs = self.jobs.is_some() && stdin_owned.is_none();
+        if background && stdin_owned.is_some() {
+            return Ok(json!({
+                "success": false,
+                "error": "background mode does not support stdin_input; use a foreground command or provide input from a file.",
+            })
+            .to_string());
+        }
+        let result = if use_jobs {
+            let store = self.jobs.as_ref().expect("job store checked");
+            let job_id = store
+                .start(
+                    backend,
+                    command2,
+                    cwd,
+                    self.background_timeout_secs,
+                    idle_timeout,
+                )
+                .map_err(AacodeError::Tool)?;
+            if background {
+                return Ok(json!({
+                    "success": true,
+                    "status": "running",
+                    "job_id": job_id,
+                    "hint": "Background job started. Use job_output/job_status; do not start a duplicate command.",
+                })
+                .to_string());
+            }
+            let snapshot = store.wait_for(&job_id, foreground_timeout).await;
+            match snapshot {
+                Some(s) if s.status != "running" => {
+                    store.remove(&job_id);
+                    snapshot_to_cmd_output(s)
+                }
+                _ => {
+                    return Ok(json!({
+                        "success": true,
+                        "status": "backgrounded",
+                        "job_id": job_id,
+                        "elapsed_ms": foreground_timeout * 1000,
+                        "hint": "The command exceeded its foreground wait and is still running. Continue other work and collect it with job_output/job_status; do not start a duplicate command.",
+                    })
+                    .to_string());
+                }
+            }
+        } else {
+            tokio::task::spawn_blocking(move || {
+                backend.run(
+                    &command2,
+                    stdin_owned.as_deref(),
+                    timeout,
+                    idle_timeout,
+                    &cwd,
+                )
+            })
+            .await
+            .map_err(|e| AacodeError::Other(format!("shell spawn: {e}")))?
+        };
 
         // Output budget: default caps keep huge outputs out of the context; the
         // full text is archived. `full_output=true` / `max_output=0` opts out.
@@ -472,14 +560,122 @@ impl Tool for ShellTool {
             "stdout": stdout_value,
             "stderr": stderr,
             "backend": self.backend.kind(),
+            "cwd": self
+                .backend
+                .logical_cwd()
+                .unwrap_or_else(|| self.cwd.display().to_string()),
+            "physical_cwd": self.cwd.display().to_string(),
         });
-        if result.exit_code == 124 {
-            out["hint"] = json!(
-                "command timed out — split it into smaller steps or add explicit per-command timeouts (e.g. `curl -m 20`)"
-            );
+        if result.exit_code != 0 {
+            let (kind, hint) = classify_shell_exit(result.exit_code, &command, &result.stderr);
+            out["error_kind"] = json!(kind);
+            out["hint"] = json!(hint);
+            if matches!(kind, "no_match" | "differences" | "condition_false") {
+                // These are useful results, not tool failures. Keep the raw
+                // returncode but let the model continue instead of retrying.
+                out["success"] = json!(true);
+                out["expected_nonzero"] = json!(true);
+            }
+        } else if result.stdout.trim().is_empty() && result.stderr.trim().is_empty() {
+            if let Some(hint) = empty_output_hint(&command) {
+                out["empty_output"] = json!(true);
+                out["hint"] = json!(hint);
+            }
         }
         Ok(out.to_string())
     }
+}
+
+/// Classify a non-zero shell exit without pretending every non-zero code is a
+/// tool bug (`grep`/`diff`/`test` use exit 1 as a normal result).
+pub(crate) fn classify_shell_exit(
+    exit_code: i32,
+    command: &str,
+    stderr: &str,
+) -> (&'static str, String) {
+    let lower = command.to_lowercase();
+    let stderr_lower = stderr.to_lowercase();
+    let has = |name: &str| {
+        lower.split_whitespace().any(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') == name
+        })
+    };
+    if stderr_lower.contains("traceback (most recent call last)") {
+        let hint = if stderr_lower.contains("keyerror") {
+            "Python KeyError: the requested field/key is missing; inspect the available keys first"
+        } else if stderr_lower.contains("modulenotfounderror")
+            || stderr_lower.contains("importerror")
+        {
+            "Python import failed; the module is unavailable in this sandbox"
+        } else if stderr_lower.contains("filenotfounderror") {
+            "Python file not found; verify the path or download result"
+        } else if stderr_lower.contains("syntaxerror") {
+            "Python syntax error; fix the script before retrying"
+        } else {
+            "Python raised an exception; inspect the traceback before retrying"
+        };
+        return ("python_exception", hint.to_string());
+    }
+    if has("curl") && !lower.contains("-ss") && lower.contains("-s") && stderr.trim().is_empty() {
+        return (
+            "network_connect",
+            "curl used -s and suppressed the error; retry with -sS to see the real network error"
+                .into(),
+        );
+    }
+    if (lower.contains(";") || lower.contains("&&") || lower.contains("||"))
+        && (stderr_lower.contains("not found") || stderr_lower.contains("no such file"))
+    {
+        return (
+            "command_chain",
+            "a later command failed; an earlier command in the chain may have failed first. Use && for dependent steps and check the earlier exit code.".into(),
+        );
+    }
+    match exit_code {
+        124 => ("timeout", "command timed out; split it into smaller steps or increase timeout".into()),
+        130 => ("cancelled", "command was cancelled".into()),
+        126 => ("permission_denied", "command is not executable or permission was denied".into()),
+        127 => ("command_not_found", "command was not found; check the command name/path".into()),
+        6 if has("curl") => ("dns", "curl could not resolve the host; check DNS/network".into()),
+        7 if has("curl") => ("network_connect", "curl could not connect to the host; check network/reachability".into()),
+        28 if has("curl") || has("wget") => ("timeout", "network request timed out".into()),
+        22 if has("curl") => ("http_status", "curl received an HTTP error status; inspect the URL/server response".into()),
+        1 if has("grep") || has("egrep") || has("fgrep") || has("rg") => (
+            "no_match",
+            "no matching lines were found (grep/rg exit 1 is a normal result)".into(),
+        ),
+        1 if has("diff") => ("differences", "files differ (diff exit 1 is a normal result)".into()),
+        1 if has("test") || has("[") => ("condition_false", "test condition evaluated to false".into()),
+        _ if stderr.trim().is_empty() => (
+            "exit_nonzero",
+            format!("command exited with code {exit_code} but wrote no stderr; inspect stdout and the command"),
+        ),
+        _ => ("command_failed", "command failed; inspect stderr and exit code".into()),
+    }
+}
+
+/// Explain a successful command that printed nothing because Windows cmd.exe
+/// mangles a multi-line `python -c` / `node -e` snippet. The model should write
+/// a temporary script instead of guessing what happened.
+pub(crate) fn empty_output_hint(command: &str) -> Option<&'static str> {
+    if !cfg!(target_os = "windows") || !command.contains('\n') {
+        return None;
+    }
+    let lower = command.to_lowercase();
+    let interpreters = [
+        "python -c",
+        "python3 -c",
+        "py -c",
+        "node -e",
+        "perl -e",
+        "ruby -e",
+    ];
+    if !interpreters.iter().any(|token| lower.contains(token)) {
+        return None;
+    }
+    Some(
+        "Command exited 0 but printed nothing. Multi-line code passed to python -c / node -e is unreliable in cmd.exe; write a temporary script file and run it instead.",
+    )
 }
 
 /// Does this decoded stdout look like binary (NUL bytes / replacement chars /
@@ -491,12 +687,15 @@ pub(crate) fn is_binary_text(s: &str) -> bool {
     if s.contains('\0') {
         return true;
     }
-    let total = s.chars().count();
-    let weird = s
+    let total = s.chars().count().max(1);
+    let replacement = s.chars().filter(|c| *c == '\u{FFFD}').count();
+    let controls = s
         .chars()
-        .filter(|c| *c == '\u{FFFD}' || (*c < ' ' && *c != '\n' && *c != '\r' && *c != '\t'))
+        .filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t')
         .count();
-    weird * 100 / total.max(1) >= 2
+    // `cat -A` and similar diagnostics contain a few control glyphs but are
+    // still useful text. Only archive when bad characters dominate.
+    replacement * 100 / total >= 5 || controls * 100 / total >= 10
 }
 
 /// Persist a binary stdout blob and return a bounded, model-facing JSON value.
@@ -507,6 +706,17 @@ pub(crate) fn binary_output_json(
 ) -> Value {
     let bytes = text.as_bytes();
     let preview = crate::artifacts::hex_preview(bytes, 64);
+    let preview_text: String = text
+        .chars()
+        .take(240)
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
     match store.put_bytes(bytes, None, label) {
         Ok(r) => json!({
             "binary": true,
@@ -514,6 +724,7 @@ pub(crate) fn binary_output_json(
             "mime": r.mime,
             "artifact": r.path,
             "preview_hex": preview,
+            "preview_text": preview_text,
             "truncated": r.bytes > 64,
             "hint": "Output is binary; saved as an artifact. Inspect a bounded sample with run_shell (e.g. `xxd -l 64 <path>` / `od -N 64 -tx1 <path>` / `head -c 64 <path>`), or read the source file directly.",
         }),
@@ -521,6 +732,7 @@ pub(crate) fn binary_output_json(
             "binary": true,
             "bytes": bytes.len(),
             "preview_hex": preview,
+            "preview_text": preview_text,
             "truncated": bytes.len() > 64,
         }),
     }
@@ -529,6 +741,70 @@ pub(crate) fn binary_output_json(
 #[cfg(test)]
 mod tests {
     use super::super::backend::{FastshellBackend, NativeShell};
+
+    #[test]
+    fn a_few_control_chars_are_still_text() {
+        let mut s = "normal text\n".repeat(100);
+        s.push('\u{000e}');
+        assert!(!is_binary_text(&s));
+        let b = "text\u{000e}".repeat(20);
+        assert!(is_binary_text(&b));
+    }
+
+    #[test]
+    fn shell_exit_classification_is_tool_aware() {
+        assert_eq!(
+            classify_shell_exit(7, "curl -s https://x", "").0,
+            "network_connect"
+        );
+        assert_eq!(classify_shell_exit(1, "grep -q foo f", "").0, "no_match");
+        assert_eq!(classify_shell_exit(1, "diff a b", "").0, "differences");
+        assert_eq!(
+            classify_shell_exit(1, "test -f nope", "").0,
+            "condition_false"
+        );
+        assert_eq!(
+            classify_shell_exit(127, "nope-cmd", "").0,
+            "command_not_found"
+        );
+        assert_eq!(classify_shell_exit(9, "echo", "").0, "exit_nonzero");
+        assert_eq!(
+            classify_shell_exit(
+                1,
+                "python3 script.py",
+                "Traceback (most recent call last):\nKeyError: 'x'"
+            )
+            .0,
+            "python_exception"
+        );
+        assert_eq!(
+            classify_shell_exit(1, "curl -s https://x", "").0,
+            "network_connect"
+        );
+        assert_eq!(
+            classify_shell_exit(
+                1,
+                "curl -s https://x -o /tmp/a; head /tmp/a",
+                "head: /tmp/a: Not found"
+            )
+            .0,
+            "command_chain"
+        );
+    }
+
+    #[test]
+    fn empty_multiline_python_on_windows_has_hint() {
+        let command = "python -c \"\nprint(1)\n\"";
+        if cfg!(target_os = "windows") {
+            assert!(super::empty_output_hint(command)
+                .unwrap()
+                .contains("temporary script"));
+        } else {
+            assert!(super::empty_output_hint(command).is_none());
+        }
+        assert!(super::empty_output_hint("python -c \"print(1)\"").is_none());
+        assert!(super::empty_output_hint("mkdir foo").is_none());
+    }
 
     #[test]
     fn binary_stdout_detected_and_artifacted() {
@@ -571,9 +847,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_job_returns_id_and_quick_commands_stay_foreground() {
+        let dir = tmp();
+        let store = Arc::new(crate::tools::jobs::JobStore::new(4));
+        let tool = ShellTool::new(
+            Arc::new(NativeShell::new()),
+            dir,
+            24000,
+            500,
+            1,
+            0,
+            SafetyConfig::default(),
+        )
+        .with_jobs(store.clone(), 5, 2);
+
+        let quick = tool
+            .call(&json!({"command": "printf ok"}), &AtomicBool::new(false))
+            .await
+            .unwrap();
+        assert!(quick.contains("ok"));
+        assert!(
+            store.list().is_empty(),
+            "completed foreground job must be removed"
+        );
+
+        let started = tool
+            .call(
+                &json!({"command": "sleep 2", "background": true}),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&started).unwrap();
+        assert_eq!(value["status"], "running");
+        assert!(value["job_id"].as_str().unwrap().starts_with("job_"));
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_promotes_to_background_job() {
+        let dir = tmp();
+        let store = Arc::new(crate::tools::jobs::JobStore::new(4));
+        let tool = ShellTool::new(
+            Arc::new(NativeShell::new()),
+            dir,
+            24000,
+            500,
+            1,
+            0,
+            SafetyConfig::default(),
+        )
+        .with_jobs(store.clone(), 5, 1);
+
+        let result = tool
+            .call(&json!({"command": "sleep 2"}), &AtomicBool::new(false))
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["status"], "backgrounded");
+        let id = value["job_id"].as_str().unwrap();
+        let done = store.wait_for(id, 5).await.unwrap();
+        assert_ne!(done.status, "running");
+    }
+
+    #[tokio::test]
+    async fn background_rejects_stdin_input() {
+        let dir = tmp();
+        let store = Arc::new(crate::tools::jobs::JobStore::new(2));
+        let tool = ShellTool::new(
+            Arc::new(NativeShell::new()),
+            dir,
+            24000,
+            500,
+            1,
+            0,
+            SafetyConfig::default(),
+        )
+        .with_jobs(store, 5, 2);
+        let out = tool
+            .call(
+                &json!({"command": "cat", "background": true, "stdin_input": "x"}),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["success"], false);
+        assert!(value["error"].as_str().unwrap().contains("stdin_input"));
+    }
+
+    #[tokio::test]
     async fn native_echo_roundtrip() {
         let dir = tmp();
-        let t = native_tool(dir);
+        let t = native_tool(dir.clone());
         let cancel = AtomicBool::new(false);
         let out = t
             .call(&json!({"command": "echo hello"}), &cancel)
@@ -583,6 +948,7 @@ mod tests {
         assert_eq!(v["success"], true);
         assert_eq!(v["returncode"], 0);
         assert_eq!(v["backend"], "native");
+        assert_eq!(v["cwd"].as_str().unwrap(), dir.to_string_lossy());
         assert!(v["stdout"].as_str().unwrap().contains("hello"));
     }
 
@@ -747,6 +1113,55 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], false);
         assert!(v["error"].as_str().unwrap().contains("unknown command"));
+    }
+
+    #[tokio::test]
+    async fn fastshell_error_semantics_and_utf8_file() {
+        let dir = tmp();
+        let mut fs = Fastshell::new();
+        let mut cfg = Config::default();
+        cfg.sandbox_path = dir.to_string_lossy().to_string();
+        cfg.python_enabled = false;
+        fs.init(cfg).unwrap();
+        let backend = Arc::new(FastshellBackend::new(Arc::new(Mutex::new(fs))));
+        let t = ShellTool::new(backend, dir, 24000, 500, 30, 30, SafetyConfig::default());
+        let cancel = AtomicBool::new(false);
+        let out = t
+            .call(
+                &json!({"command": "printf 'nothing' > f.txt && grep -q needle f.txt"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error_kind"], "no_match", "{v}");
+        let out = t
+            .call(
+                &json!({"command": "printf a > a.txt && printf b > b.txt && diff a.txt b.txt"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error_kind"], "differences", "{v}");
+        let out = t
+            .call(&json!({"command": "test -f missing.txt"}), &cancel)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error_kind"], "condition_false", "{v}");
+        let out = t
+            .call(
+                &json!({"command": "printf '中文😀' > cn.txt && file cn.txt"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["stdout"].as_str().unwrap().contains("Unicode text"),
+            "{v}"
+        );
     }
 
     #[tokio::test]

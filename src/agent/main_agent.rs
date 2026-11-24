@@ -17,6 +17,7 @@ use crate::session::{SessionManager, SessionMessage};
 use crate::stream::EventSink;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::ShellBackend;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ impl MainAgent {
         project_path: PathBuf,
         backend: Arc<dyn ShellBackend>,
     ) -> Self {
+        config.apply_flat_context();
+        config.apply_compat_defaults();
         // Wire config.timeouts.model_request into the LLM agent's per-request deadline
         if config.model.request_timeout_secs.is_none() {
             config.model.request_timeout_secs = Some(config.timeouts.model_request);
@@ -88,12 +91,13 @@ impl MainAgent {
             self.project_path.display()
         ));
         if self.backend.kind() == "fastshell" {
-            prompt.push_str(" Paths starting with / (e.g. /skills) are relative to the sandbox root, not the real filesystem. Paths without / are relative to your working directory. avoid /tmp/.");
+            prompt.push_str(
+                " Fastshell paths: '/' is the sandbox root; relative paths resolve from the working directory; '/tmp' is the sandbox temporary directory and is allowed. Prefer project-relative paths; after writing, verify the location with pwd/ls, and never assume '/tmp' and '.aacode' are the same location. For builds, test suites, downloads, or servers that may outlive a foreground wait, use run_shell with background=true or job_start; continue independent work, do not sleep/poll, and collect the job before finishing.",
+            );
             #[cfg(any(target_os = "android", target_os = "ios"))]
             {
-                prompt.push_str(" Python: embedded RustPython (only pure-Python packages work, no C extensions). Test with `python3 -m unittest`; syntax-check: `python3 -c \"import ast; ast.parse(open('f.py').read())\"`. Install missing pure-Python packages with `pip-install <name>`.");
-                prompt.push_str(" Built-in extras: `sqlite3` (embedded DB, no install), `node`/`js` (WebView JavaScript), `render` (HTML→screenshot), `jscheck` (JS/TS syntax check); full command list at https://github.com/kandada/fastshell.");
-                prompt.push_str(" The sandbox runs in-process: `bash`/`sh` and Python `subprocess` are unavailable — use built-in commands or `execute_python` instead.");
+                prompt.push_str(" Python: embedded RustPython (pure-Python only, no C extensions). Use `python3`; if `execute_python` is not advertised, discover it with `list_tool_schemas` and invoke it with `call_tool`.");
+                prompt.push_str(" Built-in extras: sqlite3, node/js, render, jscheck. `bash`/`sh` and Python subprocesses are unavailable; use built-in commands.");
             }
         }
         // Project init instructions (static config, rarely changes).
@@ -103,19 +107,16 @@ impl MainAgent {
         #[cfg(feature = "browser")]
         if crate::tools::browser::is_available() {
             prompt.push_str(
-                "\n\n## Browser\nA full browser-automation engine (`fastbrowser`) is available. It can open pages and drive a real \
-browser: click / type / fill forms, scroll, run JavaScript, read cookies & localStorage, extract \
-text / links / tables, manage tabs, wait for elements, and block or intercept requests — including \
-JS-heavy and anti-bot pages. To read cluttered or JS-heavy pages, use the accessibility tree \
-(`get_accessibility_tree`: role / name / state), which also lets you target elements by `role=` / `name=`.\n\
-`browser_tools` lists the available \
-browser tools (names by default; `mode:\"help\", name:\"<tool>\"` gives one tool's full schema). \
-Call any of them with `browser_call(name, args)`; pass `compact:true` for cleaned \
-output (large results archived under `.aacode/extracts/`).",
+                "\n\n## Browser\nA full browser-automation engine (`fastbrowser`) is available. It can open pages and drive a real browser: click / type / fill forms, scroll, run JavaScript, read cookies & localStorage, extract text / links / tables, manage tabs, wait for elements, and block or intercept requests — including JS-heavy and anti-bot pages. To read cluttered or JS-heavy pages, use the accessibility tree (`get_accessibility_tree`: role / name / state), which also lets you target elements by `role=` / `name=`.\n`browser_tools` lists the available browser tools (names by default; `mode:\"help\", name:\"<tool>\"` gives one tool's full schema). Call any of them with `browser_call(name, args)`; pass `compact:true` for cleaned output (large results archived under `.aacode/extracts/`).",
             );
         }
         // Planning guidance (static).
         prompt.push_str(PLANNING_IN_THOUGHT);
+        // Efficiency guard for simple lookups (keeps agent loops from
+        // re-fetching the same data through multiple providers).
+        prompt.push_str(
+            "\n\nEfficiency: For simple lookups, use one authoritative source and avoid equivalent requests across tools unless cross-checking is requested. For structured/API or large responses, retrieve once and process the full result instead of truncating it first. When one URL needs several filters or extractions, download it once to a temporary file and run local grep/python instead of fetching the same URL repeatedly.",
+        );
         // Plan-first mode: instruct the model to produce a plan before acting.
         if self.config.plan_first {
             prompt.push_str(
@@ -123,6 +124,12 @@ output (large results archived under `.aacode/extracts/`).",
             );
         }
         prompt
+    }
+
+    fn prompt_hash(prompt: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(prompt.as_bytes());
+        format!("{:x}", hasher.finalize())[..16].to_string()
     }
 
     /// Native tools for the active gateway.
@@ -198,7 +205,57 @@ output (large results archived under `.aacode/extracts/`).",
             eprintln!("skills discovery panicked or was cancelled: {e}");
             "(no skills installed)".to_string()
         });
-        let system_prompt = self.build_system_prompt(&registry, &skills_list);
+        let fresh_system_prompt = self.build_system_prompt(&registry, &skills_list);
+        let fresh_hash = Self::prompt_hash(&fresh_system_prompt);
+        let bootstrap = session.bootstrap();
+        let mut bootstrap_notice: Option<String> = None;
+        const BOOTSTRAP_VERSION: u64 = 6;
+        let system_prompt = if let Some(b) = bootstrap.as_ref() {
+            let stored_prompt = b
+                .get("system_prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let stored_hash = b.get("system_hash").and_then(|v| v.as_str()).unwrap_or("");
+            let stored_version = b.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+            if !stored_prompt.is_empty() && stored_version < BOOTSTRAP_VERSION {
+                // Prompt semantics changed (path rules/efficiency/JSON guidance).
+                // Rebuild once; this costs one prefix-cache miss but fixes
+                // sessions created by older mobile builds.
+                let value = serde_json::json!({
+                    "version": BOOTSTRAP_VERSION,
+                    "system_prompt": fresh_system_prompt,
+                    "system_hash": fresh_hash,
+                    "skills_snapshot": skills_list,
+                    "cwd": self.project_path.to_string_lossy(),
+                    "created_at": crate::session::now_iso(),
+                });
+                let _ = session.set_bootstrap(Some(value));
+                fresh_system_prompt.clone()
+            } else if !stored_prompt.is_empty() {
+                if stored_hash != fresh_hash {
+                    bootstrap_notice = Some(
+                        "[System] Project instructions or skills changed since this session started. \
+The session keeps its original bootstrap for prefix-cache stability. \
+Re-read init.md or the skills list if this task depends on them."
+                            .to_string(),
+                    );
+                }
+                stored_prompt.to_string()
+            } else {
+                fresh_system_prompt.clone()
+            }
+        } else {
+            let value = serde_json::json!({
+                "version": BOOTSTRAP_VERSION,
+                "system_prompt": fresh_system_prompt,
+                "system_hash": fresh_hash,
+                "skills_snapshot": skills_list,
+                "cwd": self.project_path.to_string_lossy(),
+                "created_at": crate::session::now_iso(),
+            });
+            let _ = session.set_bootstrap(Some(value));
+            fresh_system_prompt.clone()
+        };
 
         // Build the message list: system + prior history + current task.
         let mut messages = vec![ChatMessage::system(system_prompt)];
@@ -238,6 +295,9 @@ output (large results archived under `.aacode/extracts/`).",
             messages.push(ChatMessage::system(format!(
                 "[SYSTEM] Repaired {repaired} interrupted tool-call record(s) from the previous turn. Do not repeat prior tool calls; continue from the recorded results."
             )));
+        }
+        if let Some(notice) = bootstrap_notice {
+            messages.push(ChatMessage::system(notice));
         }
 
         // Current task as the final user turn. Send the raw task **exactly** as
@@ -280,6 +340,175 @@ mod tests {
         assert!(reg.contains("run_shell"));
         assert!(reg.contains("add_todo_item"));
         assert!(reg.contains("search_web"));
+    }
+
+    struct CapturingLlm {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for CapturingLlm {
+        async fn chat_stream(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _emitter: &dyn EventSink,
+            _cancel: &AtomicBool,
+        ) -> Result<crate::llm::LlmResponse> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            Ok(crate::llm::LlmResponse {
+                text: "done".into(),
+                ..Default::default()
+            })
+        }
+        async fn validate(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_prompt_is_frozen_across_execute_calls() {
+        let (mut agent, dir) = make_agent();
+        std::fs::write(
+            dir.join("init.md"),
+            "# OLD RULES
+use tabs",
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.llm = Box::new(CapturingLlm { seen: seen.clone() });
+
+        let mut session = SessionManager::new(&dir);
+        let sink = crate::stream::CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        agent
+            .execute("first", &mut session, &sink, &cancel)
+            .await
+            .unwrap();
+
+        let first_bootstrap = session.bootstrap().expect("bootstrap saved");
+        std::fs::write(
+            dir.join("init.md"),
+            "# NEW RULES
+use spaces",
+        )
+        .unwrap();
+        agent
+            .execute("second", &mut session, &sink, &cancel)
+            .await
+            .unwrap();
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0][0].content, calls[1][0].content,
+            "system prompt must stay byte-identical for prefix cache"
+        );
+        assert!(calls[1].iter().any(|m| {
+            m.role == "system" && m.content.contains("Project instructions or skills changed")
+        }));
+        assert_eq!(
+            session.bootstrap().unwrap()["system_prompt"],
+            first_bootstrap["system_prompt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_does_not_duplicate_bootstrap_system_prompt() {
+        let (mut agent, dir) = make_agent();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.llm = Box::new(CapturingLlm { seen: seen.clone() });
+        let mut session = SessionManager::new(&dir);
+        let sink = crate::stream::CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+
+        agent
+            .execute("first", &mut session, &sink, &cancel)
+            .await
+            .unwrap();
+        agent
+            .execute("second", &mut session, &sink, &cancel)
+            .await
+            .unwrap();
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].iter().filter(|m| m.role == "system").count(), 1);
+        assert_eq!(calls[1].iter().filter(|m| m.role == "system").count(), 1);
+        assert_eq!(calls[0][0].content, calls[1][0].content);
+        assert_eq!(calls[1].last().unwrap().content, "second");
+        assert!(!session.messages.iter().any(|m| m.role == "system"));
+    }
+
+    #[test]
+    fn default_auto_profile_advertises_a_small_schema_set() {
+        let (agent, _) = make_agent();
+        let reg = agent.build_registry();
+        let tools = reg.openai_tools();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(
+            names.len() <= 16,
+            "default auto profile advertises {} tools: {names:?}",
+            names.len()
+        );
+        for expected in [
+            "run_shell",
+            "search_web",
+            "list_tool_schemas",
+            "get_tool_schema",
+            "call_tool",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        assert!(
+            !names.contains(&"job_start"),
+            "heavy tools should be discoverable via meta tools, not advertised by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_bootstrap_version_is_rebuilt_once() {
+        let (mut agent, dir) = make_agent();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.llm = Box::new(CapturingLlm { seen: seen.clone() });
+        let mut session = SessionManager::new(&dir);
+        session.create_session("task", None).unwrap();
+        session
+            .set_bootstrap(Some(serde_json::json!({
+                "version": 3,
+                "system_prompt": "OLD MOBILE PROMPT",
+                "system_hash": "old"
+            })))
+            .unwrap();
+        let sink = crate::stream::CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        agent
+            .execute("hello", &mut session, &sink, &cancel)
+            .await
+            .unwrap();
+        let calls = seen.lock().unwrap();
+        let system = &calls[0][0];
+        assert_eq!(system.role, "system");
+        assert!(system.content.contains("use one authoritative source"));
+        assert!(system
+            .content
+            .contains("process the full result instead of truncating it first"));
+        assert!(!system.content.contains("OLD MOBILE PROMPT"));
+        let boot = session.bootstrap().unwrap();
+        assert_eq!(boot["version"], 6);
+    }
+
+    #[test]
+    fn core_tool_profile_is_applied_to_registry() {
+        let (mut agent, _) = make_agent();
+        agent.config.tool_profile = "core".into();
+        let reg = agent.build_registry();
+        assert!(reg.contains("run_shell"));
+        assert!(!reg.is_active("search_web"));
+        assert!(!reg.is_active("browser_call"));
+        assert!(reg.is_active("list_tool_schemas"));
     }
 
     #[test]
@@ -347,7 +576,9 @@ mod tests {
             p.contains("sandbox root"),
             "fastshell prompt must contain sandbox hint"
         );
-        assert!(p.contains("avoid /tmp/"));
+        assert!(p.contains("'/tmp' is the sandbox temporary directory"));
+        assert!(p.contains("use one authoritative source"));
+        assert!(p.contains("process the full result instead of truncating it first"));
     }
 
     #[test]

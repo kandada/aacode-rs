@@ -1086,6 +1086,71 @@ fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// Classify a reqwest transport failure. The top-level Display is often only
+/// "error sending request"; keep a source-chain detail and a stable kind so
+/// the model can decide whether to retry, change source, or fix the URL.
+fn classify_reqwest_error(e: &reqwest::Error) -> (&'static str, bool, String) {
+    let mut detail = e.to_string();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = source {
+        let text = err.to_string();
+        if !text.is_empty() && !detail.contains(&text) {
+            detail.push_str(": ");
+            detail.push_str(&text);
+        }
+        source = std::error::Error::source(err);
+    }
+    let lower = detail.to_ascii_lowercase();
+    if e.is_timeout() || lower.contains("timed out") || lower.contains("timeout") {
+        ("timeout", true, detail)
+    } else if lower.contains("dns")
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname")
+    {
+        ("dns", true, detail)
+    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("handshake")
+    {
+        ("tls", false, detail)
+    } else if e.is_connect()
+        || lower.contains("connection refused")
+        || lower.contains("failed to connect")
+    {
+        ("connect", true, detail)
+    } else if e.is_request() {
+        ("request", false, detail)
+    } else if e.is_body() || e.is_decode() {
+        ("body", false, detail)
+    } else {
+        ("transport", true, detail)
+    }
+}
+
+fn content_format_for(content_type: &str) -> &'static str {
+    let lower = content_type.to_ascii_lowercase();
+    if lower.contains("json") {
+        "json"
+    } else if lower.contains("html") || lower.contains("xml") {
+        "markup"
+    } else {
+        "text"
+    }
+}
+
+/// JSON APIs often return pretty-printed bodies. The model only needs the
+/// data, so minify valid JSON instead of spending tokens on indentation. This
+/// replaces the content (never duplicates it in a second `content_json` field).
+fn compact_json_body(content_type: &str, body: &str, cleaned: &str) -> String {
+    if content_format_for(content_type) != "json" {
+        return cleaned.to_string();
+    }
+    serde_json::from_str::<Value>(body)
+        .and_then(|value| {
+            serde_json::to_string(&value)
+                .map_err(|e| serde_json::Error::io(std::io::Error::other(e)))
+        })
+        .unwrap_or_else(|_| cleaned.to_string())
+}
+
 pub struct FetchUrlTool {
     pub project_path: PathBuf,
     pub timeout_secs: u64,
@@ -1145,6 +1210,7 @@ impl Tool for FetchUrlTool {
             .timeout(Duration::from_secs_f64(timeout as f64))
             .send()
             .await;
+        let mut content_type = String::new();
         let (status, body) = match resp {
             Ok(r) => {
                 let status = r.status().as_u16();
@@ -1154,20 +1220,47 @@ impl Tool for FetchUrlTool {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let bytes = r.bytes().await.unwrap_or_default();
+                content_type = ctype.clone();
+                let bytes = match r.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let (kind, retryable, detail) = classify_reqwest_error(&e);
+                        return Ok(json!({
+                            "success": false, "url": url, "status_code": status,
+                            "error_kind": kind,
+                            "retryable": retryable, "error": detail,
+                        })
+                        .to_string());
+                    }
+                };
                 (status, decode_body(&bytes, &ctype))
             }
             Err(e) => {
-                return Ok(
-                    json!({"success": false, "url": url, "error": e.to_string()}).to_string(),
-                );
+                let (kind, retryable, detail) = classify_reqwest_error(&e);
+                return Ok(json!({
+                    "success": false,
+                    "url": url,
+                    "error_kind": kind,
+                    "retryable": retryable,
+                    "error": detail,
+                    "hint": match kind {
+                        "dns" => "DNS resolution failed; check the hostname or network.",
+                        "connect" => "Could not connect; the endpoint may be blocked or offline. Try another source.",
+                        "timeout" => "Request timed out; retry or use a shorter/smaller request.",
+                        "tls" => "TLS/certificate failure; check the endpoint or use another source.",
+                        _ => "Request failed before an HTTP response; try another source.",
+                    },
+                })
+                .to_string());
             }
         };
 
         let raw_len = body.len();
         let cleaned = clean_html(&body);
         let cleaned_len = cleaned.chars().count();
-        let content: String = cleaned.chars().take(max_len).collect();
+        let display_body = compact_json_body(&content_type, &body, &cleaned);
+        let content_truncated = display_body.chars().count() > max_len;
+        let content: String = display_body.chars().take(max_len).collect();
         let saved = save_extract(&self.project_path, &cleaned);
 
         let block = detect_block(status, &body, cleaned_len);
@@ -1178,12 +1271,17 @@ impl Tool for FetchUrlTool {
             "success": ok,
             "url": url,
             "status_code": status,
+            "content_type": content_type,
+            "content_format": content_format_for(&content_type),
             "raw_length": raw_len,
             "content_length": cleaned_len,
+            "content_truncated": content_truncated,
             "content": content,
             "extract_file": saved,
         });
         if let Some(reason) = block {
+            out["error_kind"] = json!("blocked");
+            out["retryable"] = json!(false);
             out["blocked"] = json!(true);
             out["block_reason"] = json!(reason);
             out["hint"] = json!(
@@ -1192,6 +1290,8 @@ impl Tool for FetchUrlTool {
                  For sites with a mobile/AMP version or a public API, those often bypass the challenge."
             );
         } else if !ok {
+            out["error_kind"] = json!("http_status");
+            out["retryable"] = json!((500..600).contains(&status));
             out["hint"] = json!(format!(
                 "HTTP {status} — the server returned an error page; verify the URL or try a web search."
             ));
@@ -1769,6 +1869,94 @@ mod tests {
         assert!(start.elapsed().as_secs() < 2);
     }
 
+    #[tokio::test]
+    async fn fetch_url_classifies_connection_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "aacode_fetch_err_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = FetchUrlTool {
+            project_path: dir,
+            timeout_secs: 1,
+        };
+        let out = tool
+            .call(
+                &json!({"url": "http://127.0.0.1:1/", "timeout": 1}),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["success"], false);
+        assert_eq!(value["error_kind"], "connect", "{value}");
+        assert_eq!(value["retryable"], true);
+        assert!(value["hint"].as_str().unwrap().contains("connect"));
+    }
+
+    #[tokio::test]
+    async fn fetch_url_classifies_tls_handshake_failure() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "aacode_fetch_tls_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = FetchUrlTool {
+            project_path: dir,
+            timeout_secs: 2,
+        };
+        let out = tool
+            .call(
+                &json!({"url": format!("https://{addr}/"), "timeout": 2}),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["success"], false);
+        assert!(
+            value["error_kind"] == "tls" || value["error_kind"] == "connect",
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_url_classifies_dns_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "aacode_fetch_dns_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = FetchUrlTool {
+            project_path: dir,
+            timeout_secs: 2,
+        };
+        let out = tool
+            .call(
+                &json!({"url": "http://nonexistent.invalid/", "timeout": 2}),
+                &AtomicBool::new(false),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["success"], false);
+        assert_eq!(value["error_kind"], "dns", "{value}");
+        assert_eq!(value["retryable"], true);
+    }
+
     #[test]
     fn brief_err_truncates() {
         let long = "x".repeat(300);
@@ -1975,5 +2163,25 @@ mod tests {
             normalize_result_url("https://a.com/x?a=1&amp;b=2"),
             "https://a.com/x?a=1&b=2"
         );
+    }
+
+    #[test]
+    fn json_response_is_minified_without_duplicate() {
+        let body = "{\n  \"a\": 1,\n  \"b\": [1, 2]\n}";
+        assert_eq!(
+            compact_json_body("application/json", body, body),
+            "{\"a\":1,\"b\":[1,2]}"
+        );
+        assert_eq!(compact_json_body("text/html", "<p>x</p>", "x"), "x");
+    }
+
+    #[test]
+    fn content_format_metadata() {
+        assert_eq!(
+            content_format_for("application/json; charset=utf-8"),
+            "json"
+        );
+        assert_eq!(content_format_for("text/html; charset=utf-8"), "markup");
+        assert_eq!(content_format_for("text/plain"), "text");
     }
 }

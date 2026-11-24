@@ -115,14 +115,23 @@ impl Tool for ExecutePythonTool {
                 json!(result.stdout)
             };
 
-            Ok(json!({
+            let mut out = json!({
                 "success": result.exit_code == 0,
                 "returncode": result.exit_code,
                 "file": rel,
                 "stdout": stdout,
                 "stderr": result.stderr,
-            })
-            .to_string())
+            });
+            if result.exit_code != 0 {
+                let (kind, hint) = crate::tools::shell::classify_shell_exit(
+                    result.exit_code,
+                    "python3",
+                    &result.stderr,
+                );
+                out["error_kind"] = json!(kind);
+                out["hint"] = json!(hint);
+            }
+            Ok(out.to_string())
         })
         .await
         .map_err(|e| AacodeError::Other(format!("execute_python: {e}")))?

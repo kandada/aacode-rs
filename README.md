@@ -107,6 +107,25 @@ export LLM_MODEL_NAME="your-model-name"
 export LLM_GATEWAY="anthropic"
 ```
 
+### Tool Profile
+
+```bash
+# core | auto (default) | web | full
+export AACODE_TOOL_PROFILE="auto"
+```
+
+`auto` advertises the core coding tools + light web tools + the discovery
+meta-tools (`list_tool_schemas`, `get_tool_schema`, `call_tool`). Hidden tools
+remain callable through `call_tool` without changing the advertised schema set
+(and therefore without invalidating the prefix cache).
+
+### CLI Setup
+
+```bash
+# Interactive .env setup (model, base URL, gateway, API key)
+aacode init
+```
+
 ### Shell Backend
 
 ```bash

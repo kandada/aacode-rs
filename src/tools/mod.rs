@@ -46,6 +46,11 @@ pub fn build_sub_registry(
     // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
     reg.enable_sanitizer(&project_path, sanitize_limits_from(config));
     let _ = register_core_tools(&mut reg, backend, &project_path, config);
+    reg.install_meta_schemas();
+    reg.set_profile(
+        &config.tool_profile,
+        config.safety.permission_mode == crate::config::PermissionMode::ReadOnly,
+    );
     reg
 }
 
@@ -104,6 +109,11 @@ pub fn build_default_registry_with_holder(
         sub_registry: factory,
     }));
 
+    reg.install_meta_schemas();
+    reg.set_profile(
+        &config.tool_profile,
+        config.safety.permission_mode == crate::config::PermissionMode::ReadOnly,
+    );
     (reg, holder)
 }
 
@@ -120,23 +130,30 @@ fn register_core_tools(
     let backend_for_jobs = backend.clone();
     let backend_for_mobile = backend.clone();
 
-    // run_shell (native OS shell on desktop, fastshell sandbox on mobile)
-    reg.register(Box::new(ShellTool::new(
-        backend,
-        project_path.clone(),
-        config.limits.tool_output_chars,
-        config.limits.tool_output_lines,
-        config.timeouts.shell_command,
-        config.timeouts.shell_idle,
-        config.safety.clone(),
-    )));
-
     // Background jobs (same backend; process-local, best-effort cancel).
-    let job_store = Arc::new(jobs::JobStore::new(jobs::MAX_JOBS));
+    let job_store = jobs::store_for_project(project_path);
+
+    // run_shell (native OS shell on desktop, fastshell sandbox on mobile)
+    reg.register(Box::new(
+        ShellTool::new(
+            backend,
+            project_path.clone(),
+            config.limits.tool_output_chars,
+            config.limits.tool_output_lines,
+            config.timeouts.shell_command,
+            config.timeouts.shell_idle,
+            config.safety.clone(),
+        )
+        .with_jobs(
+            job_store.clone(),
+            config.timeouts.shell_background,
+            config.timeouts.shell_foreground_max,
+        ),
+    ));
     reg.register(Box::new(jobs::JobStartTool {
         backend: backend_for_jobs,
         project_path: project_path.clone(),
-        timeout_secs: config.timeouts.shell_command,
+        timeout_secs: config.timeouts.shell_background,
         idle_timeout_secs: config.timeouts.shell_idle,
         store: job_store.clone(),
     }));
@@ -220,6 +237,7 @@ fn register_core_tools(
         user_dir: config.skills.user_dir.as_ref().map(PathBuf::from),
         vfs_skills_dir: config.skills.vfs_skills_dir.clone(),
         extra_builtins: config.skills.extra_builtins.clone(),
+        timeout_secs: config.timeouts.skill_discovery,
     }));
 
     // Session tools
@@ -262,7 +280,7 @@ fn register_core_tools(
     reg.register(Box::new(code_tools::ExecutePythonTool {
         project_path: project_path.clone(),
         backend: backend_for_python,
-        default_timeout_secs: config.timeouts.shell_command,
+        default_timeout_secs: config.timeouts.code_execution,
     }));
     reg.register(Box::new(code_tools::RunTestsTool {
         project_path: project_path.clone(),

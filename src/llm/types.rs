@@ -99,7 +99,7 @@ impl Usage {
         let miss = self.cache_miss_tokens as f64;
         let denom = hit + miss;
         if denom > 0.0 {
-            hit / denom
+            (hit / denom).clamp(0.0, 1.0)
         } else {
             0.0
         }
@@ -124,5 +124,26 @@ impl LlmResponse {
             self.finish_reason.as_deref(),
             Some("length") | Some("max_tokens") | Some("connection_closed")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_hit_rate_is_bounded_and_zero_without_prompt() {
+        let mut u = Usage {
+            cache_read_tokens: 20,
+            cache_miss_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(u.cache_hit_rate(), 1.0);
+        u.cache_read_tokens = 0;
+        u.cache_miss_tokens = 0;
+        assert_eq!(u.cache_hit_rate(), 0.0);
+        u.cache_read_tokens = 5;
+        u.cache_miss_tokens = 10;
+        assert!((u.cache_hit_rate() - 1.0 / 3.0).abs() < 1e-9);
     }
 }

@@ -41,6 +41,26 @@ pub trait ShellBackend: Send + Sync {
         cwd: &std::path::Path,
     ) -> CmdOutput;
 
+    /// Run while observing a cooperative cancel flag. Backends without a
+    /// kill handle fall back to `run`; native processes are killed by PID.
+    fn run_cancellable(
+        &self,
+        command: &str,
+        stdin_input: Option<&str>,
+        timeout_secs: u64,
+        idle_timeout_secs: u64,
+        cwd: &std::path::Path,
+        _cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> CmdOutput {
+        self.run(command, stdin_input, timeout_secs, idle_timeout_secs, cwd)
+    }
+
+    /// Logical working directory exposed to the model, when it differs from
+    /// the host path (fastshell's `/projects/...` view).
+    fn logical_cwd(&self) -> Option<String> {
+        None
+    }
+
     /// Human-readable backend name (for diagnostics).
     fn kind(&self) -> &'static str;
 
@@ -145,7 +165,7 @@ impl ShellBackend for NativeShell {
 
         // Timeout handling: wait in a thread and enforce a deadline.
         let output = if timeout_secs > 0 || idle_timeout_secs > 0 {
-            wait_with_timeout(child, timeout_secs, idle_timeout_secs)
+            wait_with_timeout(child, timeout_secs, idle_timeout_secs, None)
         } else {
             child.wait_with_output().map(|o| CmdOutput {
                 stdout: String::from_utf8_lossy(&o.stdout).to_string(),
@@ -161,6 +181,58 @@ impl ShellBackend for NativeShell {
         })
     }
 
+    fn run_cancellable(
+        &self,
+        command: &str,
+        stdin_input: Option<&str>,
+        timeout_secs: u64,
+        idle_timeout_secs: u64,
+        cwd: &std::path::Path,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> CmdOutput {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(command);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(command);
+            c
+        };
+        cmd.current_dir(cwd)
+            .stdin(if stdin_input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return CmdOutput {
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn shell: {e}"),
+                    exit_code: 127,
+                }
+            }
+        };
+        if let Some(input) = stdin_input {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(input.as_bytes());
+            }
+        }
+        wait_with_timeout(child, timeout_secs, idle_timeout_secs, Some(cancel)).unwrap_or_else(
+            |e| CmdOutput {
+                stdout: String::new(),
+                stderr: format!("shell execution error: {e}"),
+                exit_code: -1,
+            },
+        )
+    }
+
     fn kind(&self) -> &'static str {
         "native"
     }
@@ -173,6 +245,7 @@ fn wait_with_timeout(
     mut child: std::process::Child,
     timeout_secs: u64,
     idle_timeout_secs: u64,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<CmdOutput> {
     use std::io::Read;
     use std::sync::mpsc;
@@ -241,6 +314,27 @@ fn wait_with_timeout(
     let mut last_data = std::time::Instant::now();
 
     loop {
+        if cancel
+            .as_ref()
+            .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .output();
+            }
+            return Ok(CmdOutput {
+                stdout,
+                stderr: format!("{stderr}\ncommand cancelled"),
+                exit_code: 130,
+            });
+        }
         // Compute how long we can wait for the next event.
         let wait_dur = match deadline {
             Some(dl) => {
@@ -357,6 +451,9 @@ pub type SharedFastshell = Arc<Mutex<Fastshell>>;
 /// Routes commands through the fastshell sandbox engine.
 pub struct FastshellBackend {
     fs: SharedFastshell,
+    /// SDK-level cooperative cancellation flag, captured without needing the
+    /// SDK lock while a command is running.
+    cancel_handle: Arc<std::sync::atomic::AtomicBool>,
     /// Baseline working directory (VFS path), captured on first use. fastshell's
     /// cwd is persistent across commands, so without this a `cd` in one
     /// `run_shell` leaks into the next (the model assumes each call starts at
@@ -366,8 +463,13 @@ pub struct FastshellBackend {
 
 impl FastshellBackend {
     pub fn new(fs: SharedFastshell) -> Self {
+        let cancel_handle = fs
+            .lock()
+            .map(|guard| guard.cancel_handle())
+            .unwrap_or_else(|e| e.into_inner().cancel_handle());
         FastshellBackend {
             fs,
+            cancel_handle,
             base_cwd: std::sync::Mutex::new(None),
         }
     }
@@ -439,6 +541,49 @@ impl ShellBackend for FastshellBackend {
             stderr: r.stderr,
             exit_code: r.exit_code,
         }
+    }
+
+    fn run_cancellable(
+        &self,
+        command: &str,
+        stdin_input: Option<&str>,
+        timeout_secs: u64,
+        idle_timeout_secs: u64,
+        cwd: &std::path::Path,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> CmdOutput {
+        let handle = self.cancel_handle.clone();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_for_thread = done.clone();
+        let cancel_for_thread = cancel.clone();
+        let watcher = std::thread::spawn(move || {
+            while !done_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                if cancel_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    handle.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let mut out = self.run(command, stdin_input, timeout_secs, idle_timeout_secs, cwd);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancel_handle
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = watcher.join();
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            out.exit_code = 130;
+            if !out.stderr.contains("cancelled") {
+                out.stderr.push_str("\ncommand cancelled");
+            }
+        }
+        out
+    }
+
+    fn logical_cwd(&self) -> Option<String> {
+        self.base_cwd
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn kind(&self) -> &'static str {

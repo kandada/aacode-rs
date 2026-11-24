@@ -58,6 +58,8 @@ impl AgentRuntime {
     /// shell backend. The native backend needs no setup; the fastshell backend
     /// initializes a VFS sandbox + embedded CPython.
     pub fn init(mut config: AgentConfig, project_path: PathBuf) -> Result<Self> {
+        config.apply_flat_context();
+        config.apply_compat_defaults();
         // (c) 2026 xiefujin <490021684@qq.com> — GPL-3.0
         // Wire config.timeouts.model_request into model's per-request deadline
         if config.model.request_timeout_secs.is_none() {
@@ -102,6 +104,8 @@ impl AgentRuntime {
         project_path: PathBuf,
         fs: Arc<Mutex<Fastshell>>,
     ) -> Self {
+        config.apply_flat_context();
+        config.apply_compat_defaults();
         if config.model.request_timeout_secs.is_none() {
             config.model.request_timeout_secs = Some(config.timeouts.model_request);
         }

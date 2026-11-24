@@ -209,6 +209,8 @@ pub struct RunSkillsTool {
     pub vfs_skills_dir: Option<String>,
     /// Host-declared extra builtins (e.g. ["agent_cron"]).
     pub extra_builtins: Vec<String>,
+    /// Default discovery timeout in seconds.
+    pub timeout_secs: u64,
 }
 
 #[async_trait::async_trait]
@@ -248,7 +250,10 @@ impl Tool for RunSkillsTool {
                 .map(|s| s.to_string())
         });
 
-        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(5);
+        let timeout = args
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.timeout_secs.max(1));
 
         let pp = self.project_path.clone();
         let ud = self.user_dir.clone();
@@ -334,6 +339,7 @@ mod tests {
             user_dir: None,
             vfs_skills_dir: None,
             extra_builtins: vec![],
+            timeout_secs: 5,
         }
     }
 
@@ -489,6 +495,7 @@ mod tests {
             user_dir: Some(user.clone()),
             vfs_skills_dir: None,
             extra_builtins: vec!["agent_cron".into()],
+            timeout_secs: 5,
         };
         let cancel = AtomicBool::new(false);
         let out = t

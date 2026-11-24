@@ -17,6 +17,7 @@ use crate::session::{SessionManager, SessionMessage};
 use crate::stream::{CollectingSink, EventSink};
 use crate::tools::ToolRegistry;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -97,12 +98,23 @@ impl<'a> ReactLoop<'a> {
     ) -> Result<RunResult> {
         let cancel_notify = Arc::new(Notify::new());
         let mut stale = StaleTracker::default();
+        let mut repeat_guard = RepeatTracker::default();
         // Retrieval cutoff (replaces summary compaction): stored messages stay
         // complete; only the model view is trimmed. The cutoff is frozen so the
         // request prefix stays byte-stable for provider prompt caching.
         let project_path = session.project_path();
         let mut retrieval = RetrievalState::from_value(session.context_checkpoint());
         let session_id = session.current_session_id.clone().unwrap_or_default();
+        // Per-model context policy: the configured trigger is capped by the
+        // model window, output cap, and headroom so compaction fires before the
+        // provider limit instead of relying on a fixed default.
+        let mut context_cfg = self.config.context.clone();
+        context_cfg.max_context_tokens = self.config.effective_context_window();
+        context_cfg.retrieval_trigger_tokens = self
+            .config
+            .effective_trigger()
+            .min(self.config.effective_hard_input());
+        context_cfg.retrieval_keep_tokens = self.config.effective_retain();
         // Usage telemetry (token counts only; never prompt/response text).
         let usage_tracker = crate::usage::UsageTracker::new(&session.project_path());
         let run_uuid = uuid::Uuid::new_v4().simple().to_string();
@@ -123,19 +135,19 @@ impl<'a> ReactLoop<'a> {
             // Build the model view (does not mutate stored messages). Older
             // history is omitted at a frozen cutoff and stays retrievable via
             // the history tools.
-            let (mut view, compacted, tokens, checkpoint_changed) =
-                retrieval.model_view(&messages, &self.config.context, &project_path, &session_id);
+            let (mut view, compacted, mut tokens, checkpoint_changed) =
+                retrieval.model_view(&messages, &context_cfg, &project_path, &session_id);
             if checkpoint_changed {
                 let _ = session.set_context_checkpoint(retrieval.to_value());
             }
             // Enforce hard context limit: if even the compacted view exceeds
             // max_context_tokens the request would be rejected or silently
             // truncated by the API — fail fast instead.
-            if tokens > self.config.context.max_context_tokens {
+            if tokens > context_cfg.max_context_tokens {
                 return Err(AacodeError::Api(format!(
                     "context too large: {} tokens exceeds limit of {} ({} messages). Try reducing history or restarting the session.",
                     tokens,
-                    self.config.context.max_context_tokens,
+                    context_cfg.max_context_tokens,
                     messages.len(),
                 )));
             }
@@ -146,10 +158,46 @@ impl<'a> ReactLoop<'a> {
                 crate::agent::sanitize::sanitize_history(&mut view);
             }
 
-            let resp = match self
+            let mut response = self
                 .chat_with_retry(&view, emitter, cancel, &cancel_notify)
-                .await
-            {
+                .await;
+            if let Err(e) = &response {
+                if is_context_overflow_error(e) {
+                    let reported_limit =
+                        context_overflow_limit(e).unwrap_or_else(|| context_cfg.max_context_tokens);
+                    let effective_limit = reported_limit.min(context_cfg.max_context_tokens);
+                    let safe_budget = effective_limit
+                        .saturating_sub(self.config.effective_max_output())
+                        .saturating_sub(context_cfg.headroom_tokens)
+                        .max(1);
+                    let target = safe_budget
+                        .min(context_cfg.retrieval_trigger_tokens.max(1))
+                        .min(tokens.saturating_mul(3) / 4)
+                        .max(1);
+                    let mut retry_cfg = context_cfg.clone();
+                    retry_cfg.retrieval_trigger_tokens = target;
+                    retry_cfg.retrieval_keep_tokens =
+                        context_cfg.retrieval_keep_tokens.min(target / 2).max(1);
+                    let (retry_view, retry_changed, retry_tokens, _) =
+                        retrieval.model_view(&messages, &retry_cfg, &project_path, &session_id);
+                    if retry_view.len() < view.len() {
+                        if retry_changed {
+                            let _ = session.set_context_checkpoint(retrieval.to_value());
+                        }
+                        emitter.tool_progress(
+                            "compacting",
+                            "context overflow: retrying with shorter history",
+                            0,
+                        );
+                        response = self
+                            .chat_with_retry(&retry_view, emitter, cancel, &cancel_notify)
+                            .await;
+                        view = retry_view;
+                        tokens = retry_tokens;
+                    }
+                }
+            }
+            let resp = match response {
                 Ok(r) => r,
                 Err(AacodeError::Cancelled) => {
                     emitter.error("cancelled");
@@ -187,6 +235,7 @@ impl<'a> ReactLoop<'a> {
                     tokens,
                     view.len(),
                     compacted,
+                    self.config.model.pricing.as_ref(),
                     resp.usage.as_ref(),
                 );
                 // Request manifest (no prompt text): the actual exposed tool
@@ -203,10 +252,54 @@ impl<'a> ReactLoop<'a> {
                     })
                     .collect();
                 event["tools"] = serde_json::json!(tools);
+                let system_hash = view
+                    .first()
+                    .map(|m| {
+                        let mut h = Sha256::new();
+                        h.update(m.content.as_bytes());
+                        format!("{:x}", h.finalize())[..16].to_string()
+                    })
+                    .unwrap_or_default();
+                let tools_hash = {
+                    let mut h = Sha256::new();
+                    if let Ok(raw) = serde_json::to_string(&self.native_tools) {
+                        h.update(raw.as_bytes());
+                    }
+                    format!("{:x}", h.finalize())[..16].to_string()
+                };
+                event["system_hash"] = serde_json::json!(system_hash);
+                event["tools_hash"] = serde_json::json!(tools_hash);
+                let context_for_display = resp
+                    .usage
+                    .as_ref()
+                    .map(|u| u.input_tokens as usize)
+                    .filter(|v| *v > 0)
+                    .unwrap_or(tokens);
+                event["context_tokens"] = serde_json::json!(context_for_display);
+                event["context_window"] = serde_json::json!(context_cfg.max_context_tokens);
+                event["context_trigger_tokens"] = serde_json::json!(context_cfg.max_context_tokens);
                 if let Some(cp) = retrieval.checkpoint.as_ref() {
                     event["retrieval_cutoff"] = serde_json::json!(cp.cutoff_index);
                     event["retrieval_stub_chars"] = serde_json::json!(cp.stub.chars().count());
                 }
+                let _ = session.record_usage(&event);
+                if let Some(summary) = session.current_summary() {
+                    event["session_usage"] = serde_json::json!({
+                        "calls": summary.calls,
+                        "cache_hit_rate": summary.cache_hit_rate,
+                        "total_usage_tokens": summary.total_usage_tokens,
+                        "uncached_input_tokens": summary.uncached_input_tokens,
+                        "cache_read_tokens": summary.cache_read_tokens,
+                        "cache_write_tokens": summary.cache_write_tokens,
+                        "output_tokens": summary.output_tokens,
+                        "reasoning_tokens": summary.reasoning_tokens,
+                        "cost": summary.cost,
+                        "context_tokens": summary.context_tokens,
+                        "context_window": summary.context_window,
+                        "context_trigger_tokens": summary.context_trigger_tokens,
+                    });
+                }
+                emitter.usage(&event);
                 if usage_tracker.record(&event) && usage_tracker.verbose {
                     if let Some(u) = &resp.usage {
                         eprintln!(
@@ -244,6 +337,19 @@ impl<'a> ReactLoop<'a> {
                     continue;
                 }
 
+                // An empty completion is not a successful task. Without this
+                // guard, a failed gateway/stream is reported as "completed"
+                // with a blank final answer and persisted as an empty turn.
+                if last_text.trim().is_empty() {
+                    let msg = "provider returned an empty final response (no text, no tool calls)";
+                    emitter.error(msg);
+                    return Ok(RunResult {
+                        status: RunStatus::Error(msg.into()),
+                        iterations: iteration + 1,
+                        final_text: String::new(),
+                    });
+                }
+
                 let assistant = ChatMessage {
                     role: "assistant".into(),
                     content: last_text.clone(),
@@ -279,6 +385,8 @@ impl<'a> ReactLoop<'a> {
             assistant_msg.reasoning_content = resp.reasoning_content.clone();
             messages.push(assistant_msg.clone());
             let _ = session.add_message(SessionMessage::from_chat(&assistant_msg));
+
+            let repeat_warning = repeat_guard.observe(&resp.tool_calls);
 
             // Execute tool calls. A batch containing a non-reentrant lane
             // (shell/browser/python/delegate) runs sequentially; otherwise
@@ -364,6 +472,13 @@ impl<'a> ReactLoop<'a> {
                         },
                     );
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
+                    let observation = spill_tool_observation(
+                        &project_path,
+                        &session_id,
+                        &tc_id,
+                        observation,
+                        &self.config.context,
+                    );
                     let tool_msg = ChatMessage::tool_result(tc_id, observation);
                     messages.push(tool_msg.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
@@ -408,10 +523,24 @@ impl<'a> ReactLoop<'a> {
                         },
                     );
                     emitter.seg_observation(&observation, self.config.limits.display_preview_chars);
+                    let observation = spill_tool_observation(
+                        &project_path,
+                        &session_id,
+                        &tc.id,
+                        observation,
+                        &self.config.context,
+                    );
                     let tool_msg = ChatMessage::tool_result(tc.id.clone(), observation);
                     messages.push(tool_msg.clone());
                     let _ = session.add_message(SessionMessage::from_chat(&tool_msg));
                 }
+            }
+
+            // Warn after the tool result pair so the conversation stays valid.
+            if let Some(w) = repeat_warning {
+                let warn_msg = ChatMessage::system(format!("[SYSTEM WARNING]: {w}"));
+                let _ = session.add_message(SessionMessage::from_chat(&warn_msg));
+                messages.push(warn_msg);
             }
 
             // Context growth check (informational; compact view is built each iter).
@@ -535,17 +664,25 @@ impl<'a> ReactLoop<'a> {
         // Read-only mode: block mutating/executing tools before any dispatch.
         // The structured observation tells the model why (and is classified as
         // a tool error by `tool_status`).
-        if self.config.safety.permission_mode == crate::config::PermissionMode::ReadOnly
-            && !crate::tools::registry::is_read_only(name)
-        {
-            return serde_json::json!({
-                "success": false,
-                "error": format!(
-                    "read-only mode: tool '{name}' is not allowed (switch to full access to run it)"
-                ),
-                "tool": name,
-            })
-            .to_string();
+        if self.config.safety.permission_mode == crate::config::PermissionMode::ReadOnly {
+            let target_is_read_only = if name == "call_tool" {
+                args.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(crate::tools::registry::is_read_only)
+                    .unwrap_or(false)
+            } else {
+                crate::tools::registry::is_read_only(name)
+            };
+            if !target_is_read_only {
+                return serde_json::json!({
+                    "success": false,
+                    "error": format!(
+                        "read-only mode: tool '{name}' is not allowed (switch to full access to run it)"
+                    ),
+                    "tool": name,
+                })
+                .to_string();
+            }
         }
         let max_retries = self.config.limits.max_retries.max(1);
         let mut last = String::new();
@@ -581,6 +718,13 @@ impl<'a> ReactLoop<'a> {
 /// Classify a tool observation into a structured `(status, error_code)` pair
 /// for the additive `tool_status` event.
 fn classify_tool_status(observation: &str) -> (&'static str, Option<&'static str>) {
+    // Expected non-zero shell results (grep no match, diff changes, test false)
+    // are successful tool executions, even though their process exit is 1.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(observation) {
+        if value.get("expected_nonzero").and_then(|v| v.as_bool()) == Some(true) {
+            return ("success", None);
+        }
+    }
     let l = observation.to_lowercase();
     let failed = l.contains("parameter validation failed")
         || l.contains("execution error")
@@ -612,6 +756,48 @@ fn classify_tool_status(observation: &str) -> (&'static str, Option<&'static str
     }
 }
 
+/// Whether an API error means the request exceeded the provider context limit.
+fn is_context_overflow_error(e: &AacodeError) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("context_length_exceeded")
+        || s.contains("context length")
+        || s.contains("context window")
+        || s.contains("maximum context")
+        || s.contains("prompt is too long")
+        || s.contains("input is too long")
+        || s.contains("too many tokens")
+}
+
+/// Extract the provider-reported context limit from an overflow error, if any.
+fn context_overflow_limit(e: &AacodeError) -> Option<usize> {
+    let s = e.to_string();
+    let lower = s.to_lowercase();
+    const MARKERS: [&str; 5] = [
+        "maximum context length is ",
+        "context length is ",
+        "maximum context window is ",
+        "context window is ",
+        "limit is ",
+    ];
+    for marker in MARKERS {
+        if let Some(pos) = lower.find(marker) {
+            let rest = &s[pos + marker.len()..];
+            let digits: String = rest
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '_')
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(value) = digits.parse::<usize>() {
+                if value > 0 {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Classify an LLM/API error into a friendly, actionable message.
 fn classify_api_error(e: &AacodeError) -> String {
     let s = e.to_string();
@@ -627,6 +813,60 @@ fn classify_api_error(e: &AacodeError) -> String {
     } else {
         s
     }
+}
+
+/// Spill oversized tool observations before they enter model-visible history.
+/// Small results are returned unchanged; large results keep a bounded preview
+/// plus the full-file path (the model can retrieve the rest with run_shell).
+fn spill_tool_observation(
+    project_path: &std::path::Path,
+    session_id: &str,
+    call_id: &str,
+    observation: String,
+    cfg: &crate::config::ContextConfig,
+) -> String {
+    if observation.is_empty() || cfg.inline_tool_tokens == 0 {
+        return observation;
+    }
+    if crate::session::estimate_tokens(&observation) <= cfg.inline_tool_tokens {
+        return observation;
+    }
+    let safe = |value: &str, fallback: &str| {
+        let cleaned: String = value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            .collect();
+        if cleaned.is_empty() {
+            fallback.to_string()
+        } else {
+            cleaned
+        }
+    };
+    let session = safe(session_id, "session");
+    let call = safe(call_id, &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let relative = format!(".aacode/spill/{session}/{call}.txt");
+    let path = project_path.join(&relative);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return observation;
+        }
+    }
+    if std::fs::write(&path, observation.as_bytes()).is_err() {
+        return observation;
+    }
+    let total = observation.chars().count();
+    let head: String = observation.chars().take(cfg.inline_head_chars).collect();
+    let tail: String = observation
+        .chars()
+        .rev()
+        .take(cfg.inline_tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!(
+        "{head}\n\n[... tool result spilled: {total} chars; full output at {relative}. Use run_shell head/tail/sed to inspect it.]\n\n{tail}"
+    )
 }
 
 /// Tracks fetch_url results per domain to detect stale loops (mirrors Python).
@@ -678,6 +918,33 @@ impl StaleTracker {
             let drain = e.len() - 5;
             e.drain(0..drain);
         }
+    }
+}
+
+/// Warns when the model repeats an identical tool call too many times in one
+/// run. Mirrors the Python repeat guard at a conservative, advisory threshold.
+#[derive(Default)]
+struct RepeatTracker {
+    counts: HashMap<String, usize>,
+    warned: std::collections::HashSet<String>,
+}
+
+impl RepeatTracker {
+    fn observe(&mut self, tool_calls: &[ToolCall]) -> Option<String> {
+        let mut warning = None;
+        for tc in tool_calls {
+            let args = serde_json::to_string(&tc.parsed_args()).unwrap_or_default();
+            let sig = format!("{}\u{0}{args}", tc.name);
+            let count = self.counts.entry(sig.clone()).or_insert(0);
+            *count += 1;
+            if *count >= 3 && self.warned.insert(sig) {
+                warning = Some(format!(
+                    "The tool call `{}` with identical arguments has repeated {} times. Stop repeating it; verify the result, change the approach, or finish with what you have.",
+                    tc.name, count
+                ));
+            }
+        }
+        warning
     }
 }
 
@@ -827,7 +1094,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn large_tool_observation_is_spilled_with_preview_and_path() {
+        let proj = tmp_proj();
+        let mut cfg = crate::config::ContextConfig::default();
+        cfg.inline_tool_tokens = 10;
+        cfg.inline_head_chars = 20;
+        cfg.inline_tail_chars = 10;
+        let raw = format!("HEAD{}TAIL", "x".repeat(5000));
+        let out = spill_tool_observation(&proj, "s1", "call_1", raw.clone(), &cfg);
+        assert!(out.len() < raw.len());
+        assert!(out.contains(".aacode/spill/s1/call_1.txt"));
+        assert!(out.contains("full output at"));
+        let path = proj.join(".aacode/spill/s1/call_1.txt");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn repeat_guard_warns_once_at_third_identical_call() {
+        let mut g = RepeatTracker::default();
+        let call = tc("read_file", r#"{"path":"a"}"#);
+        assert!(g.observe(std::slice::from_ref(&call)).is_none());
+        assert!(g.observe(std::slice::from_ref(&call)).is_none());
+        assert!(g.observe(std::slice::from_ref(&call)).is_some());
+        assert!(g.observe(std::slice::from_ref(&call)).is_none());
+        let other = tc("read_file", r#"{"path":"b"}"#);
+        assert!(g.observe(&[other]).is_none());
+    }
+
     /// Same-lane tools must not overlap (deterministic event log, no timing).
+    struct HugeTool;
+    #[async_trait::async_trait]
+    impl Tool for HugeTool {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new("huge", "return a large result", vec![])
+        }
+        async fn call(&self, _args: &Value, _c: &AtomicBool) -> Result<String> {
+            Ok("HEAD".to_string() + &"x".repeat(5000) + "TAIL")
+        }
+    }
+
+    #[tokio::test]
+    async fn large_tool_result_is_spilled_before_session_persistence() {
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    tool_calls: vec![tc("huge", "{}")],
+                    ..Default::default()
+                },
+                LlmResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(HugeTool));
+        let mut cfg = AgentConfig::default();
+        cfg.context.inline_tool_tokens = 10;
+        cfg.context.inline_head_chars = 12;
+        cfg.context.inline_tail_chars = 8;
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("go")];
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
+        assert_eq!(res.status, RunStatus::Completed);
+        let tool = sm
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool message");
+        assert!(tool.content.contains(".aacode/spill/"));
+        assert!(tool.content.contains("full output at"));
+        let spill_dir = proj.join(".aacode/spill");
+        assert!(spill_dir.join("session").is_dir() || spill_dir.exists());
+    }
+
     #[tokio::test]
     async fn lane_batch_runs_sequentially() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1131,6 +1477,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_response_is_error_not_completed() {
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![LlmResponse::default()]),
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(EchoTool));
+        let cfg = AgentConfig::default();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+
+        let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
+        match res.status {
+            RunStatus::Error(msg) => assert!(msg.contains("empty final response")),
+            other => panic!("empty response must not be {other:?}"),
+        }
+        assert!(!sink
+            .lines()
+            .iter()
+            .any(|l| l.contains(r#""status":"completed""#)));
+        assert!(!sm
+            .messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.is_empty()));
+    }
+
+    #[tokio::test]
     async fn executes_tool_then_completes() {
         let llm = ScriptedLlm {
             responses: Mutex::new(vec![
@@ -1164,6 +1542,116 @@ mod tests {
         // session persisted assistant(tool_calls) + tool + final assistant
         assert!(sm.messages.iter().any(|m| m.tool_calls.is_some()));
         assert!(sm.messages.iter().any(|m| m.role == "tool"));
+    }
+
+    #[tokio::test]
+    async fn session_usage_aggregates_from_provider_responses() {
+        let usage = crate::llm::Usage {
+            input_tokens: 1000,
+            output_tokens: 10,
+            total_tokens: 1010,
+            cache_read_tokens: 900,
+            cache_write_tokens: 0,
+            cache_miss_tokens: 100,
+            reasoning_tokens: 2,
+        };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![
+                LlmResponse {
+                    tool_calls: vec![tc("echo", "{\"text\":\"one\"}")],
+                    usage: Some(usage.clone()),
+                    ..Default::default()
+                },
+                LlmResponse {
+                    text: "done".into(),
+                    usage: Some(usage),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(EchoTool));
+        let cfg = AgentConfig::default();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+        let res = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
+        assert_eq!(res.status, RunStatus::Completed);
+
+        let lines = sink.lines();
+        assert!(
+            lines.iter().any(|l| {
+                l.contains("\"type\":\"usage\"")
+                    && l.contains("\"session_usage\"")
+                    && l.contains("\"context_trigger_tokens\"")
+            }),
+            "live usage event missing: {lines:?}"
+        );
+
+        let summary = sm.list_sessions().into_iter().next().unwrap();
+        assert_eq!(summary.calls, 2);
+        assert_eq!(summary.uncached_input_tokens, 200);
+        assert_eq!(summary.cache_read_tokens, 1800);
+        assert_eq!(summary.output_tokens, 20);
+        assert_eq!(summary.reasoning_tokens, 4);
+        assert!((summary.cache_hit_rate - 0.9).abs() < 1e-9);
+        assert_eq!(
+            summary.context_tokens, 1000,
+            "display context must use provider prompt"
+        );
+        assert_eq!(summary.context_trigger_tokens, summary.context_window);
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_tool_call_gets_one_warning_after_tool_results() {
+        let call = || LlmResponse {
+            tool_calls: vec![tc("echo", "{\"text\":\"same\"}")],
+            ..Default::default()
+        };
+        let llm = ScriptedLlm {
+            responses: Mutex::new(vec![
+                call(),
+                call(),
+                call(),
+                LlmResponse {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+            ]),
+        };
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(EchoTool));
+        let cfg = AgentConfig::default();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let msgs = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+        let _ = loop_.run(msgs, &mut sm, &sink, &cancel).await.unwrap();
+
+        let warnings: Vec<usize> = sm
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "system" && m.content.contains("repeated 3 times"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(warnings.len(), 1, "warning must be emitted exactly once");
+        let last_tool = sm
+            .messages
+            .iter()
+            .rposition(|m| m.role == "tool")
+            .expect("tool result persisted");
+        assert!(
+            warnings[0] > last_tool,
+            "warning must come after the tool result, not split the tool pair"
+        );
     }
 
     #[tokio::test]
@@ -1354,6 +1842,31 @@ mod tests {
         assert_eq!(domain_of("http://a.b.c/x/y"), "a.b.c");
     }
 
+    #[test]
+    fn context_overflow_errors_are_detected() {
+        assert!(is_context_overflow_error(&AacodeError::Api(
+            "context_length_exceeded: maximum context length is 1000000".into()
+        )));
+        assert!(is_context_overflow_error(&AacodeError::Api(
+            "prompt is too long".into()
+        )));
+        assert!(!is_context_overflow_error(&AacodeError::Api(
+            "HTTP 401 unauthorized".into()
+        )));
+        assert_eq!(
+            context_overflow_limit(&AacodeError::Api(
+                "context_length_exceeded: maximum context length is 128,000 tokens".into()
+            )),
+            Some(128_000)
+        );
+        assert_eq!(
+            context_overflow_limit(&AacodeError::Api(
+                "input is too long; limit is 1000000".into()
+            )),
+            Some(1_000_000)
+        );
+    }
+
     #[tokio::test]
     async fn classify_errors() {
         assert!(
@@ -1455,6 +1968,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_overflow_retries_with_shorter_history() {
+        let llm = ContextOverflowThenOkLlm {
+            calls: Mutex::new(vec![]),
+            systems: Mutex::new(vec![]),
+        };
+        let reg = ToolRegistry::new();
+        let cfg = AgentConfig::default();
+        let loop_ = ReactLoop::new(&llm, &reg, &cfg, vec![]);
+        let proj = tmp_proj();
+        let mut sm = SessionManager::new(&proj);
+        sm.create_session("t", None).unwrap();
+        let mut messages = vec![ChatMessage::system("SYS")];
+        for i in 0..30 {
+            messages.push(ChatMessage::user(format!("task {i} {}", "x".repeat(800))));
+            messages.push(ChatMessage::assistant("ok"));
+        }
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let res = loop_.run(messages, &mut sm, &sink, &cancel).await.unwrap();
+        assert_eq!(res.status, RunStatus::Completed);
+        let calls = llm.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "must retry exactly once after overflow");
+        assert!(calls[1] < calls[0], "retry view must be shorter");
+        let systems = llm.systems.lock().unwrap();
+        assert_eq!(systems.len(), 2);
+        assert_eq!(systems[0], "SYS", "original system prompt changed");
+        assert_eq!(
+            systems[1], "SYS",
+            "retry must preserve cached system prefix"
+        );
+    }
+
+    #[tokio::test]
     async fn max_iterations_returns_last_text() {
         let responses: Vec<LlmResponse> = (0..5)
             .map(|i| LlmResponse {
@@ -1512,6 +2058,40 @@ mod tests {
             emitter.seg("thought", "complete response");
             Ok(LlmResponse {
                 text: "complete response".into(),
+                ..Default::default()
+            })
+        }
+        async fn validate(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ContextOverflowThenOkLlm {
+        calls: Mutex<Vec<usize>>,
+        systems: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for ContextOverflowThenOkLlm {
+        async fn chat_stream(
+            &self,
+            m: &[ChatMessage],
+            _t: &[Value],
+            _e: &dyn EventSink,
+            _c: &AtomicBool,
+        ) -> Result<LlmResponse> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(m.len());
+            self.systems
+                .lock()
+                .unwrap()
+                .push(m.first().map(|x| x.content.clone()).unwrap_or_default());
+            if calls.len() == 1 {
+                return Err(AacodeError::Api(
+                    "context_length_exceeded: maximum context length is 1000000".into(),
+                ));
+            }
+            Ok(LlmResponse {
+                text: "recovered".into(),
                 ..Default::default()
             })
         }

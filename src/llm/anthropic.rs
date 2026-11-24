@@ -9,23 +9,10 @@
 //! `input_json_delta`.
 
 use super::sse::SseReader;
-use super::types::{LlmResponse, ToolCall};
+use super::types::LlmResponse;
 use crate::error::{AacodeError, Result};
 use crate::stream::EventSink;
-use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-#[derive(Default, Clone)]
-struct BlockAcc {
-    kind: String, // "text" | "thinking" | "tool_use"
-    id: String,
-    name: String,
-    text: String,         // for text/thinking
-    partial_json: String, // for tool_use input
-    name_announced: bool,
-    last_report: usize,
-}
 
 /// Parse an Anthropic SSE stream from any reader.
 pub fn parse_anthropic_stream<R: std::io::Read>(
@@ -33,172 +20,24 @@ pub fn parse_anthropic_stream<R: std::io::Read>(
     emitter: &dyn EventSink,
     cancel: &AtomicBool,
 ) -> Result<LlmResponse> {
+    // Keep the sync wrapper as a thin I/O loop over the shared parser. The
+    // previous duplicate implementation dropped provider `usage` entirely
+    // (always `usage: None`), so sync callers could never account for tokens.
     let mut sse = SseReader::new(reader);
-    let mut blocks: BTreeMap<i64, BlockAcc> = BTreeMap::new();
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut stop_reason: Option<String> = None;
-    let mut valid_chunks: usize = 0;
-    let mut total_payloads: usize = 0;
-
+    let mut state = super::parse::AnthropicParseState::default();
     while let Some(payload) = match sse.next_data() {
         Ok(Some(p)) => Some(p),
         Ok(None) => None,
-        Err(e) => return Err(AacodeError::Network(format!("SSE read error: {e}"))),
+        Err(e) => {
+            return Err(AacodeError::Network(format!("SSE read error: {e}")));
+        }
     } {
         if cancel.load(Ordering::SeqCst) {
             return Err(AacodeError::Cancelled);
         }
-        total_payloads += 1;
-        let ev: Value = match serde_json::from_str(&payload) {
-            Ok(v) => {
-                valid_chunks += 1;
-                v
-            }
-            Err(_) => continue,
-        };
-        let etype = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match etype {
-            "error" => {
-                let msg = ev
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| ev.to_string());
-                return Err(AacodeError::Api(format!("stream error: {msg}")));
-            }
-            "content_block_start" => {
-                let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                let block = ev.get("content_block");
-                let mut acc = BlockAcc::default();
-                if let Some(b) = block {
-                    acc.kind = b
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    acc.id = b
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    acc.name = b
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                }
-                if acc.kind == "tool_use" && !acc.name.is_empty() && !acc.name_announced {
-                    acc.name_announced = true;
-                    emitter.tool_progress("building", &acc.name, 0);
-                }
-                blocks.insert(idx, acc);
-            }
-            "content_block_delta" => {
-                let idx = ev.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                let delta = ev.get("delta");
-                if let Some(d) = delta {
-                    let dt = d.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    let acc = blocks.entry(idx).or_default();
-                    match dt {
-                        "text_delta" => {
-                            if let Some(t) = d.get("text").and_then(|v| v.as_str()) {
-                                text.push_str(t);
-                                acc.text.push_str(t);
-                                emitter.delta("thought", t);
-                            }
-                        }
-                        "thinking_delta" => {
-                            if let Some(t) = d.get("thinking").and_then(|v| v.as_str()) {
-                                reasoning.push_str(t);
-                                acc.text.push_str(t);
-                                emitter.delta("thinking", t);
-                            }
-                        }
-                        "input_json_delta" => {
-                            if let Some(pj) = d.get("partial_json").and_then(|v| v.as_str()) {
-                                acc.partial_json.push_str(pj);
-                                let cur = acc.partial_json.len();
-                                if cur - acc.last_report >= 500 {
-                                    acc.last_report = cur - (cur % 500);
-                                    emitter.tool_progress("building", &acc.name, cur);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "message_delta" => {
-                if let Some(sr) = ev
-                    .get("delta")
-                    .and_then(|d| d.get("stop_reason"))
-                    .and_then(|v| v.as_str())
-                {
-                    stop_reason = Some(sr.to_string());
-                }
-            }
-            _ => {}
-        }
+        super::parse::parse_anthropic_chunk(&payload, &mut state, emitter)?;
     }
-
-    if total_payloads > 0 && valid_chunks == 0 {
-        return Err(AacodeError::Api(
-            "stream returned no parseable data (all chunks malformed)".into(),
-        ));
-    }
-
-    if stop_reason.is_none() && (!text.is_empty() || !reasoning.is_empty() || !blocks.is_empty()) {
-        stop_reason = Some("connection_closed".to_string());
-    }
-
-    if !reasoning.is_empty() {
-        emitter.seg_large("thinking", &reasoning, 512);
-    }
-    emitter.seg_large("thought", &text, 512);
-
-    let mut tool_calls = Vec::new();
-    for (i, (_, acc)) in blocks.into_iter().enumerate() {
-        if acc.kind != "tool_use" || acc.name.is_empty() {
-            continue;
-        }
-        let args = if acc.partial_json.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            acc.partial_json
-        };
-        let id = if acc.id.is_empty() {
-            format!("call_{i}")
-        } else {
-            acc.id
-        };
-        emitter.tool_progress("done", &acc.name, args.len());
-        emitter.action(&acc.name, &args);
-        tool_calls.push(ToolCall {
-            id,
-            name: acc.name,
-            arguments: args,
-        });
-    }
-
-    if matches!(stop_reason.as_deref(), Some("max_tokens")) {
-        text.push_str(
-            "\n\n[⚠️ WARNING: API response truncated (max_tokens). Reduce content or raise max_tokens.]",
-        );
-    }
-
-    Ok(LlmResponse {
-        text,
-        tool_calls,
-        reasoning_content: if reasoning.is_empty() {
-            None
-        } else {
-            Some(reasoning)
-        },
-        finish_reason: stop_reason,
-        usage: None,
-    })
+    super::parse::finalize_anthropic(state, emitter)
 }
 
 #[cfg(test)]
@@ -206,6 +45,26 @@ mod tests {
     use super::*;
     use crate::stream::CollectingSink;
     use std::io::Cursor;
+
+    #[test]
+    fn sync_stream_preserves_provider_usage() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":700,\"cache_creation_input_tokens\":30,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let sink = CollectingSink::new(false);
+        let cancel = AtomicBool::new(false);
+        let resp =
+            parse_anthropic_stream(Cursor::new(raw.as_bytes().to_vec()), &sink, &cancel).unwrap();
+        let usage = resp.usage.expect("provider usage");
+        assert_eq!(usage.input_tokens, 750);
+        assert_eq!(usage.cache_read_tokens, 700);
+        assert_eq!(usage.cache_write_tokens, 30);
+        assert_eq!(usage.output_tokens, 12);
+    }
 
     #[test]
     fn stream_parses_text_and_thinking() {

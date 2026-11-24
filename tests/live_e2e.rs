@@ -12,6 +12,8 @@
 //! ```
 
 use aacode_rs::config::{AgentConfig, Gateway, ModelConfig};
+use aacode_rs::llm::async_llm::build_client_async;
+use aacode_rs::llm::types::{ChatMessage, ToolCall};
 use aacode_rs::runtime::AgentRuntime;
 use aacode_rs::session::SessionManager;
 use aacode_rs::stream::CollectingSink;
@@ -208,4 +210,67 @@ async fn live_e2e_cross_task_cache() {
     }
 
     let _ = std::fs::remove_dir_all(&project);
+}
+
+/// Live Anthropic-compatible request with two tool results in one user turn.
+/// The old Python adapter emitted one user message per tool result; Rust's
+/// builder always grouped them, and this test locks the wire behaviour in.
+#[tokio::test]
+#[ignore = "requires a real LLM_API_KEY and Anthropic-compatible endpoint"]
+async fn live_anthropic_accepts_parallel_tool_results() {
+    let api_key = std::env::var("LLM_API_KEY")
+        .expect("LLM_API_KEY must be set (never hardcode it in the repo)");
+    let cfg = ModelConfig {
+        name: std::env::var("LLM_MODEL_NAME").unwrap_or_else(|_| "deepseek-flash".into()),
+        api_key: Some(api_key),
+        base_url: Some(
+            std::env::var("AACODE_LIVE_ANTHROPIC_URL")
+                .unwrap_or_else(|_| "https://api.deepseek.com/anthropic".into()),
+        ),
+        gateway: Gateway::Anthropic,
+        temperature: 0.0,
+        max_tokens: 128,
+        ..Default::default()
+    };
+    let client = build_client_async(&cfg);
+    let sink = CollectingSink::new(false);
+    let cancel = AtomicBool::new(false);
+    let messages = vec![
+        ChatMessage::system("You are concise."),
+        ChatMessage::user("Run both commands in parallel."),
+        ChatMessage::assistant_with_tools(
+            "Running both.",
+            vec![
+                ToolCall {
+                    id: "call_00_ET_live_a".into(),
+                    name: "run_shell".into(),
+                    arguments: "{\"command\":\"printf a\"}".into(),
+                },
+                ToolCall {
+                    id: "call_01_ET_live_b".into(),
+                    name: "run_shell".into(),
+                    arguments: "{\"command\":\"printf b\"}".into(),
+                },
+            ],
+        ),
+        ChatMessage::tool_result("call_00_ET_live_a", "a"),
+        ChatMessage::tool_result("call_01_ET_live_b", "b"),
+    ];
+    let tools = vec![serde_json::json!({
+        "name": "run_shell",
+        "description": "Run a shell command",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        }
+    })];
+    let resp = client
+        .chat_stream(&messages, &tools, &sink, &cancel)
+        .await
+        .expect("Anthropic-compatible gateway rejected the second iteration");
+    assert!(
+        !resp.text.trim().is_empty() || !resp.tool_calls.is_empty(),
+        "empty response after parallel tool results"
+    );
 }

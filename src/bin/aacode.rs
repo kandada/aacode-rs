@@ -43,6 +43,84 @@ fn load_dotenv(path: &std::path::Path) {
     }
 }
 
+/// Read one line from stdin with a default value.
+fn prompt(label: &str, default: &str) -> String {
+    let suffix = if default.is_empty() {
+        ": ".to_string()
+    } else {
+        format!(" [{default}]: ")
+    };
+    print!("{label}{suffix}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let value = line.trim().to_string();
+    if value.is_empty() {
+        default.to_string()
+    } else {
+        value
+    }
+}
+
+/// Write/update `.env` without clobbering unrelated keys.
+fn write_env_file(path: &std::path::Path, updates: &[(&str, &str)]) -> std::io::Result<()> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || !trimmed.contains('=') {
+                lines.push(line.to_string());
+                continue;
+            }
+            let key = trimmed.split('=').next().unwrap_or("").trim();
+            if let Some((_, value)) = updates.iter().find(|(k, _)| *k == key) {
+                lines.push(format!("{key}={value}"));
+                seen.insert(key.to_string());
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    for (key, value) in updates {
+        if !seen.contains(*key) {
+            lines.push(format!("{key}={value}"));
+        }
+    }
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn run_init() {
+    println!("AACode setup (Rust CLI)");
+    let name = prompt("Model name", "deepseek-chat");
+    let base = prompt("Base URL", "https://api.deepseek.com/v1");
+    let gateway = prompt("Gateway (openai/anthropic)", "openai");
+    let key = prompt("API Key", "");
+    if key.trim().is_empty() {
+        eprintln!("API Key cannot be empty.");
+        std::process::exit(1);
+    }
+    if let Err(e) = write_env_file(
+        std::path::Path::new(".env"),
+        &[
+            ("LLM_MODEL_NAME", &name),
+            ("LLM_API_URL", &base),
+            ("LLM_GATEWAY", &gateway),
+            ("LLM_API_KEY", &key),
+        ],
+    ) {
+        eprintln!(".env write failed: {e}");
+        std::process::exit(1);
+    }
+    println!("Saved to .env. Restart aacode or run `set -a; . ./.env; set +a`.");
+}
+
 #[cfg(all(feature = "pty", unix))]
 fn run_terminal(args: &[String]) {
     use std::io::{Read, Write};
@@ -162,6 +240,21 @@ fn main() {
 
     let _args: Vec<String> = std::env::args().collect();
     let args: Vec<String> = std::env::args().collect();
+
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("init") | Some("setup")
+    ) {
+        run_init();
+        return;
+    }
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("--version") | Some("-V")
+    ) {
+        println!("aacode-rs {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     // `aacode terminal [shell]` — interactive PTY (Unix, feature `pty`).
     if args.get(1).map(String::as_str) == Some("terminal") {
@@ -302,14 +395,64 @@ fn print_help() {
         "aacode-rs — Rust coding agent\n\n\
         USAGE:\n  \
         aacode [-p <project>] [--session <id>] [--plan-first] \"task\"\n  \
+        aacode init           Interactive LLM setup (.env)\n  \
         aacode [-p <project>] --interactive\n\n\
         OPTIONS:\n  \
         -p, --project <dir>   Project sandbox directory (default: .)\n  \
         --session <id>        Continue an existing session\n  \
         --plan-first          Plan before executing\n  \
         -i, --interactive     Interactive session mode\n  \
-        -h, --help            Show this help\n\n\
+        -h, --help            Show this help\n  \
+        -V, --version         Show version\n\n\
         ENV:\n  \
         LLM_API_KEY, LLM_API_URL, LLM_MODEL_NAME, LLM_GATEWAY, SEARCHXNG_URL"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_env_file;
+
+    #[test]
+    fn write_env_file_updates_values_and_keeps_unrelated_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "aacode_cli_env_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        std::fs::write(&path, "# comment\nOTHER=keep\nLLM_API_KEY=old\n").unwrap();
+        write_env_file(
+            &path,
+            &[
+                ("LLM_API_KEY", "sk-new"),
+                ("LLM_MODEL_NAME", "deepseek-flash"),
+            ],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# comment"));
+        assert!(text.contains("OTHER=keep"));
+        assert!(text.contains("LLM_API_KEY=sk-new"));
+        assert!(text.contains("LLM_MODEL_NAME=deepseek-flash"));
+        assert!(!text.contains("LLM_API_KEY=old"));
+        assert_eq!(text.matches("LLM_API_KEY=").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_env_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "aacode_cli_perm_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        write_env_file(&path, &[("LLM_API_KEY", "sk-secret")]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

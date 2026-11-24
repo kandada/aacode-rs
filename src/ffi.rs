@@ -32,7 +32,7 @@ use crate::config::AgentConfig;
 use crate::runtime::{AgentRuntime, TOKIO_RT};
 use crate::session::{valid_session_id, SessionManager, SessionMessage, SCHEMA_VERSION};
 use crate::stream::CallbackSink;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -612,6 +612,19 @@ pub extern "C" fn aacode_list_sessions(project_path: *const c_char) -> *mut c_ch
                     "created_at": s.created_at,
                     "last_activity": s.last_activity,
                     "total_messages": s.total_messages,
+                    "total_tokens": s.total_tokens,
+                    "total_usage_tokens": s.total_usage_tokens,
+                    "context_tokens": s.context_tokens,
+                    "context_window": s.context_window,
+                    "context_trigger_tokens": s.context_trigger_tokens,
+                    "uncached_input_tokens": s.uncached_input_tokens,
+                    "cache_read_tokens": s.cache_read_tokens,
+                    "cache_write_tokens": s.cache_write_tokens,
+                    "output_tokens": s.output_tokens,
+                    "reasoning_tokens": s.reasoning_tokens,
+                    "cache_hit_rate": s.cache_hit_rate,
+                    "calls": s.calls,
+                    "cost": s.cost,
                     "status": s.status,
                 })
             })
@@ -692,6 +705,113 @@ fn session_id_args(
     Ok((pp, sid))
 }
 
+// ── Background jobs ───────────────────────────────────────────────────────
+
+fn job_store(
+    project_path: *const c_char,
+) -> std::result::Result<std::sync::Arc<crate::tools::jobs::JobStore>, String> {
+    let pp = unsafe { cstr(project_path) }
+        .ok_or_else(|| "null project_path".to_string())?
+        .to_string();
+    Ok(crate::tools::jobs::store_for_project(std::path::Path::new(
+        &pp,
+    )))
+}
+
+fn valid_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 80
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// List background jobs. Returns `{"success":true,"jobs":[...]}`.
+#[no_mangle]
+pub extern "C" fn aacode_jobs_list(project_path: *const c_char) -> *mut c_char {
+    guard_cchar(|| {
+        let store = match job_store(project_path) {
+            Ok(s) => s,
+            Err(e) => return session_err(&e),
+        };
+        let jobs: Vec<serde_json::Value> = store
+            .list()
+            .into_iter()
+            .map(|s| json!({
+                "job_id": s.id, "status": s.status, "command": s.command,
+                "cwd": s.cwd, "exit_code": if s.exit_code == i32::MIN { Value::Null } else { json!(s.exit_code) },
+                "started_at": s.started_at, "finished_at": s.finished_at,
+                "log_path": s.log_path, "elapsed_ms": s.elapsed_ms,
+                "cancel_requested": s.cancel_requested,
+            }))
+            .collect();
+        to_c_string(json!({"success": true, "jobs": jobs}).to_string())
+    })
+}
+
+/// Read a job's bounded output/status.
+#[no_mangle]
+pub extern "C" fn aacode_jobs_output(
+    project_path: *const c_char,
+    job_id: *const c_char,
+) -> *mut c_char {
+    guard_cchar(|| {
+        let store = match job_store(project_path) {
+            Ok(s) => s,
+            Err(e) => return session_err(&e),
+        };
+        let id = unsafe { cstr(job_id) }.unwrap_or("");
+        if !valid_job_id(id) {
+            return session_err("invalid job_id");
+        }
+        let Some(s) = store.status(id) else {
+            return session_err("unknown job");
+        };
+        let max = 20_000usize;
+        let out = if s.stdout.chars().count() > max {
+            s.stdout.chars().take(max).collect::<String>()
+        } else {
+            s.stdout
+        };
+        let err = if s.stderr.chars().count() > max {
+            s.stderr.chars().take(max).collect::<String>()
+        } else {
+            s.stderr
+        };
+        to_c_string(json!({
+            "success": true, "job_id": s.id, "status": s.status, "command": s.command,
+            "cwd": s.cwd, "exit_code": if s.exit_code == i32::MIN { Value::Null } else { json!(s.exit_code) },
+            "started_at": s.started_at, "finished_at": s.finished_at, "log_path": s.log_path,
+            "stdout": out, "stderr": err, "elapsed_ms": s.elapsed_ms,
+        }).to_string())
+    })
+}
+
+/// Cancel a native/cooperative background job.
+#[no_mangle]
+pub extern "C" fn aacode_jobs_cancel(
+    project_path: *const c_char,
+    job_id: *const c_char,
+) -> *mut c_char {
+    guard_cchar(|| {
+        let store = match job_store(project_path) {
+            Ok(s) => s,
+            Err(e) => return session_err(&e),
+        };
+        let id = unsafe { cstr(job_id) }.unwrap_or("");
+        if !valid_job_id(id) {
+            return session_err("invalid job_id");
+        }
+        if store.cancel(id) {
+            to_c_string(
+                json!({"success": true, "job_id": id, "cancel_requested": true}).to_string(),
+            )
+        } else {
+            session_err("unknown job")
+        }
+    })
+}
+
 /// Current on-disk session schema version (see SESSION_FFI.md §6).
 #[no_mangle]
 pub extern "C" fn aacode_session_version() -> u32 {
@@ -718,6 +838,18 @@ pub extern "C" fn aacode_session_list(project_path: *const c_char) -> *mut c_cha
                     "last_activity": s.last_activity,
                     "total_messages": s.total_messages,
                     "total_tokens": s.total_tokens,
+                    "total_usage_tokens": s.total_usage_tokens,
+                    "context_tokens": s.context_tokens,
+                    "context_window": s.context_window,
+                    "context_trigger_tokens": s.context_trigger_tokens,
+                    "uncached_input_tokens": s.uncached_input_tokens,
+                    "cache_read_tokens": s.cache_read_tokens,
+                    "cache_write_tokens": s.cache_write_tokens,
+                    "output_tokens": s.output_tokens,
+                    "reasoning_tokens": s.reasoning_tokens,
+                    "cache_hit_rate": s.cache_hit_rate,
+                    "calls": s.calls,
+                    "cost": s.cost,
                     "status": s.status,
                 })
             })
@@ -1388,6 +1520,41 @@ mod tests {
         assert!(s.contains("\"success\":true"));
     }
 
+    #[test]
+    fn list_sessions_ffi_includes_usage_aggregates() {
+        let d =
+            std::env::temp_dir().join(format!("ffi_ls_usage_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        {
+            let mut sm = SessionManager::new(&d);
+            sm.create_session("task", None).unwrap();
+            sm.record_usage(&serde_json::json!({
+                "uncached_input": 100,
+                "cache_read": 900,
+                "output": 50,
+                "cost": 0.001,
+                "context_tokens": 650000,
+                "context_window": 1000000,
+                "context_trigger_tokens": 800000
+            }))
+            .unwrap();
+        }
+        let c = CString::new(d.to_string_lossy().to_string()).unwrap();
+        let ptr = aacode_list_sessions(c.as_ptr());
+        let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_string() };
+        aacode_free_string(ptr);
+        assert!(s.contains("\"success\":true"), "{s}");
+        assert!(s.contains("\"cache_read_tokens\":900"), "{s}");
+        assert!(s.contains("\"uncached_input_tokens\":100"), "{s}");
+        assert!(s.contains("\"output_tokens\":50"), "{s}");
+        assert!(s.contains("\"calls\":1"), "{s}");
+        assert!(s.contains("\"total_usage_tokens\":1050"), "{s}");
+        assert!(s.contains("\"context_tokens\":650000"), "{s}");
+        assert!(s.contains("\"context_window\":1000000"), "{s}");
+        assert!(s.contains("\"context_trigger_tokens\":800000"), "{s}");
+        assert!(s.contains("\"cost\":0.001"), "{s}");
+    }
+
     // ── resolve_shell_root (skills user_dir root widening) ─────────
 
     fn mkdirs(p: &std::path::Path) -> String {
@@ -1543,6 +1710,35 @@ mod tests {
             r.contains("\"success\":true"),
             "delete again (idempotent): {r}"
         );
+    }
+
+    #[test]
+    fn session_list_ffi_contract_exposes_usage_aggregates() {
+        let proj = mkdirs(&tmp_root("sess_usage_contract"));
+        {
+            let mut sm = SessionManager::new(std::path::Path::new(&proj));
+            sm.create_session("task", None).unwrap();
+            sm.record_usage(&serde_json::json!({
+                "uncached_input": 20,
+                "cache_read": 80,
+                "cache_write": 5,
+                "output": 10,
+                "reasoning": 2,
+                "cost": 0.0005
+            }))
+            .unwrap();
+        }
+        let pp = CString::new(proj).unwrap();
+        let r = call_str(|| aacode_session_list(pp.as_ptr()));
+        assert!(r.contains("\"success\":true"), "{r}");
+        assert!(r.contains("\"uncached_input_tokens\":20"), "{r}");
+        assert!(r.contains("\"cache_read_tokens\":80"), "{r}");
+        assert!(r.contains("\"cache_write_tokens\":5"), "{r}");
+        assert!(r.contains("\"output_tokens\":10"), "{r}");
+        assert!(r.contains("\"reasoning_tokens\":2"), "{r}");
+        assert!(r.contains("\"calls\":1"), "{r}");
+        assert!(r.contains("\"total_usage_tokens\":115"), "{r}");
+        assert!(r.contains("\"cost\":0.0005"), "{r}");
     }
 
     #[test]
